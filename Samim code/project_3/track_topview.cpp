@@ -1,0 +1,806 @@
+#include "track_topview.h"
+#include <cmath>
+#include <algorithm>
+
+TopViewTrack::TopViewTrack()
+    : currentTrackId(1),
+      roadWidth(380.0), // Ultra-wide 380px 4-lane highway!
+      totalTrackLength(0.0),
+      startHeading(0.0),
+      isLoopTrack(false) {
+    loadTrack(1);
+}
+
+void TopViewTrack::loadTrack(int trackId) {
+    currentTrackId = trackId;
+    roadWidth = 380.0;
+    controlPoints.clear();
+    nodes.clear();
+    boostPads.clear();
+    nitroPickups.clear();
+    oilSlicks.clear();
+
+    if (trackId == 1) {
+        // LEVEL 1: Pure Straight Sprint (1 Lap)
+        isLoopTrack = false;
+        theme = {
+            "LEVEL 1: DESERT HIGHWAY SPRINT", "PURE STRAIGHT (1 SPRINT LAP)",
+            rgba(217, 119, 6),    // Golden Sand Base
+            rgba(180, 83, 9),     // Sand Dune Waves
+            rgba(39, 39, 42),     // Smooth Blacktop Asphalt
+            rgba(255, 255, 255),  // White Border Lines
+            rgba(234, 179, 8),    // Yellow Kerb
+            rgba(255, 255, 255),  // White Kerb
+            rgba(250, 204, 21),   // Yellow Centerline
+            rgba(241, 245, 249),  // White Lane Lines
+            rgba(100, 116, 139),  // Steel Guardrails
+            rgba(180, 83, 9)      // Desert Rocks
+        };
+
+        // Pure straight 4-lane drag highway heading straight North (-Y)
+        controlPoints = {
+            Vec2D(1000, 4800), // Far South Start Area
+            Vec2D(1000, 4000), // Start Line & Staging Zone
+            Vec2D(1000, 3000), // High Speed Blast
+            Vec2D(1000, 2000), // Midpoint Acceleration
+            Vec2D(1000, 1000), // Approach to Finish
+            Vec2D(1000,  300)  // Stage Finish Line North
+        };
+    }
+    else if (trackId == 2) {
+        // LEVEL 2: Gentle Curving Highway (Non-Circular, 1 Lap)
+        isLoopTrack = false;
+        theme = {
+            "LEVEL 2: COASTAL HIGHWAY", "GENTLE CURVES (NON-CIRCULAR, 1 LAP)",
+            rgba(14, 116, 144),   // Ocean Azure
+            rgba(202, 138, 4),    // Sandy Coastline
+            rgba(51, 65, 85),     // Smooth Coastal Asphalt
+            rgba(255, 255, 255),  // White Borders
+            rgba(220, 38, 38),    // Red Kerb
+            rgba(255, 255, 255),  // White Kerb
+            rgba(250, 204, 21),   // Yellow Centerline
+            rgba(241, 245, 249),  // White Lane Lines
+            rgba(234, 179, 8),    // Gold Guardrail
+            rgba(16, 185, 129)    // Coastal Palms
+        };
+
+        // Gentle sweeping S-curve point-to-point highway (NOT circular)
+        controlPoints = {
+            Vec2D( 800, 5000), // Start Straight South
+            Vec2D( 800, 4200), // Start Line Straight
+            Vec2D(1050, 3500), // Gentle Right Sweeper
+            Vec2D(1350, 2800), // Flowing Apex
+            Vec2D(1150, 2100), // Gentle Left Transition
+            Vec2D( 850, 1400), // Gentle Left Sweeper
+            Vec2D( 950,  700), // Final Gentle Sweeper
+            Vec2D(1150,  200)  // Finish Line Sprint North
+        };
+    }
+    else if (trackId == 3) {
+        // LEVEL 3: Winding Alpine Canyon (Non-Circular, 1 Lap)
+        isLoopTrack = false;
+        theme = {
+            "LEVEL 3: ALPINE CANYON PASS", "WINDING S-CURVES (NON-CIRCULAR, 1 LAP)",
+            rgba(30, 41, 59),     // Mountain Slate
+            rgba(20, 83, 45),     // Deep Pine Forest
+            rgba(45, 55, 72),     // Canyon Asphalt
+            rgba(255, 255, 255),  // White Borders
+            rgba(250, 204, 21),   // Yellow Kerb
+            rgba(56, 189, 248),   // Cyan Kerb
+            rgba(250, 204, 21),   // Yellow Centerline
+            rgba(241, 245, 249),  // White Lane Lines
+            rgba(239, 68, 68),    // Red Safety Barrier
+            rgba(15, 23, 42)      // Canyon Boulders
+        };
+
+        // More technical winding point-to-point highway (NOT circular)
+        controlPoints = {
+            Vec2D( 600, 5400), // Canyon Entrance South
+            Vec2D( 600, 4600), // Approach Straight
+            Vec2D(1100, 3900), // Canyon Turn 1
+            Vec2D(1500, 3300), // High Ridge Sweeper
+            Vec2D( 950, 2600), // Mountain S-Curve 1
+            Vec2D(1550, 1900), // Mountain S-Curve 2
+            Vec2D(1100, 1100), // Gorge Bridge Section
+            Vec2D( 700,  600), // Canyon Exit Sweeper
+            Vec2D( 800,  150)  // Alpine Finish Line North
+        };
+    }
+    else if (trackId == 4) {
+        // LEVEL 4: Meadow Grand Prix Circuit (Closed Loop, 3 Laps!)
+        isLoopTrack = true;
+        theme = {
+            "LEVEL 4: MEADOW GP CIRCUIT", "CLOSED LOOP (3 LAPS TO WIN)",
+            rgba(34, 139, 34),    // Grass Base
+            rgba(46, 160, 67),    // Lawn Mowing Stripes
+            rgba(51, 65, 85),     // Smooth Dark Asphalt
+            rgba(255, 255, 255),  // White Border Lines
+            rgba(220, 38, 38),    // Kerb Red
+            rgba(255, 255, 255),  // Kerb White
+            rgba(250, 204, 21),   // Centerline Yellow
+            rgba(241, 245, 249),  // Lane Dashes White
+            rgba(185, 28, 28),    // Barrier Red
+            rgba(20, 83, 45)      // Trees
+        };
+
+        // High-speed flowing closed loop circuit
+        controlPoints = {
+            Vec2D( 500, 1850), // Main Straight South
+            Vec2D( 500, 1200), // Start/Finish Straight
+            Vec2D( 500,  650), // Main Straight North
+            Vec2D( 680,  380), // Gentle Turn 1 Entry
+            Vec2D(1050,  260), // Turn 1 Sweeping Apex
+            Vec2D(1500,  280), // North Straight Sweeper
+            Vec2D(1950,  450), // Gentle Turn 2 Entry
+            Vec2D(2280,  800), // Turn 2 Sweeping Apex
+            Vec2D(2350, 1300), // Back Straight
+            Vec2D(2250, 1800), // Gentle Turn 3 Sweeper
+            Vec2D(1800, 2100), // South Sweeper Apex
+            Vec2D(1150, 2100), // Return Sweeper
+            Vec2D( 750, 2000)  // Gentle Entry into Main Straight
+        };
+    }
+    else {
+        // LEVEL 5: Neo Tokyo Grand Prix Circuit (Closed Loop, 3 Laps!)
+        isLoopTrack = true;
+        theme = {
+            "LEVEL 5: NEO TOKYO EXPRESSWAY", "CHAMPIONSHIP LOOP (3 LAPS TO WIN)",
+            rgba(15, 23, 42),     // Dark Pavement
+            rgba(30, 41, 59),     // Sidewalks
+            rgba(39, 39, 42),     // Wet Dark Asphalt
+            rgba(6, 182, 212),    // Neon Cyan Borders
+            rgba(236, 72, 153),   // Neon Pink Kerb
+            rgba(6, 182, 212),    // Neon Cyan Kerb
+            rgba(250, 204, 21),   // Centerline Neon Yellow
+            rgba(6, 182, 212),    // Lane Dashes Cyan
+            rgba(168, 85, 247),   // Cyber Barrier
+            rgba(14, 165, 233)    // Holograms
+        };
+
+        controlPoints = {
+            Vec2D( 500, 1800), // Shinjuku Avenue South
+            Vec2D( 500, 1100), // Start Line Straight
+            Vec2D( 500,  600), // Shinjuku Avenue North
+            Vec2D( 750,  300), // Expressway Overpass Entry
+            Vec2D(1250,  220), // Shibuya Flyover
+            Vec2D(1750,  320), // Akihabara Neon Straight
+            Vec2D(2200,  700), // Rainbow Bridge Incline
+            Vec2D(2250, 1400), // Tokyo Bay Coastal Section
+            Vec2D(1950, 1900), // Roppongi Sweeper
+            Vec2D(1450, 2050), // Ginza Underpass Link
+            Vec2D( 950, 2000)  // Curve back to Main Strip
+        };
+    }
+
+    buildTrackGeometry();
+    generateDecorations();
+}
+
+static Vec2D catmullRom(const Vec2D &p0, const Vec2D &p1, const Vec2D &p2, const Vec2D &p3, double t) {
+    double t2 = t * t;
+    double t3 = t2 * t;
+
+    double f0 = -0.5 * t3 + t2 - 0.5 * t;
+    double f1 =  1.5 * t3 - 2.5 * t2 + 1.0;
+    double f2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+    double f3 =  0.5 * t3 - 0.5 * t2;
+
+    return Vec2D(
+        p0.x * f0 + p1.x * f1 + p2.x * f2 + p3.x * f3,
+        p0.y * f0 + p1.y * f1 + p2.y * f2 + p3.y * f3
+    );
+}
+
+void TopViewTrack::buildTrackGeometry() {
+    int numPoints = static_cast<int>(controlPoints.size());
+    if (numPoints < 2) return;
+
+    int samplesPerSegment = 24;
+    nodes.clear();
+    double accumDist = 0.0;
+
+    if (isLoopTrack) {
+        for (int i = 0; i < numPoints; i++) {
+            const Vec2D &p0 = controlPoints[(i - 1 + numPoints) % numPoints];
+            const Vec2D &p1 = controlPoints[i];
+            const Vec2D &p2 = controlPoints[(i + 1) % numPoints];
+            const Vec2D &p3 = controlPoints[(i + 2) % numPoints];
+
+            for (int step = 0; step < samplesPerSegment; step++) {
+                double t = static_cast<double>(step) / samplesPerSegment;
+                Vec2D pt = catmullRom(p0, p1, p2, p3, t);
+
+                double tNext = t + 0.01;
+                Vec2D ptNext = catmullRom(p0, p1, p2, p3, tNext);
+                Vec2D tangent = (ptNext - pt).normalized();
+                Vec2D normal = Vec2D(-tangent.y, tangent.x);
+
+                double halfW = roadWidth / 2.0;
+                Vec2D leftEdge  = pt - normal * halfW;
+                Vec2D rightEdge = pt + normal * halfW;
+                Vec2D leftKerb  = pt - normal * (halfW + 18.0);
+                Vec2D rightKerb = pt + normal * (halfW + 18.0);
+
+                if (!nodes.empty()) {
+                    accumDist += (pt - nodes.back().center).length();
+                }
+
+                TrackNode node;
+                node.center = pt;
+                node.tangent = tangent;
+                node.normal = normal;
+                node.leftEdge = leftEdge;
+                node.rightEdge = rightEdge;
+                node.leftKerb = leftKerb;
+                node.rightKerb = rightKerb;
+                node.distFromStart = accumDist;
+                node.isCorner = false;
+
+                nodes.push_back(node);
+            }
+        }
+    } else {
+        // Clamped Catmull-Rom for Open / Non-circular sprint tracks
+        int numSegments = numPoints - 1;
+        for (int i = 0; i < numSegments; i++) {
+            const Vec2D &p0 = controlPoints[std::max(0, i - 1)];
+            const Vec2D &p1 = controlPoints[i];
+            const Vec2D &p2 = controlPoints[i + 1];
+            const Vec2D &p3 = controlPoints[std::min(numPoints - 1, i + 2)];
+
+            int steps = (i == numSegments - 1) ? (samplesPerSegment + 1) : samplesPerSegment;
+            for (int step = 0; step < steps; step++) {
+                double t = static_cast<double>(step) / samplesPerSegment;
+                Vec2D pt = catmullRom(p0, p1, p2, p3, t);
+
+                double tNext = t + 0.01;
+                Vec2D ptNext = catmullRom(p0, p1, p2, p3, tNext);
+                Vec2D tangent = (ptNext - pt).normalized();
+                Vec2D normal = Vec2D(-tangent.y, tangent.x);
+
+                double halfW = roadWidth / 2.0;
+                Vec2D leftEdge  = pt - normal * halfW;
+                Vec2D rightEdge = pt + normal * halfW;
+                Vec2D leftKerb  = pt - normal * (halfW + 18.0);
+                Vec2D rightKerb = pt + normal * (halfW + 18.0);
+
+                if (!nodes.empty()) {
+                    accumDist += (pt - nodes.back().center).length();
+                }
+
+                TrackNode node;
+                node.center = pt;
+                node.tangent = tangent;
+                node.normal = normal;
+                node.leftEdge = leftEdge;
+                node.rightEdge = rightEdge;
+                node.leftKerb = leftKerb;
+                node.rightKerb = rightKerb;
+                node.distFromStart = accumDist;
+                node.isCorner = false;
+
+                nodes.push_back(node);
+            }
+        }
+    }
+
+    totalTrackLength = accumDist;
+
+    int totalNodes = static_cast<int>(nodes.size());
+    for (int i = 0; i < totalNodes; i++) {
+        int lookIdx = isLoopTrack ? ((i + 8) % totalNodes) : std::min(totalNodes - 1, i + 8);
+        const TrackNode &curr = nodes[i];
+        const TrackNode &next = nodes[lookIdx];
+        double dotProd = curr.tangent.dot(next.tangent);
+        if (dotProd < 0.96) {
+            nodes[i].isCorner = true;
+        }
+    }
+
+    if (!nodes.empty()) {
+        const Vec2D &t = nodes[0].tangent;
+        startHeading = std::atan2(t.x, -t.y);
+    }
+}
+
+void TopViewTrack::generateDecorations() {
+    int totalNodes = static_cast<int>(nodes.size());
+    if (totalNodes < 10) return;
+
+    if (currentTrackId == 1) {
+        // Level 1: Clean straight drag sprint - 2 boost pads & nitro canisters, zero oil slicks!
+        std::vector<int> boostIndices = { totalNodes / 3, (totalNodes * 2) / 3 };
+        for (int idx : boostIndices) {
+            const TrackNode &n = nodes[idx];
+            BoostPad pad;
+            pad.pos = n.center;
+            pad.angle = std::atan2(n.tangent.x, -n.tangent.y);
+            pad.width = roadWidth * 0.70;
+            pad.height = 42.0;
+            pad.pulseAnim = 0.0;
+            boostPads.push_back(pad);
+        }
+
+        std::vector<int> nitroIndices = { totalNodes / 4, (totalNodes * 3) / 4 };
+        for (int idx : nitroIndices) {
+            const TrackNode &n = nodes[idx];
+            NitroPickup np;
+            np.pos = n.center + n.normal * (roadWidth * 0.28);
+            np.active = true;
+            np.respawnTimer = 0.0;
+            nitroPickups.push_back(np);
+        }
+        return;
+    }
+
+    std::vector<int> boostIndices = {
+        totalNodes / 5,
+        (totalNodes * 3) / 6,
+        (totalNodes * 4) / 5
+    };
+
+    for (int idx : boostIndices) {
+        const TrackNode &n = nodes[idx];
+        BoostPad pad;
+        pad.pos = n.center;
+        pad.angle = std::atan2(n.tangent.x, -n.tangent.y);
+        pad.width = roadWidth * 0.70;
+        pad.height = 42.0;
+        pad.pulseAnim = 0.0;
+        boostPads.push_back(pad);
+    }
+
+    std::vector<int> nitroIndices = {
+        totalNodes / 4,
+        (totalNodes * 3) / 5,
+        (totalNodes * 7) / 8
+    };
+
+    for (int idx : nitroIndices) {
+        const TrackNode &n = nodes[idx];
+        NitroPickup np;
+        np.pos = n.center + n.normal * (roadWidth * 0.28);
+        np.active = true;
+        np.respawnTimer = 0.0;
+        nitroPickups.push_back(np);
+    }
+
+    std::vector<int> oilIndices = {
+        totalNodes / 3,
+        (totalNodes * 7) / 10
+    };
+
+    for (int idx : oilIndices) {
+        const TrackNode &n = nodes[idx];
+        OilSlick os;
+        os.pos = n.center - n.normal * (roadWidth * 0.30);
+        os.radius = 28.0;
+        oilSlicks.push_back(os);
+    }
+}
+
+Vec2D TopViewTrack::getPointAtDistance(double dist) const {
+    if (nodes.empty()) return Vec2D(0.0, 0.0);
+    if (!isLoopTrack) {
+        if (dist <= 0.0) return nodes.front().center;
+        if (dist >= totalTrackLength) return nodes.back().center;
+    } else {
+        while (dist < 0.0) dist += totalTrackLength;
+        while (dist >= totalTrackLength) dist -= totalTrackLength;
+    }
+
+    for (size_t i = 0; i + 1 < nodes.size(); i++) {
+        if (dist >= nodes[i].distFromStart && dist <= nodes[i+1].distFromStart) {
+            double segLen = nodes[i+1].distFromStart - nodes[i].distFromStart;
+            double t = (segLen > 1e-4) ? (dist - nodes[i].distFromStart) / segLen : 0.0;
+            return nodes[i].center * (1.0 - t) + nodes[i+1].center * t;
+        }
+    }
+    return nodes.back().center;
+}
+
+double TopViewTrack::getDistanceAlongTrack(const Vec2D &point) const {
+    if (nodes.empty()) return 0.0;
+    double bestDistSq = 1e12;
+    double bestDist = 0.0;
+
+    for (const auto &n : nodes) {
+        double dSq = (point - n.center).lengthSquared();
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            bestDist = n.distFromStart;
+        }
+    }
+    return bestDist;
+}
+
+bool TopViewTrack::isPointOnTrack(const Vec2D &point, double &distFromCenter) const {
+    if (nodes.empty()) {
+        distFromCenter = 999.0;
+        return false;
+    }
+
+    double bestDistSq = 1e12;
+    for (const auto &n : nodes) {
+        double dSq = (point - n.center).lengthSquared();
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+        }
+    }
+
+    distFromCenter = std::sqrt(bestDistSq);
+    return distFromCenter <= (roadWidth / 2.0);
+}
+
+Vec2D TopViewTrack::getTangentAtPoint(const Vec2D &point) const {
+    if (nodes.empty()) return Vec2D(0.0, -1.0);
+    double bestDistSq = 1e12;
+    Vec2D tangent = nodes[0].tangent;
+
+    for (const auto &n : nodes) {
+        double dSq = (point - n.center).lengthSquared();
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            tangent = n.tangent;
+        }
+    }
+    return tangent;
+}
+
+Vec2D TopViewTrack::getTrackCenterAtPoint(const Vec2D &point) const {
+    if (nodes.empty()) return Vec2D(0.0, 0.0);
+    double bestDistSq = 1e12;
+    Vec2D center = nodes[0].center;
+
+    for (const auto &n : nodes) {
+        double dSq = (point - n.center).lengthSquared();
+        if (dSq < bestDistSq) {
+            bestDistSq = dSq;
+            center = n.center;
+        }
+    }
+    return center;
+}
+
+bool TopViewTrack::checkBarrierCollision(const Vec2D &pos, double radius, Vec2D &pushOut) const {
+    double distFromCenter = 0.0;
+    bool onTrack = isPointOnTrack(pos, distFromCenter);
+
+    if (!isLoopTrack) {
+        double distAlong = getDistanceAlongTrack(pos);
+        if (distAlong < 30.0) {
+            Vec2D tangent = getTangentAtPoint(pos);
+            pushOut = tangent * (30.0 - distAlong + radius);
+            return true;
+        }
+        if (distAlong > totalTrackLength - 20.0) {
+            Vec2D tangent = getTangentAtPoint(pos);
+            pushOut = -tangent * (distAlong - (totalTrackLength - 20.0) + radius);
+            return true;
+        }
+    }
+
+    if (onTrack) {
+        return false; // Safely on track!
+    }
+
+    // Outer barrier boundary limit
+    double maxDist = (roadWidth / 2.0) + 14.0;
+    if (distFromCenter > maxDist) {
+        Vec2D center = getTrackCenterAtPoint(pos);
+        Vec2D toTrack = (center - pos).normalized();
+        double penetration = (distFromCenter - maxDist) + radius;
+        pushOut = toTrack * penetration;
+        return true;
+    }
+    return false;
+}
+
+bool TopViewTrack::checkBoostPad(const Vec2D &pos, double radius) {
+    for (const auto &bp : boostPads) {
+        if ((pos - bp.pos).length() <= (bp.height / 2.0 + radius + 10.0)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TopViewTrack::checkOilSlick(const Vec2D &pos, double radius) {
+    for (const auto &os : oilSlicks) {
+        if ((pos - os.pos).length() <= (os.radius + radius)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TopViewTrack::checkNitroPickup(const Vec2D &pos, double radius) {
+    for (auto &np : nitroPickups) {
+        if (np.active && (pos - np.pos).length() <= (22.0 + radius)) {
+            np.active = false;
+            np.respawnTimer = 6.0;
+            return true;
+        }
+    }
+    return false;
+}
+
+Vec2D TopViewTrack::getGridPosition(int gridIndex) const {
+    if (nodes.empty()) return Vec2D(0.0, 0.0);
+
+    // Staggered grid across the 4 massive lanes (widths 95px each):
+    // gridIndex 0: Lane 2 (-48 px) - Player Pole Position
+    // gridIndex 1: Lane 3 (+48 px) - Rival 1
+    // gridIndex 2: Lane 1 (-135 px) - Rival 2
+    // gridIndex 3: Lane 4 (+135 px) - Rival 3
+    // gridIndex 4: Lane 2 (-48 px) - Rival 4
+    double sideOffset = 0.0;
+    if (gridIndex == 0) sideOffset = -48.0;
+    else if (gridIndex == 1) sideOffset = 48.0;
+    else if (gridIndex == 2) sideOffset = -135.0;
+    else if (gridIndex == 3) sideOffset = 135.0;
+    else sideOffset = ((gridIndex % 2 == 0) ? -48.0 : 48.0);
+
+    Vec2D pt;
+    if (!isLoopTrack) {
+        // Point-to-point sprint: start line is at S = 420 px
+        double carDist = 420.0 - 55.0 - (gridIndex * 55.0);
+        pt = getPointAtDistance(std::max(60.0, carDist));
+    } else {
+        // Closed loop circuit: start line is at S = 0
+        double offsetDist = 55.0 + (gridIndex * 65.0);
+        pt = getPointAtDistance(totalTrackLength - offsetDist);
+    }
+
+    Vec2D tangent = getTangentAtPoint(pt);
+    Vec2D normal = Vec2D(-tangent.y, tangent.x);
+
+    return pt + normal * sideOffset;
+}
+
+void TopViewTrack::getTrackBounds(double &outMinX, double &outMaxX, double &outMinY, double &outMaxY) const {
+    if (nodes.empty()) {
+        outMinX = 0; outMaxX = 2000; outMinY = 0; outMaxY = 2000;
+        return;
+    }
+    outMinX = 1e9; outMaxX = -1e9;
+    outMinY = 1e9; outMaxY = -1e9;
+
+    for (const auto &n : nodes) {
+        if (n.center.x < outMinX) outMinX = n.center.x;
+        if (n.center.x > outMaxX) outMaxX = n.center.x;
+        if (n.center.y < outMinY) outMinY = n.center.y;
+        if (n.center.y > outMaxY) outMaxY = n.center.y;
+    }
+
+    outMinX -= 150.0;
+    outMaxX += 150.0;
+    outMinY -= 150.0;
+    outMaxY += 150.0;
+}
+
+void TopViewTrack::update(double dt) {
+    for (auto &bp : boostPads) {
+        bp.pulseAnim += dt * 6.0;
+    }
+
+    for (auto &np : nitroPickups) {
+        if (!np.active) {
+            np.respawnTimer -= dt;
+            if (np.respawnTimer <= 0.0) {
+                np.active = true;
+            }
+        }
+    }
+}
+
+void TopViewTrack::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix, const Vec2D &camPos, double viewRadius) {
+    // 1. Base Terrain Grass / City Pavement
+    for (int y = 0; y < fbH; y++) {
+        uint32_t groundCol = ((y / 36) % 2 == 0) ? theme.terrainBaseColor : theme.terrainPatternColor;
+        fillScanline(fb, fbW, fbH, y, 0, fbW - 1, groundCol);
+    }
+
+    int totalNodes = static_cast<int>(nodes.size());
+    if (totalNodes < 4) return;
+
+    double maxDistSq = viewRadius * viewRadius;
+
+    // 2. Render Track Segments
+    int endNode = isLoopTrack ? totalNodes : (totalNodes - 1);
+    for (int i = 0; i < endNode; i++) {
+        int nextIdx = isLoopTrack ? ((i + 1) % totalNodes) : (i + 1);
+        const TrackNode &n0 = nodes[i];
+        const TrackNode &n1 = nodes[nextIdx];
+
+        if ((n0.center - camPos).lengthSquared() > maxDistSq &&
+            (n1.center - camPos).lengthSquared() > maxDistSq) {
+            continue;
+        }
+
+        Vec2D sL0 = viewMatrix.transform(n0.leftEdge);
+        Vec2D sR0 = viewMatrix.transform(n0.rightEdge);
+        Vec2D sL1 = viewMatrix.transform(n1.leftEdge);
+        Vec2D sR1 = viewMatrix.transform(n1.rightEdge);
+
+        Vec2D sKL0 = viewMatrix.transform(n0.leftKerb);
+        Vec2D sKR0 = viewMatrix.transform(n0.rightKerb);
+        Vec2D sKL1 = viewMatrix.transform(n1.leftKerb);
+        Vec2D sKR1 = viewMatrix.transform(n1.rightKerb);
+
+        // A. Rumble Kerbs on corners
+        if (n0.isCorner || n1.isCorner) {
+            uint32_t kerbCol = ((i / 2) % 2 == 0) ? theme.kerbColor1 : theme.kerbColor2;
+
+            std::vector<Vec2D> leftKerbPoly = { sKL0, sL0, sL1, sKL1 };
+            fillConvexPolygon(fb, fbW, fbH, leftKerbPoly, kerbCol);
+
+            std::vector<Vec2D> rightKerbPoly = { sR0, sKR0, sKR1, sR1 };
+            fillConvexPolygon(fb, fbW, fbH, rightKerbPoly, kerbCol);
+        }
+
+        // B. Wide Asphalt Surface Quad (240px wide!)
+        std::vector<Vec2D> roadPoly = { sL0, sR0, sR1, sL1 };
+        fillConvexPolygon(fb, fbW, fbH, roadPoly, theme.asphaltColor);
+
+        // C. Continuous Solid Outer Border Lines
+        drawBresenhamLine(fb, fbW, fbH,
+                          static_cast<int>(sL0.x), static_cast<int>(sL0.y),
+                          static_cast<int>(sL1.x), static_cast<int>(sL1.y),
+                          theme.asphaltBorderColor, 3);
+
+        drawBresenhamLine(fb, fbW, fbH,
+                          static_cast<int>(sR0.x), static_cast<int>(sR0.y),
+                          static_cast<int>(sR1.x), static_cast<int>(sR1.y),
+                          theme.asphaltBorderColor, 3);
+
+        // D. 3 Dashed Lane Lines (separating 4 dedicated massive 95px lanes!)
+        if ((i % 3) != 0) {
+            // Lane 1 divider (offset -95)
+            Vec2D l1_0 = viewMatrix.transform(n0.center - n0.normal * 95.0);
+            Vec2D l1_1 = viewMatrix.transform(n1.center - n1.normal * 95.0);
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(l1_0.x), static_cast<int>(l1_0.y),
+                              static_cast<int>(l1_1.x), static_cast<int>(l1_1.y), theme.laneLineColor, 2);
+
+            // Centerline divider (offset 0)
+            Vec2D c0 = viewMatrix.transform(n0.center);
+            Vec2D c1 = viewMatrix.transform(n1.center);
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(c0.x), static_cast<int>(c0.y),
+                              static_cast<int>(c1.x), static_cast<int>(c1.y), theme.centerLineColor, 2);
+
+            // Lane 3 divider (offset +95)
+            Vec2D l2_0 = viewMatrix.transform(n0.center + n0.normal * 95.0);
+            Vec2D l2_1 = viewMatrix.transform(n1.center + n1.normal * 95.0);
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(l2_0.x), static_cast<int>(l2_0.y),
+                              static_cast<int>(l2_1.x), static_cast<int>(l2_1.y), theme.laneLineColor, 2);
+        }
+    }
+
+    // 3. Start & Finish Lines
+    if (isLoopTrack) {
+        const TrackNode &startNode = nodes[0];
+        Vec2D sL = viewMatrix.transform(startNode.leftEdge);
+        Vec2D sR = viewMatrix.transform(startNode.rightEdge);
+
+        int numCheckers = 28;
+        for (int c = 0; c < numCheckers; c++) {
+            double t0 = static_cast<double>(c) / numCheckers;
+            double t1 = static_cast<double>(c + 1) / numCheckers;
+
+            Vec2D p0 = sL * (1.0 - t0) + sR * t0;
+            Vec2D p1 = sL * (1.0 - t1) + sR * t1;
+
+            Vec2D fwd = viewMatrix.transform(startNode.center + startNode.tangent * 24.0) - viewMatrix.transform(startNode.center);
+
+            std::vector<Vec2D> checkQuad = {
+                p0, p1, p1 + fwd, p0 + fwd
+            };
+            uint32_t col = (c % 2 == 0) ? rgba(255, 255, 255) : rgba(15, 23, 42);
+            fillConvexPolygon(fb, fbW, fbH, checkQuad, col);
+        }
+
+        Vec2D sCenter = viewMatrix.transform(startNode.center);
+        drawArcadeText(fb, fbW, fbH, static_cast<int>(sCenter.x - 30), static_cast<int>(sCenter.y - 24), "START / FINISH", rgba(250, 204, 21), 1, true);
+    } else {
+        // A. Start Line across road at S = 420 px
+        int startNodeIdx = 0;
+        for (size_t i = 0; i < nodes.size(); i++) {
+            if (nodes[i].distFromStart >= 420.0) {
+                startNodeIdx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (startNodeIdx < totalNodes) {
+            const TrackNode &sNode = nodes[startNodeIdx];
+            Vec2D sL = viewMatrix.transform(sNode.leftEdge);
+            Vec2D sR = viewMatrix.transform(sNode.rightEdge);
+            Vec2D fwd = viewMatrix.transform(sNode.center + sNode.tangent * 24.0) - viewMatrix.transform(sNode.center);
+
+            int numCheckers = 28;
+            for (int c = 0; c < numCheckers; c++) {
+                double t0 = static_cast<double>(c) / numCheckers;
+                double t1 = static_cast<double>(c + 1) / numCheckers;
+                Vec2D p0 = sL * (1.0 - t0) + sR * t0;
+                Vec2D p1 = sL * (1.0 - t1) + sR * t1;
+                std::vector<Vec2D> checkQuad = { p0, p1, p1 + fwd, p0 + fwd };
+                uint32_t col = (c % 2 == 0) ? rgba(34, 197, 94) : rgba(255, 255, 255);
+                fillConvexPolygon(fb, fbW, fbH, checkQuad, col);
+            }
+            Vec2D sCenter = viewMatrix.transform(sNode.center);
+            drawArcadeText(fb, fbW, fbH, static_cast<int>(sCenter.x - 24), static_cast<int>(sCenter.y - 24), "START LINE", rgba(34, 197, 94), 1, true);
+        }
+
+        // B. Checkered Stage Finish Line near end of the sprint
+        int finishNodeIdx = std::max(0, totalNodes - 3);
+        const TrackNode &fNode = nodes[finishNodeIdx];
+        Vec2D fL = viewMatrix.transform(fNode.leftEdge);
+        Vec2D fR = viewMatrix.transform(fNode.rightEdge);
+        Vec2D fwd = viewMatrix.transform(fNode.center + fNode.tangent * 28.0) - viewMatrix.transform(fNode.center);
+
+        int numCheckers = 28;
+        for (int c = 0; c < numCheckers; c++) {
+            double t0 = static_cast<double>(c) / numCheckers;
+            double t1 = static_cast<double>(c + 1) / numCheckers;
+            Vec2D p0 = fL * (1.0 - t0) + fR * t0;
+            Vec2D p1 = fL * (1.0 - t1) + fR * t1;
+            std::vector<Vec2D> checkQuad = { p0, p1, p1 + fwd, p0 + fwd };
+            uint32_t col = (c % 2 == 0) ? rgba(250, 204, 21) : rgba(15, 23, 42);
+            fillConvexPolygon(fb, fbW, fbH, checkQuad, col);
+        }
+        Vec2D fCenter = viewMatrix.transform(fNode.center);
+        drawArcadeText(fb, fbW, fbH, static_cast<int>(fCenter.x - 30), static_cast<int>(fCenter.y - 24), "STAGE FINISH", rgba(250, 204, 21), 1, true);
+    }
+
+    // 4. Interactive Speed Boost Pads
+    for (const auto &bp : boostPads) {
+        if ((bp.pos - camPos).lengthSquared() > maxDistSq) continue;
+
+        Mat2D padMat = Mat2D::multiply(Mat2D::translation(bp.pos.x, bp.pos.y), Mat2D::rotation(bp.angle));
+        Mat2D padToScreen = Mat2D::multiply(viewMatrix, padMat);
+
+        double hw = bp.width / 2.0;
+        double hh = bp.height / 2.0;
+
+        std::vector<Vec2D> padBox = {
+            padToScreen.transform(-hw,  hh),
+            padToScreen.transform( hw,  hh),
+            padToScreen.transform( hw, -hh),
+            padToScreen.transform(-hw, -hh)
+        };
+
+        double pulse = 0.5 + 0.5 * std::sin(bp.pulseAnim);
+        uint32_t padBg = lerpRgba(rgba(14, 165, 233, 210), rgba(234, 179, 8, 230), pulse);
+        fillConvexPolygonBlend(fb, fbW, fbH, padBox, padBg);
+        drawPolygonOutline(fb, fbW, fbH, padBox, rgba(255, 255, 255), 2);
+
+        for (double v = -12.0; v <= 12.0; v += 12.0) {
+            Vec2D tip = padToScreen.transform(0.0, v + 8.0);
+            Vec2D lArm = padToScreen.transform(-hw * 0.6, v - 5.0);
+            Vec2D rArm = padToScreen.transform( hw * 0.6, v - 5.0);
+
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(tip.x), static_cast<int>(tip.y), static_cast<int>(lArm.x), static_cast<int>(lArm.y), rgba(255, 255, 255), 3);
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(tip.x), static_cast<int>(tip.y), static_cast<int>(rArm.x), static_cast<int>(rArm.y), rgba(255, 255, 255), 3);
+        }
+    }
+
+    // 5. Oil Slicks
+    for (const auto &os : oilSlicks) {
+        if ((os.pos - camPos).lengthSquared() > maxDistSq) continue;
+        Vec2D sPos = viewMatrix.transform(os.pos);
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(sPos.x), static_cast<int>(sPos.y), static_cast<int>(os.radius), rgba(15, 23, 42, 220));
+        drawMidpointCircle(fb, fbW, fbH, static_cast<int>(sPos.x - 3), static_cast<int>(sPos.y - 3), static_cast<int>(os.radius * 0.6), rgba(99, 102, 241, 160), 2);
+    }
+
+    // 6. Nitro Pickup Canisters
+    for (const auto &np : nitroPickups) {
+        if (!np.active || (np.pos - camPos).lengthSquared() > maxDistSq) continue;
+        Vec2D sPos = viewMatrix.transform(np.pos);
+        int sx = static_cast<int>(sPos.x);
+        int sy = static_cast<int>(sPos.y);
+
+        fillMidpointCircle(fb, fbW, fbH, sx, sy, 16, rgba(6, 182, 212, 100));
+        fillMidpointCircle(fb, fbW, fbH, sx, sy, 9, rgba(6, 182, 212, 220));
+        fillMidpointCircle(fb, fbW, fbH, sx, sy, 4, rgba(255, 255, 255, 255));
+        drawArcadeText(fb, fbW, fbH, sx - 4, sy - 4, "N", rgba(255, 255, 255), 1, false);
+    }
+}
