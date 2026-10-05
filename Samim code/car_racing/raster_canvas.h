@@ -5,6 +5,7 @@
 #include <QImage>
 #include <QPainter>
 #include <QKeyEvent>
+#include <QResizeEvent>
 #include <vector>
 #include <unordered_set>
 #include <cstdint>
@@ -24,12 +25,16 @@ public:
 
     bool isKeyPressed(int key) const;
 
+    QSize sizeHint() const override { return QSize(canvasWidth, canvasHeight); }
+    QSize minimumSizeHint() const override { return QSize(400, 300); }
+
 signals:
     void keyPressedSignal(int key);
     void keyReleasedSignal(int key);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
 

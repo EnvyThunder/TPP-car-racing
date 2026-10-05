@@ -11,6 +11,9 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override = default;
 
+protected:
+    void keyPressEvent(QKeyEvent *event) override;
+
 private:
     RasterCanvas *canvas;
     TopViewEngine *engine;

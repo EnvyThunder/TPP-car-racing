@@ -531,7 +531,8 @@ void TopViewEngine::renderFrame() {
     }
 
     // 1. Render Wide 4-Lane Track
-    track.render(fb, fbW, fbH, viewMatrix, cameraPos, 1600.0);
+    double viewRadius = std::max(1600.0, std::hypot(fbW / 2.0, fbH / 2.0) + 300.0);
+    track.render(fb, fbW, fbH, viewMatrix, cameraPos, viewRadius);
 
     // 2. Render Skid Marks
     renderSkidMarks(fb, fbW, fbH, viewMatrix);

@@ -15,7 +15,7 @@ TopViewRival::TopViewRival(const std::string &name, int carIdx, double startDist
       nitroCooldown(3.0),
       laneShiftTimer(2.5 + (rand() % 3)),
       currentLevel(1),
-      speedScale(0.78),
+      speedScale(0.52),
       safetyDistance(95.0),
       mistakeProbability(0.03),
       crashWobbleTimer(0.0),
@@ -28,38 +28,40 @@ TopViewRival::TopViewRival(const std::string &name, int carIdx, double startDist
 void TopViewRival::setLevel(int level) {
     currentLevel = level;
     if (level == 1) {
-        // Level 1: Straight drag road, opponents at ~42% speed (~160-170 px/s)
-        // Clean cruise, player at 380+ px/s easily overtakes but opponents still have nice motion
-        speedScale = 0.42;
-        safetyDistance = 110.0;
+        // Level 1: Straight drag road, opponents at ~52% speed (~200-210 px/s)
+        // Slight difficulty increase: smooth cruising pack, easily overtakable by player (at 100%)
+        speedScale = 0.52;
+        safetyDistance = 100.0;
         mistakeProbability = 0.00;
         nitroCooldown = 999.0;
     } else if (level == 2) {
-        // Level 2: Gentle coastal curves, opponents at ~54% speed (~210-220 px/s)
-        speedScale = 0.54;
-        safetyDistance = 85.0;
+        // Level 2: Gentle coastal curves, opponents at ~63% speed (~245-255 px/s)
+        // Gradual increase: nice steady road pace
+        speedScale = 0.63;
+        safetyDistance = 80.0;
         mistakeProbability = 0.04;
-        nitroCooldown = 20.0;
+        nitroCooldown = 18.0;
     } else if (level == 3) {
-        // Level 3: Winding canyon, opponents at ~65% speed (~255-265 px/s)
-        speedScale = 0.65;
-        safetyDistance = 65.0;
+        // Level 3: Winding canyon, opponents at ~73% speed (~285-295 px/s)
+        // Gradual increase: moderately challenging through canyon curves
+        speedScale = 0.73;
+        safetyDistance = 60.0;
         mistakeProbability = 0.10;
-        nitroCooldown = 14.0;
+        nitroCooldown = 12.0;
     } else if (level == 4) {
-        // Level 4: Closed loop circuit (3 laps!), opponents at ~75% speed (~295-305 px/s)
-        // Balanced competitive racing, player still has solid speed advantage
-        speedScale = 0.75;
-        safetyDistance = 50.0;
-        mistakeProbability = 0.18;
-        nitroCooldown = 9.0;
+        // Level 4: Closed loop circuit (3 laps!), opponents at ~82% speed (~320-330 px/s)
+        // Competitive racing pack, player maintains clear lead with good lines & nitro
+        speedScale = 0.82;
+        safetyDistance = 45.0;
+        mistakeProbability = 0.16;
+        nitroCooldown = 8.0;
     } else {
-        // Level 5: Championship loop (3 laps!), opponents at ~85% speed (~335-345 px/s)
-        // Exciting championship pace while keeping player (380 - 430 px/s) comfortably in the lead!
-        speedScale = 0.85;
-        safetyDistance = 40.0;
-        mistakeProbability = 0.25;
-        nitroCooldown = 6.0;
+        // Level 5: Championship loop (3 laps!), opponents at ~90% speed (~350-365 px/s)
+        // Thrilling championship pace, player retains full speed (100%) + nitro advantage
+        speedScale = 0.90;
+        safetyDistance = 38.0;
+        mistakeProbability = 0.22;
+        nitroCooldown = 5.5;
     }
     car.setSpeedScale(speedScale);
 }
