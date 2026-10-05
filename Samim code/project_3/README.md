@@ -25,7 +25,7 @@ Unlike traditional third-person racers where vehicles are viewed from behind wit
 
 ## 🛣️ Circuit Design & Racing Mechanics
 
-- **Massive 4-Lane Circuits (380px Road Width)**: Over $3.5\times$ wider than typical arcade tracks, accommodating up to 12 supercars side-by-side with 4 dedicated lanes (Inside, Mid-Left, Mid-Right, Outside).
+- **Massive 4-Lane Circuits (540px Road Width)**: Over $4\times$ wider than standard tracks, accommodating up to 14 supercars side-by-side with 4 dedicated massive lanes (135px each: Inside, Mid-Left, Mid-Right, Outside).
 - **Dynamic AI Competitors**: AI rivals select racing lanes, overtake intelligently, and draft behind other vehicles.
 - **Fluid Barrier Deflection**: Outer barriers deflect vehicles smoothly forward along the track curve—preventing jarring dead-stops.
 - **Controlled Crawl Reverse**: Reversing (`[DOWN]` / `[S]`) operates at a gentle, controlled crawl (~35 km/h) with bright white reverse lamps for effortless maneuvering.

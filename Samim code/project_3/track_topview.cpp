@@ -4,7 +4,7 @@
 
 TopViewTrack::TopViewTrack()
     : currentTrackId(1),
-      roadWidth(380.0), // Ultra-wide 380px 4-lane highway!
+      roadWidth(540.0), // Ultra-wide 540px 4-lane highway!
       totalTrackLength(0.0),
       startHeading(0.0),
       isLoopTrack(false) {
@@ -13,7 +13,7 @@ TopViewTrack::TopViewTrack()
 
 void TopViewTrack::loadTrack(int trackId) {
     currentTrackId = trackId;
-    roadWidth = 380.0;
+    roadWidth = 540.0;
     controlPoints.clear();
     nodes.clear();
     boostPads.clear();
@@ -528,18 +528,19 @@ bool TopViewTrack::checkNitroPickup(const Vec2D &pos, double radius) {
 Vec2D TopViewTrack::getGridPosition(int gridIndex) const {
     if (nodes.empty()) return Vec2D(0.0, 0.0);
 
-    // Staggered grid across the 4 massive lanes (widths 95px each):
-    // gridIndex 0: Lane 2 (-48 px) - Player Pole Position
-    // gridIndex 1: Lane 3 (+48 px) - Rival 1
-    // gridIndex 2: Lane 1 (-135 px) - Rival 2
-    // gridIndex 3: Lane 4 (+135 px) - Rival 3
-    // gridIndex 4: Lane 2 (-48 px) - Rival 4
+    // Staggered grid across the 4 massive lanes (widths 135px each):
+    // gridIndex 0: Lane 2 (-68 px) - Player Pole Position
+    // gridIndex 1: Lane 3 (+68 px) - Rival 1
+    // gridIndex 2: Lane 1 (-195 px) - Rival 2
+    // gridIndex 3: Lane 4 (+195 px) - Rival 3
+    // gridIndex 4: Lane 2 (-68 px) - Rival 4
+    double laneW = roadWidth / 4.0;
     double sideOffset = 0.0;
-    if (gridIndex == 0) sideOffset = -48.0;
-    else if (gridIndex == 1) sideOffset = 48.0;
-    else if (gridIndex == 2) sideOffset = -135.0;
-    else if (gridIndex == 3) sideOffset = 135.0;
-    else sideOffset = ((gridIndex % 2 == 0) ? -48.0 : 48.0);
+    if (gridIndex == 0) sideOffset = -laneW * 0.5;
+    else if (gridIndex == 1) sideOffset = laneW * 0.5;
+    else if (gridIndex == 2) sideOffset = -laneW * 1.45;
+    else if (gridIndex == 3) sideOffset = laneW * 1.45;
+    else sideOffset = ((gridIndex % 2 == 0) ? -laneW * 0.5 : laneW * 0.5);
 
     Vec2D pt;
     if (!isLoopTrack) {
@@ -654,11 +655,12 @@ void TopViewTrack::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatri
                           static_cast<int>(sR1.x), static_cast<int>(sR1.y),
                           theme.asphaltBorderColor, 3);
 
-        // D. 3 Dashed Lane Lines (separating 4 dedicated massive 95px lanes!)
+        // D. 3 Dashed Lane Lines (separating 4 dedicated massive lanes!)
         if ((i % 3) != 0) {
-            // Lane 1 divider (offset -95)
-            Vec2D l1_0 = viewMatrix.transform(n0.center - n0.normal * 95.0);
-            Vec2D l1_1 = viewMatrix.transform(n1.center - n1.normal * 95.0);
+            double laneW = roadWidth / 4.0;
+            // Lane 1 divider (offset -laneW)
+            Vec2D l1_0 = viewMatrix.transform(n0.center - n0.normal * laneW);
+            Vec2D l1_1 = viewMatrix.transform(n1.center - n1.normal * laneW);
             drawBresenhamLine(fb, fbW, fbH, static_cast<int>(l1_0.x), static_cast<int>(l1_0.y),
                               static_cast<int>(l1_1.x), static_cast<int>(l1_1.y), theme.laneLineColor, 2);
 
@@ -668,9 +670,9 @@ void TopViewTrack::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatri
             drawBresenhamLine(fb, fbW, fbH, static_cast<int>(c0.x), static_cast<int>(c0.y),
                               static_cast<int>(c1.x), static_cast<int>(c1.y), theme.centerLineColor, 2);
 
-            // Lane 3 divider (offset +95)
-            Vec2D l2_0 = viewMatrix.transform(n0.center + n0.normal * 95.0);
-            Vec2D l2_1 = viewMatrix.transform(n1.center + n1.normal * 95.0);
+            // Lane 3 divider (offset +laneW)
+            Vec2D l2_0 = viewMatrix.transform(n0.center + n0.normal * laneW);
+            Vec2D l2_1 = viewMatrix.transform(n1.center + n1.normal * laneW);
             drawBresenhamLine(fb, fbW, fbH, static_cast<int>(l2_0.x), static_cast<int>(l2_0.y),
                               static_cast<int>(l2_1.x), static_cast<int>(l2_1.y), theme.laneLineColor, 2);
         }

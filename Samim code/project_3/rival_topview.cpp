@@ -161,11 +161,11 @@ void TopViewRival::update(double dt, const TopViewTrack &track, const std::vecto
         }
 
         if (carAheadInLane) {
-            // Shift to adjacent lane to overtake!
+            // Shift to adjacent lane to overtake across massive 540px road!
             if (currentLateralOffset < 0.0) {
-                targetLateralOffset = std::min(135.0, currentLateralOffset + 85.0);
+                targetLateralOffset = std::min(200.0, currentLateralOffset + 120.0);
             } else {
-                targetLateralOffset = std::max(-135.0, currentLateralOffset - 85.0);
+                targetLateralOffset = std::max(-200.0, currentLateralOffset - 120.0);
             }
         } else if (rand() % 3 == 0) {
             // Return to preferred base lane
