@@ -59,6 +59,26 @@ struct TrackNode {
     bool isCorner;
 };
 
+enum PropType {
+    PROP_OAK_TREE = 0,
+    PROP_PINE_TREE,
+    PROP_PALM_TREE,
+    PROP_BUSH_CLUSTER,
+    PROP_FLOWER_PATCH,
+    PROP_BOULDER,
+    PROP_TIRE_STACK,
+    PROP_LAMP_POST
+};
+
+struct RoadsideProp {
+    Vec2D pos;
+    double scale;
+    double rotation;
+    PropType type;
+    uint32_t color1;
+    uint32_t color2;
+};
+
 class TopViewTrack {
 public:
     TopViewTrack();
@@ -117,9 +137,11 @@ private:
     std::vector<BoostPad> boostPads;
     std::vector<NitroPickup> nitroPickups;
     std::vector<OilSlick> oilSlicks;
+    std::vector<RoadsideProp> roadsideProps;
 
     void buildTrackGeometry();
     void generateDecorations();
+    void renderRoadsideProps(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix, const Vec2D &camPos, double viewRadius);
 };
 
 #endif // TRACK_TOPVIEW_H

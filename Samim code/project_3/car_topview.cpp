@@ -367,13 +367,13 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         drawHeadlightCone(fb, fbW, fbH, rightLightScreen, forwardScreen, 0.42, 120.0, innerBeam, outerBeam);
     }
 
-    // 3. Four Wheels (with Steerable Front Wheels!)
+    // 3. Four Wheels (with Steerable Front Wheels & 5-Spoke Alloy Rims!)
     auto drawWheel = [&](double cx, double cy, double wheelSteer) {
         Mat2D wheelLocal = Mat2D::multiply(Mat2D::translation(cx, cy), Mat2D::rotation(wheelSteer));
         Mat2D wheelToScreen = Mat2D::multiply(carToScreen, wheelLocal);
 
-        double hw = 3.5;
-        double hl = 8.0;
+        double hw = 4.2;
+        double hl = 8.5;
 
         std::vector<Vec2D> tirePoly = {
             wheelToScreen.transform(-hw,  hl),
@@ -385,9 +385,18 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         drawPolygonOutline(fb, fbW, fbH, tirePoly, rgba(3, 7, 18), 1);
 
         Vec2D rimCenter = wheelToScreen.transform(0.0, 0.0);
-        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(rimCenter.x), static_cast<int>(rimCenter.y), 2, rgba(156, 163, 175));
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(rimCenter.x), static_cast<int>(rimCenter.y), 3, rgba(75, 85, 99));
 
-        Vec2D caliperPos = wheelToScreen.transform(0.0, 3.0);
+        // 5-Spoke Star Rim lines
+        for (int sp = 0; sp < 5; sp++) {
+            double ang = wheelSteer + (sp * 2.0 * 3.14159 / 5.0);
+            Vec2D spTip = wheelToScreen.transform(std::cos(ang) * (hw - 1.0), std::sin(ang) * (hl - 2.5));
+            drawBresenhamLine(fb, fbW, fbH, static_cast<int>(rimCenter.x), static_cast<int>(rimCenter.y),
+                              static_cast<int>(spTip.x), static_cast<int>(spTip.y), rgba(209, 213, 219), 1);
+        }
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(rimCenter.x), static_cast<int>(rimCenter.y), 1, rgba(255, 255, 255));
+
+        Vec2D caliperPos = wheelToScreen.transform(0.0, 3.5);
         putPixelSafe(fb, fbW, fbH, static_cast<int>(caliperPos.x), static_cast<int>(caliperPos.y), spec.caliperColor);
     };
 
@@ -399,19 +408,29 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
     drawWheel(-14.5,  17.0, steerAngle);
     drawWheel( 14.5,  17.0, steerAngle);
 
-    // 4. Front Aerodynamic Splitter
+    // 4. Front Aerodynamic Splitter & Dive Canards
     {
         std::vector<Vec2D> splitterPoly = {
-            toScreen(-13.0, 32.5),
-            toScreen( 13.0, 32.5),
-            toScreen( 14.0, 27.0),
-            toScreen(-14.0, 27.0)
+            toScreen(-14.0, 33.5),
+            toScreen( 14.0, 33.5),
+            toScreen( 15.0, 26.5),
+            toScreen(-15.0, 26.5)
         };
-        fillConvexPolygon(fb, fbW, fbH, splitterPoly, rgba(30, 41, 59));
-        drawPolygonOutline(fb, fbW, fbH, splitterPoly, rgba(15, 23, 42), 1);
+        fillConvexPolygon(fb, fbW, fbH, splitterPoly, rgba(15, 23, 42));
+        drawPolygonOutline(fb, fbW, fbH, splitterPoly, spec.secondaryColor, 1);
+
+        // Aerodynamic canards/winglets
+        drawBresenhamLine(fb, fbW, fbH,
+                          static_cast<int>(toScreen(-15.0, 31.0).x), static_cast<int>(toScreen(-15.0, 31.0).y),
+                          static_cast<int>(toScreen(-18.0, 27.0).x), static_cast<int>(toScreen(-18.0, 27.0).y),
+                          rgba(15, 23, 42), 2);
+        drawBresenhamLine(fb, fbW, fbH,
+                          static_cast<int>(toScreen(15.0, 31.0).x), static_cast<int>(toScreen(15.0, 31.0).y),
+                          static_cast<int>(toScreen(18.0, 27.0).x), static_cast<int>(toScreen(18.0, 27.0).y),
+                          rgba(15, 23, 42), 2);
     }
 
-    // 5. Main Sculpted Hypercar Chassis
+    // 5. Main Sculpted Hypercar Chassis with Bevel Highlights
     {
         std::vector<Vec2D> bodyPoly = {
             toScreen( -9.0,  31.0),
@@ -433,9 +452,29 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         };
         fillConvexPolygon(fb, fbW, fbH, bodyPoly, spec.primaryColor);
         drawPolygonOutline(fb, fbW, fbH, bodyPoly, scaleBrightness(spec.primaryColor, 0.65), 1);
+
+        // Fender highlights & waistline scallops
+        Vec2D fL0 = toScreen(-13.5, 23.0), fL1 = toScreen(-14.5, 15.0);
+        Vec2D fR0 = toScreen( 13.5, 23.0), fR1 = toScreen( 14.5, 15.0);
+        uint32_t highlightCol = scaleBrightness(spec.primaryColor, 1.30);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(fL0.x), static_cast<int>(fL0.y), static_cast<int>(fL1.x), static_cast<int>(fL1.y), highlightCol, 1);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(fR0.x), static_cast<int>(fR0.y), static_cast<int>(fR1.x), static_cast<int>(fR1.y), highlightCol, 1);
     }
 
-    // 6. Center Racing Stripe & Hood Scoops
+    // 6. Daytime Running Lights (DRL LED Eyebrows)
+    {
+        Vec2D drlL0 = toScreen(-13.0, 28.5);
+        Vec2D drlL1 = toScreen( -8.0, 31.0);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(drlL0.x), static_cast<int>(drlL0.y),
+                          static_cast<int>(drlL1.x), static_cast<int>(drlL1.y), rgba(255, 255, 255), 2);
+
+        Vec2D drlR0 = toScreen( 13.0, 28.5);
+        Vec2D drlR1 = toScreen(  8.0, 31.0);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(drlR0.x), static_cast<int>(drlR0.y),
+                          static_cast<int>(drlR1.x), static_cast<int>(drlR1.y), rgba(255, 255, 255), 2);
+    }
+
+    // 7. Center Racing Stripe & Hood Air Extractors
     {
         std::vector<Vec2D> stripePoly = {
             toScreen(-2.5,  30.5),
@@ -445,24 +484,21 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         };
         fillConvexPolygon(fb, fbW, fbH, stripePoly, spec.secondaryColor);
 
+        // Hood cooling vents with black mesh
         std::vector<Vec2D> leftScoop = {
-            toScreen(-8.0, 22.0),
-            toScreen(-5.0, 22.0),
-            toScreen(-6.0, 16.0),
-            toScreen(-8.5, 16.0)
+            toScreen(-8.0, 22.0), toScreen(-5.0, 22.0),
+            toScreen(-6.0, 16.0), toScreen(-8.5, 16.0)
         };
         fillConvexPolygon(fb, fbW, fbH, leftScoop, rgba(15, 23, 42));
 
         std::vector<Vec2D> rightScoop = {
-            toScreen(5.0, 22.0),
-            toScreen(8.0, 22.0),
-            toScreen(8.5, 16.0),
-            toScreen(6.0, 16.0)
+            toScreen(5.0, 22.0), toScreen(8.0, 22.0),
+            toScreen(8.5, 16.0), toScreen(6.0, 16.0)
         };
         fillConvexPolygon(fb, fbW, fbH, rightScoop, rgba(15, 23, 42));
     }
 
-    // 7. Glass Windshield & Specular Glint
+    // 8. Tinted Windshield with Double Specular Glint & Wiper
     {
         std::vector<Vec2D> windshieldPoly = {
             toScreen(-10.5, 15.0),
@@ -470,17 +506,22 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
             toScreen(  9.0,  7.0),
             toScreen( -9.0,  7.0)
         };
-        fillConvexPolygon(fb, fbW, fbH, windshieldPoly, rgba(15, 23, 42, 240));
+        fillConvexPolygon(fb, fbW, fbH, windshieldPoly, rgba(15, 23, 42, 245));
 
+        // Specular glint
         Vec2D glint0 = toScreen(-7.0, 14.0);
         Vec2D glint1 = toScreen(-2.0,  8.0);
-        drawBresenhamLine(fb, fbW, fbH,
-                          static_cast<int>(glint0.x), static_cast<int>(glint0.y),
-                          static_cast<int>(glint1.x), static_cast<int>(glint1.y),
-                          rgba(255, 255, 255, 220), 2);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(glint0.x), static_cast<int>(glint0.y),
+                          static_cast<int>(glint1.x), static_cast<int>(glint1.y), rgba(255, 255, 255, 230), 2);
+
+        // Race wiper blade
+        Vec2D wip0 = toScreen(0.0, 7.5);
+        Vec2D wip1 = toScreen(5.0, 13.5);
+        drawBresenhamLine(fb, fbW, fbH, static_cast<int>(wip0.x), static_cast<int>(wip0.y),
+                          static_cast<int>(wip1.x), static_cast<int>(wip1.y), rgba(30, 41, 59), 1);
     }
 
-    // 8. Roof Panel with Racing Number
+    // 9. Roof Panel with White Racing Number Roundel
     {
         std::vector<Vec2D> roofPoly = {
             toScreen(-9.0,   7.0),
@@ -491,15 +532,19 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         fillConvexPolygon(fb, fbW, fbH, roofPoly, spec.roofColor);
         drawPolygonOutline(fb, fbW, fbH, roofPoly, rgba(15, 23, 42), 1);
 
+        // White racing roundel for sharp number contrast
         Vec2D roofCenter = toScreen(0.0, 1.0);
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(roofCenter.x), static_cast<int>(roofCenter.y), 6, rgba(255, 255, 255));
+        drawMidpointCircle(fb, fbW, fbH, static_cast<int>(roofCenter.x), static_cast<int>(roofCenter.y), 6, rgba(15, 23, 42), 1);
+
         std::string numStr = std::to_string(currentCarIdx + 1);
         drawArcadeText(fb, fbW, fbH,
                        static_cast<int>(roofCenter.x - 3),
                        static_cast<int>(roofCenter.y - 3),
-                       numStr, spec.secondaryColor, 1, false);
+                       numStr, rgba(15, 23, 42), 1, false);
     }
 
-    // 9. Rear Glass & Engine Bay
+    // 10. Rear Glass & Engine Bay
     {
         std::vector<Vec2D> engineGlass = {
             toScreen(-8.5,  -5.0),
@@ -508,6 +553,12 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
             toScreen(-7.5, -17.0)
         };
         fillConvexPolygon(fb, fbW, fbH, engineGlass, rgba(15, 23, 42, 230));
+
+        // Engine cylinder bank details
+        Vec2D engL = toScreen(-3.5, -11.0);
+        Vec2D engR = toScreen( 3.5, -11.0);
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(engL.x), static_cast<int>(engL.y), 3, rgba(203, 213, 225));
+        fillMidpointCircle(fb, fbW, fbH, static_cast<int>(engR.x), static_cast<int>(engR.y), 3, rgba(203, 213, 225));
 
         for (double v = -7.0; v >= -15.0; v -= 3.0) {
             Vec2D sl0 = toScreen(-5.5, v);
@@ -519,22 +570,26 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         }
     }
 
-    // 10. Side Mirrors
+    // 11. Side Mirrors with Reflective Glass
     {
         std::vector<Vec2D> leftMirror = {
             toScreen(-13.0, 9.0), toScreen(-18.0, 9.0),
             toScreen(-17.5, 6.5), toScreen(-12.5, 6.5)
         };
         fillConvexPolygon(fb, fbW, fbH, leftMirror, spec.primaryColor);
+        drawPolygonOutline(fb, fbW, fbH, leftMirror, rgba(15, 23, 42), 1);
+        putPixelSafe(fb, fbW, fbH, static_cast<int>(toScreen(-16.0, 7.8).x), static_cast<int>(toScreen(-16.0, 7.8).y), rgba(226, 232, 240));
 
         std::vector<Vec2D> rightMirror = {
             toScreen(13.0, 9.0), toScreen(18.0, 9.0),
             toScreen(17.5, 6.5), toScreen(12.5, 6.5)
         };
         fillConvexPolygon(fb, fbW, fbH, rightMirror, spec.primaryColor);
+        drawPolygonOutline(fb, fbW, fbH, rightMirror, rgba(15, 23, 42), 1);
+        putPixelSafe(fb, fbW, fbH, static_cast<int>(toScreen(16.0, 7.8).x), static_cast<int>(toScreen(16.0, 7.8).y), rgba(226, 232, 240));
     }
 
-    // 11. GT Rear Wing
+    // 12. GT Rear Wing with Aerodynamic Endplates
     {
         Vec2D pylonL0 = toScreen(-6.0, -22.0);
         Vec2D pylonL1 = toScreen(-6.0, -28.0);
@@ -546,12 +601,28 @@ void TopViewCar::render(uint32_t *fb, int fbW, int fbH, const Mat2D &viewMatrix,
         drawBresenhamLine(fb, fbW, fbH, static_cast<int>(pylonR0.x), static_cast<int>(pylonR0.y),
                           static_cast<int>(pylonR1.x), static_cast<int>(pylonR1.y), rgba(15, 23, 42), 2);
 
+        // Wing Blade
         std::vector<Vec2D> wingPoly = {
-            toScreen(-15.5, -26.0), toScreen( 15.5, -26.0),
-            toScreen( 15.5, -30.0), toScreen(-15.5, -30.0)
+            toScreen(-16.0, -26.0), toScreen( 16.0, -26.0),
+            toScreen( 16.0, -30.0), toScreen(-16.0, -30.0)
         };
         fillConvexPolygon(fb, fbW, fbH, wingPoly, spec.wingColor);
         drawPolygonOutline(fb, fbW, fbH, wingPoly, rgba(15, 23, 42), 1);
+
+        // Prominent Endplates in secondary/team color
+        std::vector<Vec2D> leftEndplate = {
+            toScreen(-17.5, -24.0), toScreen(-15.5, -24.0),
+            toScreen(-15.5, -31.5), toScreen(-17.5, -31.5)
+        };
+        fillConvexPolygon(fb, fbW, fbH, leftEndplate, spec.secondaryColor);
+        drawPolygonOutline(fb, fbW, fbH, leftEndplate, rgba(15, 23, 42), 1);
+
+        std::vector<Vec2D> rightEndplate = {
+            toScreen(15.5, -24.0), toScreen(17.5, -24.0),
+            toScreen(17.5, -31.5), toScreen(15.5, -31.5)
+        };
+        fillConvexPolygon(fb, fbW, fbH, rightEndplate, spec.secondaryColor);
+        drawPolygonOutline(fb, fbW, fbH, rightEndplate, rgba(15, 23, 42), 1);
     }
 
     // 12. Taillights, Brake Lights, & Reverse Lights!
