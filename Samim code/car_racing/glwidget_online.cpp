@@ -80,27 +80,9 @@ QString GLWidget::playerName() const
 
 QString GLWidget::lanAddress()
 {
-    // The address friends on the same Wi-Fi/hotspot can reach (shown for CODE@ADDRESS joining).
-    // Prefer the real Wi-Fi adapter, then Ethernet; skip virtual adapters (WSL, Hyper-V, VMs, VPNs).
-    static const char *VIRTUAL[] = {"vEthernet", "VirtualBox", "VMware", "WSL", "Hyper-V", "Bluetooth", "TAP", "Tailscale", "ZeroTier"};
-    QString best;
-    int bestScore = -1;
-    for (const QNetworkInterface &nif : QNetworkInterface::allInterfaces()) {
-        const auto f = nif.flags();
-        if (!(f & QNetworkInterface::IsUp) || !(f & QNetworkInterface::IsRunning) || (f & QNetworkInterface::IsLoopBack)) continue;
-        bool isVirtual = false;
-        for (const char *v : VIRTUAL)
-            isVirtual = isVirtual || nif.humanReadableName().contains(v, Qt::CaseInsensitive)
-                        || nif.name().contains(v, Qt::CaseInsensitive);
-        if (isVirtual) continue;
-        int score = (nif.type() == QNetworkInterface::Wifi) ? 2 : (nif.type() == QNetworkInterface::Ethernet) ? 1 : 0;
-        for (const QNetworkAddressEntry &e : nif.addressEntries())
-            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && !e.ip().isLinkLocal() && score > bestScore) {
-                best = e.ip().toString();
-                bestScore = score;
-            }
-    }
-    return best;
+    // the address friends on the same Wi-Fi/hotspot can reach (Wi-Fi adapter first)
+    const auto entries = net::lanEntries();
+    return entries.isEmpty() ? QString() : entries.first().ip().toString();
 }
 
 void GLWidget::openOnline()
@@ -406,6 +388,13 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         QByteArray t = s.toUtf8();
         drawText(t.constData(), x, y, size, r, g, b);
     };
+    // status/error messages may hold several lines separated by '|'
+    auto message = [&](float yTop, float size, float r, float g, float b) {
+        const QStringList lines = netMessage.split('|');
+        for (int i = 0; i < lines.size(); ++i)
+            centered(lines[i], yTop - i * (9.0f * size + 4.0f * dpr), size * (i == 0 ? 1.0f : 0.85f),
+                     r, g, i == 0 ? b : std::min(1.0f, b + 0.4f));
+    };
 
     float y = y1 - pad - 7.0f * ps * 1.5f;
     switch (netScreen) {
@@ -429,9 +418,12 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
             if (sel) left(">", bx + bw - 26.0f * dpr, by0 + bh * 0.4f, ps * 1.1f, 1.0f, 0.85f, 0.25f);
             y = by0 - 14.0f * dpr;
         }
-        if (!netMessage.isEmpty()) centered(netMessage, y - 10.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
-        centered("SAME WI-FI OR PHONE HOTSPOT: JUST SHARE THE CODE   |   YOUR NAME: " + playerName(),
-                 y0 + pad + 16.0f * dpr, ps * 0.62f, 0.60f, 0.70f, 0.85f);
+        if (!netMessage.isEmpty()) message(y - 10.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
+        {
+            QString ip = lanAddress();
+            centered("YOUR NAME: " + playerName() + "   -   THIS PC: " + (ip.isEmpty() ? QString("NO NETWORK!") : ip),
+                     y0 + pad + 16.0f * dpr, ps * 0.62f, 0.60f, 0.70f, 0.85f);
+        }
         centered("[UP/DOWN] CHOOSE   [ENTER] OK   [ESC] BACK", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
         break;
     }
@@ -452,14 +444,14 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         centered("4 LETTERS, FOR EXAMPLE K7Q2", y, ps * 0.7f, 0.65f, 0.72f, 0.85f);
         y -= 18.0f * dpr;
         centered("DIFFERENT NETWORK? TYPE CODE@ADDRESS, FOR EXAMPLE K7Q2@203.0.113.5", y, ps * 0.62f, 0.55f, 0.62f, 0.78f);
-        if (!netMessage.isEmpty()) centered(netMessage, y - 30.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
+        if (!netMessage.isEmpty()) message(y - 30.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
         centered("[ENTER] JOIN   [BACKSPACE] DELETE   [ESC] BACK", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
         break;
     }
     case NetScreen::Busy:
         centered("ONLINE", y, ps * 1.5f, 1.0f, 1.0f, 1.0f);
-        centered(netMessage.isEmpty() ? QString("CONNECTING...") : netMessage, (y0 + y1) * 0.5f, ps * 0.95f,
-                 1.0f, 0.88f, 0.30f);
+        if (netMessage.isEmpty()) centered("CONNECTING...", (y0 + y1) * 0.5f, ps * 0.95f, 1.0f, 0.88f, 0.30f);
+        else message((y0 + y1) * 0.5f, ps * 0.95f, 1.0f, 0.88f, 0.30f);
         centered("[ESC] CANCEL", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
         break;
     case NetScreen::Lobby: {
@@ -483,7 +475,19 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
             QString ip = lanAddress();
             if (!ip.isEmpty()) {
                 y -= 16.0f * dpr;
-                centered("IF THE CODE ALONE DOES NOT WORK: " + net->code + "@" + ip, y, ps * 0.6f, 0.55f, 0.65f, 0.80f);
+                centered("IF THE CODE ALONE DOES NOT WORK, FRIENDS TYPE: " + net->code + "@" + ip, y, ps * 0.62f,
+                         0.85f, 0.85f, 0.55f);
+            }
+            if (hostServer && net->players.size() < 2) {
+                // shows whether friends' join attempts reach this PC at all
+                y -= 16.0f * dpr;
+                int seen = hostServer->remoteAttempts();
+                if (seen == 0)
+                    centered("JOIN ATTEMPTS FROM OTHER PCS: 0  -  IF A FRIEND IS TRYING, RUN ALLOW_FIREWALL.BAT ON THIS PC",
+                             y, ps * 0.6f, 1.0f, 0.60f, 0.35f);
+                else
+                    centered(QString("JOIN ATTEMPTS FROM OTHER PCS: %1  -  YOUR NETWORK IS FINE").arg(seen),
+                             y, ps * 0.6f, 0.45f, 1.0f, 0.55f);
             }
         }
         y -= 30.0f * dpr;
@@ -581,6 +585,7 @@ void GLWidget::runNetAutoShot()
     if (host) {
         const int wanted = std::max(1, netTest.section(':', 1, 1).toInt());
         if (f == 45) shot("net_01_online_menu");
+        if (f == 330 && netScreen == NetScreen::Lobby) shot("net_02a_host_waiting");
         if (f == 50) netHost();
         if (!codeWritten && net && !net->code.isEmpty()) {         // tell the test script the code
             QFile file(autoShotDir + "/room.txt");
@@ -596,6 +601,10 @@ void GLWidget::runNetAutoShot()
         if (f == 70) netJoin();
         if (netScreen == NetScreen::Lobby && lobbyFrame < 0) lobbyFrame = f;
         if (lobbyFrame > 0 && f == lobbyFrame + 30) shot("net_04_guest_lobby");
+        if (f == 600 && lobbyFrame < 0 && !isOnline()) {      // the room was never found
+            shot("net_03b_join_failed");
+            QCoreApplication::quit();
+        }
     }
     auto finish = [&]() {
         QFile stats(autoShotDir + "/net_stats.txt");        // GUI apps on Windows have no console

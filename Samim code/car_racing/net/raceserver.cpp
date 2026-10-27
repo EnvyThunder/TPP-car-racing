@@ -60,6 +60,7 @@ void RaceServer::onNewConnection()
 {
     while (QTcpSocket *sock = tcp.nextPendingConnection()) {
         sock->setSocketOption(QAbstractSocket::LowDelayOption, 1);   // no Nagle delay on tiny packets
+        if (!sock->peerAddress().isLoopback()) ++remoteSeen;
         Player *p = new Player;
         p->sock = sock;
         bySocket.insert(sock, p);
@@ -330,6 +331,7 @@ void RaceServer::onDiscovery()
         QNetworkDatagram d = udp.receiveDatagram();
         QString msg = QString::fromUtf8(d.data());
         if (!msg.startsWith("TURBO8?")) continue;
+        if (!d.senderAddress().isLoopback()) ++remoteSeen;
         QString code = msg.mid(7).trimmed().toUpper();
         if (!rooms.contains(code)) continue;
         QByteArray reply = QString("TURBO8!%1:%2").arg(code).arg(tcp.serverPort()).toUtf8();

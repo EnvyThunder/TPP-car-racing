@@ -34,6 +34,28 @@ port 47800 forwarded on the router). Players join with `CODE@server-address`, an
 host creates the room on it by starting the game with
 `CAR_RACING_SERVER=server-address` set.
 
+## If friends cannot join (troubleshooting)
+
+The host lobby shows **JOIN ATTEMPTS FROM OTHER PCS** while you are alone in the room.
+Ask a friend to try joining and watch that number:
+
+| What you see | Cause | Fix |
+|---|---|---|
+| Friend sees "ROOM ... NOT FOUND" and the host's counter stays **0** | Windows Firewall on the host blocks the game. Very common when Windows calls the Wi-Fi a **Public** network (college Wi-Fi such as JU WI-FI): the firewall question only ticks "Private" by default | On the **host** PC: right-click `allow_firewall.bat` → **Run as administrator** (once). Then host again |
+| Still **0** after running it | The Wi-Fi blocks devices from talking to each other ("client isolation", normal on campus Wi-Fi) | Turn on a **phone hotspot** and connect both laptops to it, then host again |
+| Friend sees "FOUND ... BUT IT DID NOT LET US IN" | The host's firewall drops the connection | `allow_firewall.bat` on the host |
+| Friend sees "NO GAME IS HOSTING AT ..." | The host left the lobby or typed address is wrong | Host again, check the CODE@ADDRESS |
+| Counter goes up but the friend never appears | Different game versions | Both pull the latest code and rebuild |
+
+`allow_firewall.bat` opens only the game's ports (TCP 47800-47809, UDP 47801) on all
+network types and removes "block" rules Windows made if its question was cancelled.
+`allow_firewall.bat remove` undoes it. If McAfee (or another antivirus) runs its own
+firewall, allow `car_racing.exe` there too.
+
+How a friend's game finds the room: it broadcasts "who has room CODE?" on the Wi-Fi, and
+because many routers drop broadcasts it also asks the 1,022 addresses around it directly.
+If even that fails, typing `CODE@address` (shown in the host lobby) connects straight away.
+
 ## How it works (for the viva)
 
 ```mermaid

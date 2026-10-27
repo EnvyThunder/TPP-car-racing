@@ -55,6 +55,7 @@ private slots:
     void onDiscoveryReply();
     void onDiscoveryTimer();
     void onPingTimer();
+    void onConnectTimeout();
 
 private:
     void connectTo(const QString &host, quint16 port);
@@ -64,7 +65,7 @@ private:
 
     QTcpSocket sock;
     QUdpSocket udp;
-    QTimer discoverTimer, pingTimer;
+    QTimer discoverTimer, pingTimer, connectTimer;
     QElapsedTimer pingClock;
     net::FrameReader reader;
     int discoverTries = 0;
@@ -74,6 +75,7 @@ private:
     float myR = 1, myG = 1, myB = 1;
     int wantMap = 0;
     int fakeLagMs = 0;
+    QString connectHost;
 };
 
 #endif // RACECLIENT_H

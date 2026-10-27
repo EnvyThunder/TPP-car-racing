@@ -15,11 +15,39 @@
 #include <QByteArray>
 #include <QDataStream>
 #include <QIODevice>
+#include <QNetworkInterface>
 #include <QString>
 #include <QtEndian>
 #include "simtypes.h"
 
 namespace net {
+
+// Virtual adapters (WSL, Hyper-V, VMs, VPNs) are not the Wi-Fi friends are on
+inline bool isVirtualAdapter(const QNetworkInterface &nif)
+{
+    static const char *VIRTUAL[] = {"vEthernet", "VirtualBox", "VMware", "WSL", "Hyper-V",
+                                    "Bluetooth", "TAP", "Tailscale", "ZeroTier", "Npcap"};
+    for (const char *v : VIRTUAL)
+        if (nif.humanReadableName().contains(v, Qt::CaseInsensitive) || nif.name().contains(v, Qt::CaseInsensitive))
+            return true;
+    return false;
+}
+
+// Real, connected network adapters (Wi-Fi first) with an IPv4 address
+inline QList<QNetworkAddressEntry> lanEntries()
+{
+    QList<QNetworkAddressEntry> wifi, other;
+    for (const QNetworkInterface &nif : QNetworkInterface::allInterfaces()) {
+        const auto f = nif.flags();
+        if (!(f & QNetworkInterface::IsUp) || !(f & QNetworkInterface::IsRunning) || (f & QNetworkInterface::IsLoopBack))
+            continue;
+        if (isVirtualAdapter(nif)) continue;
+        for (const QNetworkAddressEntry &e : nif.addressEntries())
+            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && !e.ip().isLinkLocal())
+                (nif.type() == QNetworkInterface::Wifi ? wifi : other).append(e);
+    }
+    return wifi + other;
+}
 
 constexpr quint16 PROTOCOL_VERSION = 1;
 constexpr quint16 GAME_PORT        = 47800;   // TCP; a busy port makes the host try the next ones

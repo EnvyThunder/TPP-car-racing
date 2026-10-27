@@ -2,6 +2,7 @@
 
 #include <QNetworkDatagram>
 #include <QNetworkInterface>
+#include <algorithm>
 
 using namespace net;
 
@@ -15,6 +16,8 @@ RaceClient::RaceClient(QObject *parent)
     connect(&udp, &QUdpSocket::readyRead, this, &RaceClient::onDiscoveryReply);
     connect(&discoverTimer, &QTimer::timeout, this, &RaceClient::onDiscoveryTimer);
     connect(&pingTimer, &QTimer::timeout, this, &RaceClient::onPingTimer);
+    connectTimer.setSingleShot(true);
+    connect(&connectTimer, &QTimer::timeout, this, &RaceClient::onConnectTimeout);
     pingClock.start();
     // Lag simulator for testing/demos: CAR_RACING_LAG_MS=150 delays every message
     // by half of that each way, like a slow internet connection.
@@ -32,6 +35,7 @@ RaceClient::~RaceClient()
 void RaceClient::reset()
 {
     discoverTimer.stop();
+    connectTimer.stop();
     pingTimer.stop();
     udp.close();
     reader = FrameReader();
@@ -89,8 +93,20 @@ void RaceClient::leave()
 void RaceClient::connectTo(const QString &host, quint16 port)
 {
     discoverTimer.stop();
+    connectHost = host;
     emit status(QString("CONNECTING TO %1...").arg(host.toUpper()));
     sock.connectToHost(host, port);
+    connectTimer.start(6000);   // a firewall silently drops the connection: don't wait forever
+}
+
+void RaceClient::onConnectTimeout()
+{
+    if (sock.state() == QAbstractSocket::ConnectedState) return;
+    leaving = true;
+    sock.abort();
+    emit failed("FOUND " + connectHost.toUpper() + " BUT IT DID NOT LET US IN|"
+                "WINDOWS FIREWALL ON THE HOST PC IS BLOCKING THE GAME|"
+                "ON THE HOST PC: RIGHT-CLICK ALLOW_FIREWALL.BAT > RUN AS ADMINISTRATOR");
 }
 
 // ---------------------------------------------------------------------------
@@ -98,20 +114,35 @@ void RaceClient::connectTo(const QString &host, quint16 port)
 // ---------------------------------------------------------------------------
 void RaceClient::onDiscoveryTimer()
 {
-    if (++discoverTries > 12) {                          // ~3.5 s without an answer
+    if (++discoverTries > 14) {                          // ~4 s without an answer
         discoverTimer.stop();
         udp.close();
-        emit failed("ROOM " + wantCode + " NOT FOUND - SAME WI-FI/HOTSPOT? OR TYPE CODE@HOST-IP");
+        emit failed("ROOM " + wantCode + " NOT FOUND ON THIS NETWORK|"
+                    "1. HOST: RUN ALLOW_FIREWALL.BAT ONCE (RIGHT-CLICK > RUN AS ADMINISTRATOR)|"
+                    "2. OR TYPE THE CODE@ADDRESS SHOWN IN THE HOST LOBBY|"
+                    "3. STILL NOTHING? THIS WI-FI BLOCKS DEVICES - USE A PHONE HOTSPOT");
         return;
     }
     QByteArray ask = ("TURBO8?" + wantCode).toUtf8();
-    udp.writeDatagram(ask, QHostAddress::Broadcast, DISCOVERY_PORT);
-    udp.writeDatagram(ask, QHostAddress::LocalHost, DISCOVERY_PORT);
-    for (const QNetworkInterface &nif : QNetworkInterface::allInterfaces()) {
-        if (!(nif.flags() & QNetworkInterface::IsUp) || (nif.flags() & QNetworkInterface::IsLoopBack)) continue;
-        for (const QNetworkAddressEntry &e : nif.addressEntries())
-            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && !e.broadcast().isNull())
-                udp.writeDatagram(ask, e.broadcast(), DISCOVERY_PORT);
+    const bool testNoBroadcast = qEnvironmentVariableIsSet("CAR_RACING_NO_BROADCAST");   // tests the sweep
+    if (!testNoBroadcast) {
+        udp.writeDatagram(ask, QHostAddress::Broadcast, DISCOVERY_PORT);
+        udp.writeDatagram(ask, QHostAddress::LocalHost, DISCOVERY_PORT);
+        for (const QNetworkAddressEntry &e : lanEntries())
+            if (!e.broadcast().isNull()) udp.writeDatagram(ask, e.broadcast(), DISCOVERY_PORT);
+    }
+    // Many routers drop broadcasts between Wi-Fi devices. So after a moment we also ask
+    // every address on our subnet directly (unicast gets through where broadcast doesn't).
+    if (discoverTries == 2 || discoverTries == 6 || discoverTries == 10) {
+        for (const QNetworkAddressEntry &e : lanEntries()) {
+            // big networks (college Wi-Fi is often /16): ask the 1022 addresses nearest to us
+            int prefix = std::max(e.prefixLength(), 22);
+            if (prefix > 30) continue;
+            quint32 ip = e.ip().toIPv4Address(), mask = 0xFFFFFFFFu << (32 - prefix);
+            quint32 first = (ip & mask) + 1, last = (ip | ~mask) - 1;
+            for (quint32 a = first; a <= last; ++a)
+                udp.writeDatagram(ask, QHostAddress(a), DISCOVERY_PORT);
+        }
     }
 }
 
@@ -135,6 +166,7 @@ void RaceClient::onDiscoveryReply()
 // ---------------------------------------------------------------------------
 void RaceClient::onConnected()
 {
+    connectTimer.stop();
     sock.setSocketOption(QAbstractSocket::LowDelayOption, 1);
     emit status("JOINING...");
     QByteArray out;
@@ -228,7 +260,15 @@ void RaceClient::onDisconnected()
 void RaceClient::onSocketError(QAbstractSocket::SocketError)
 {
     if (leaving || sock.state() == QAbstractSocket::ConnectedState) return;
-    if (!joined) emit failed("COULD NOT CONNECT: " + sock.errorString().toUpper());
+    if (joined) return;
+    connectTimer.stop();
+    leaving = true;
+    if (sock.error() == QAbstractSocket::ConnectionRefusedError)
+        emit failed("NO GAME IS HOSTING AT " + connectHost.toUpper() + "|CHECK THE CODE@ADDRESS, OR ASK THE HOST TO HOST AGAIN");
+    else if (sock.error() == QAbstractSocket::HostNotFoundError)
+        emit failed("ADDRESS " + connectHost.toUpper() + " NOT FOUND|CHECK THE CODE@ADDRESS");
+    else
+        emit failed("COULD NOT CONNECT TO " + connectHost.toUpper() + "|" + sock.errorString().toUpper());
 }
 
 void RaceClient::onPingTimer()

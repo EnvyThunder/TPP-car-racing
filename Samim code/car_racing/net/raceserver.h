@@ -29,6 +29,9 @@ public:
     bool start(quint16 port = net::GAME_PORT);
     quint16 port() const { return tcp.serverPort(); }
     int roomCount() const { return rooms.size(); }
+    // Join attempts that reached this PC from other machines (room searches + connections).
+    // Stays 0 while a friend is trying to join => a firewall or the Wi-Fi is blocking them.
+    int remoteAttempts() const { return remoteSeen; }
 
 signals:
     void log(const QString &line);
@@ -78,6 +81,7 @@ private:
     QTimer timer;
     QElapsedTimer clock;
     double accumulator = 0.0;
+    int remoteSeen = 0;
     QHash<QString, Room *> rooms;
     QHash<QTcpSocket *, Player *> bySocket;
     QHash<Player *, Room *> roomOf;
