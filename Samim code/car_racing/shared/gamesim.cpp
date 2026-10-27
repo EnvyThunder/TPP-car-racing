@@ -76,7 +76,12 @@ void GameSim::reset(uint32_t seed, int racers)
     rng.seed(seed);
     cars.clear();
 
-    // Starting grid: two columns, rows 9 m apart behind the start line.
+    // Online rooms race up to 8 cars side by side: a 5-lane road instead of 3
+    const bool online = (mode == ModeOnline);
+    lanes = online ? ONLINE_LANES : 3;
+    halfWidth = ROAD_HALF + float(lanes - 3) * 0.5f * LANE_WIDTH;
+
+    // Starting grid: two columns (four online), rows 9 m apart behind the start line.
     // Slots 0 and 1 are the original P1 (red, right) and P2 (blue, left).
     static const float GRID_COL[MAX_RACERS][3] = {
         {0.92f, 0.14f, 0.16f}, {0.15f, 0.42f, 0.98f}, {1.00f, 0.75f, 0.10f}, {0.20f, 0.85f, 0.35f},
@@ -84,8 +89,14 @@ void GameSim::reset(uint32_t seed, int racers)
     racers = std::clamp(racers, 1, MAX_RACERS);
     for (int i = 0; i < racers; ++i) {
         Car c;
-        c.x = (i % 2 == 0) ? 3.0f : -3.0f;
-        c.z = float(i / 2) * 9.0f;
+        if (online) {
+            static const float COL_X[4] = {2.5f, -2.5f, 7.5f, -7.5f};
+            c.x = COL_X[i % 4];
+            c.z = float(i / 4) * 9.0f;
+        } else {
+            c.x = (i % 2 == 0) ? 3.0f : -3.0f;
+            c.z = float(i / 2) * 9.0f;
+        }
         c.r = GRID_COL[i][0]; c.g = GRID_COL[i][1]; c.b = GRID_COL[i][2];
         cars.push_back(c);
     }
@@ -103,12 +114,12 @@ void GameSim::reset(uint32_t seed, int racers)
     auto R = [&gen](float a, float b) { return uniformFloat(gen, a, b); };
 
     // ---- Collectible Nitro Pickups ----
-    // Fewer, strategic nitro canisters spaced across the 4,000m track (approx 7-8 total)
-    for (float d = 360.0f; d < TRACK_LEN - 220.0f; d += R(440.0f, 580.0f)) {
+    // Strategic nitro canisters spaced across the 4,000m track (about 10 in total)
+    for (float d = 360.0f; d < TRACK_LEN - 220.0f; d += R(330.0f, 450.0f)) {
         NitroPickup np{};
         np.z = -d;
-        int lane = int(R(0, 3)) % 3;
-        np.x = roadCenter(np.z) + LANES[lane];
+        int lane = int(R(0, float(lanes))) % lanes;
+        np.x = roadCenter(np.z) + laneX(lane);
         np.y = 0.5f;
         np.active = true;
         nitroPickups.push_back(np);
@@ -127,28 +138,39 @@ void GameSim::reset(uint32_t seed, int racers)
     const MapDef &map = MAPS[mapIndex];
 
     // ---- Obstacle patterns ----
-    for (float d = 240.0f; d < TRACK_LEN - 220.0f; d += R(map.obstacleGapMin, map.obstacleGapMax)) {
+    // Online: a pack of up to 8 cars, so only small things that close one lane at most
+    // (no barrier walls, no cone walls) and more room between them.
+    for (float d = 300.0f; online && d < TRACK_LEN - 220.0f; d += R(map.obstacleGapMin, map.obstacleGapMax) * 1.6f) {
+        float x = laneX(int(R(0.0f, float(lanes))) % lanes);
+        if (R(0.0f, 1.0f) < 0.6f) {                      // three cones in a row along one lane
+            for (int i = 0; i < 3; ++i) addRound(Obstacle::Cone, d + i * 7.0f, x);
+        } else {                                         // two barrels side by side
+            addRound(Obstacle::Barrel, d, x - 1.0f);
+            addRound(Obstacle::Barrel, d, x + 1.0f);
+        }
+    }
+    for (float d = 240.0f; !online && d < TRACK_LEN - 220.0f; d += R(map.obstacleGapMin, map.obstacleGapMax)) {
         int pattern = int(R(0.0f, 4.0f)) % 4;
         if (pattern == 0) { // cone slalom
             for (int i = 0; i < 6; ++i) addRound(Obstacle::Cone, d + i * 11.0f, (i % 2) ? 3.5f : -3.5f);
         } else if (pattern == 1) { // zig-zag barrier walls
             int open1 = int(R(0, 3)) % 3;
             int open2 = (open1 + 1 + int(R(0, 2)) % 2) % 3;
-            for (int l = 0; l < 3; ++l) if (l != open1) addBarrier(d, LANES[l]);
-            for (int l = 0; l < 3; ++l) if (l != open2) addBarrier(d + 38.0f, LANES[l]);
+            for (int l = 0; l < 3; ++l) if (l != open1) addBarrier(d, laneX(l));
+            for (int l = 0; l < 3; ++l) if (l != open2) addBarrier(d + 38.0f, laneX(l));
         } else if (pattern == 2) { // barrels
             for (int i = 0; i < 3; ++i) addRound(Obstacle::Barrel, d + R(0, 18), R(-5.5f, 5.5f));
         } else { // cone wall with one gap
             int gap = int(R(0, 3)) % 3;
             for (float x = -6.0f; x <= 6.01f; x += 1.5f)
-                if (std::fabs(x - LANES[gap]) > 2.4f) addRound(Obstacle::Cone, d, x);
+                if (std::fabs(x - laneX(gap)) > 2.4f) addRound(Obstacle::Cone, d, x);
         }
     }
 
     // ---- Scenery (depends on the map's theme) ----
     auto addProp = [&](Prop::Type t, float d, float side, float off, float scale, int palette, float rot) {
         Prop p{}; p.type = t; p.z = -d; p.scale = scale; p.palette = palette; p.rot = rot;
-        p.x = roadCenter(p.z) + side * (RAIL_OFFSET + off);
+        p.x = roadCenter(p.z) + side * (railOffset() + off);
         props.push_back(p);
     };
     auto addLamps = [&](float spacing, bool bothSides) {
@@ -158,7 +180,7 @@ void GameSim::reset(uint32_t seed, int racers)
                 float side = (s == 0) ? -1.0f : 1.0f;
                 if (!bothSides && side != ((alt % 2) ? 1.0f : -1.0f)) continue;
                 Prop p{}; p.type = Prop::Lamp; p.z = -d; p.scale = 1.0f;
-                p.x = roadCenter(p.z) + side * (ROAD_HALF + 2.2f);
+                p.x = roadCenter(p.z) + side * (halfWidth + 2.2f);
                 p.rot = (side < 0) ? 90.0f : -90.0f;
                 props.push_back(p);
             }
@@ -177,12 +199,12 @@ void GameSim::reset(uint32_t seed, int racers)
                     float r = R(0, 1);
                     if (r < 0.4f && d - lastHouse[s] > 16.0f && d < TRACK_LEN - 220.0f) {
                         p.type = Prop::House; lastHouse[s] = d;
-                        p.x = roadCenter(p.z) + side * (RAIL_OFFSET + 8.0f + R(0, 6));
+                        p.x = roadCenter(p.z) + side * (railOffset() + 8.0f + R(0, 6));
                         p.rot = (side < 0) ? 90.0f : -90.0f;
                     } else {
                         p.type = (r < 0.72f) ? Prop::Pine : Prop::RoundTree;
                         float off = (d - lastHouse[s] < 10.0f) ? R(20, 30) : R(3, 25);
-                        p.x = roadCenter(p.z) + side * (RAIL_OFFSET + off);
+                        p.x = roadCenter(p.z) + side * (railOffset() + off);
                         p.rot = R(0, 360);
                     }
                     props.push_back(p);
@@ -190,7 +212,7 @@ void GameSim::reset(uint32_t seed, int racers)
                 Prop b{}; // background forest row
                 b.type = (R(0, 1) < 0.6f) ? Prop::Pine : Prop::RoundTree;
                 b.z = -d + R(-6, 6);
-                b.x = roadCenter(b.z) + side * (RAIL_OFFSET + 32.0f + R(0, 45));
+                b.x = roadCenter(b.z) + side * (railOffset() + 32.0f + R(0, 45));
                 b.scale = R(1.0f, 1.6f); b.rot = R(0, 360);
                 props.push_back(b);
             }
@@ -268,7 +290,7 @@ void GameSim::reset(uint32_t seed, int racers)
         for (int s = 0; s < 2; ++s) {
             float side = (s == 0) ? -1.0f : 1.0f;
             Prop p{}; p.type = Prop::Torch; p.z = -d; p.scale = 1.0f; p.palette = s; p.rot = 0;
-            p.x = roadCenter(p.z) + side * (ROAD_HALF + 2.0f);
+            p.x = roadCenter(p.z) + side * (halfWidth + 2.0f);
             props.push_back(p);
         }
     }
@@ -276,11 +298,12 @@ void GameSim::reset(uint32_t seed, int racers)
     // ---- Traffic ----
     const float pal[6][3] = {{0.95f, 0.95f, 0.95f}, {0.65f, 0.67f, 0.70f}, {0.20f, 0.65f, 0.30f},
                              {1.00f, 0.55f, 0.10f}, {0.55f, 0.30f, 0.75f}, {0.98f, 0.85f, 0.15f}};
-    const float trafficGap = (TRACK_LEN - 400.0f) / float(map.trafficCount);
-    for (int i = 0; i < map.trafficCount; ++i) {
+    const int trafficCount = online ? map.trafficCount / 2 : map.trafficCount;   // online: half as much
+    const float trafficGap = (TRACK_LEN - 400.0f) / float(trafficCount);
+    for (int i = 0; i < trafficCount; ++i) {
         Traffic t{};
         t.z = -(180.0f + i * trafficGap + R(0, trafficGap * 0.35f));
-        t.lane = t.targetLane = LANES[int(R(0, 3)) % 3];
+        t.lane = t.targetLane = laneX(int(R(0, float(lanes))) % lanes);
         t.speed = R(0.35f, 0.62f);
         int k = int(R(0, 6)) % 6;
         t.r = pal[k][0]; t.g = pal[k][1]; t.b = pal[k][2];
@@ -290,7 +313,7 @@ void GameSim::reset(uint32_t seed, int racers)
     }
 }
 
-void GameSim::step(const PlayerInput inputs[], int inputCount)
+void GameSim::step(const PlayerInput inputs[], int inputCount, const int runs[], const PlayerInput extra[])
 {
     events.clear();
     ++tick;
@@ -326,7 +349,9 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
             updateAI(cars[i], int(i));
         } else {
             PlayerInput in = (int(i) < inputCount) ? inputs[i] : PlayerInput{};
-            updateCar(cars[i], in, int(i));
+            const int r = (runs && int(i) < inputCount) ? runs[i] : 1;
+            if (r >= 1) updateCar(cars[i], in, int(i));
+            if (r >= 2 && extra) updateCar(cars[i], extra[i], int(i));
         }
     }
 
@@ -346,12 +371,12 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
             if (o.type != Obstacle::Barrier || o.z > t.z || o.z < t.z - 25.0f) continue;
             float c = roadCenter(o.z);
             if (std::fabs(c + t.targetLane - o.x) < o.hx + 1.2f) {
-                for (int l = 0; l < 3; ++l) {
+                for (int l = 0; l < lanes; ++l) {
                     bool blocked = false;
                     for (const Obstacle &o2 : obstacles)
                         if (o2.type == Obstacle::Barrier && std::fabs(o2.z - o.z) < 1.0f &&
-                            std::fabs(c + LANES[l] - o2.x) < o2.hx + 1.2f) { blocked = true; break; }
-                    if (!blocked) { t.targetLane = LANES[l]; break; }
+                            std::fabs(c + laneX(l) - o2.x) < o2.hx + 1.2f) { blocked = true; break; }
+                    if (!blocked) { t.targetLane = laneX(l); break; }
                 }
             }
         }
@@ -365,7 +390,7 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
             float nz = lead - 260.0f - rnd(0.0f, 160.0f);
             if (nz < -TRACK_LEN + 80.0f) { t.parked = true; continue; }
             t.z = nz;
-            t.lane = t.targetLane = LANES[int(rnd(0, 3)) % 3];
+            t.lane = t.targetLane = laneX(int(rnd(0, float(lanes))) % lanes);
             t.speed = rnd(0.35f, 0.62f);
         }
     }
@@ -433,7 +458,7 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
     if (state == Countdown) { left = right = false; }
 
     float offset = c.x - roadCenter(c.z);
-    bool offroad = std::fabs(offset) > ROAD_HALF;
+    bool offroad = std::fabs(offset) > halfWidth;
 
     // Trigger nitro when player/AI presses nitro button and has an available charge
     if (nitroKey && c.nitroCharges > 0 && c.nitroTimer == 0 && !offroad) {
@@ -551,7 +576,7 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
 
     // Guard rails
     offset = c.x - roadCenter(c.z);
-    float lim = RAIL_OFFSET - 1.0f;
+    float lim = railOffset() - 1.0f;
     if (std::fabs(offset) > lim) {
         c.x = roadCenter(c.z) + (offset > 0 ? lim : -lim);
         c.speed *= 0.82f;
@@ -583,22 +608,43 @@ PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
     PlayerInput in;
 
     // ---- 1. Pace: difficulty + catch-up ("rubber band") ----------------------------
-    // Easy / Medium / Hard change the CPU's top speed a little; when the CPU falls
-    // behind player 1 it gets extra pace so races stay close, and on Easy/Medium it
-    // eases off when it is far ahead.
-    const int diff = std::clamp(aiDifficulty, 0, 2);
-    const float playerZ = cars.empty() ? c.z : cars[0].z;
-    const float gap = c.z - playerZ;                     // > 0: CPU is behind player 1
+    // The difficulty changes the CPU's top speed a little; when the CPU falls behind the
+    // leading human it gets extra pace so races stay close, and the easier levels ease
+    // off when they are far ahead.
+    //   single player: Easy / Medium / Hard (aiDifficulty 0..2)
+    //   online CPU racers: level 1..5 (Car::aiLevel), picked at random by the server
+    float playerZ = c.z;                                 // the leading human driver
+    bool haveHuman = false;
+    for (int j = 0; j < int(cars.size()); ++j) {
+        if (j == carIndex || cars[j].aiLevel > 0) continue;
+        if (!haveHuman || cars[j].z < playerZ) { playerZ = cars[j].z; haveHuman = true; }
+    }
+    const float gap = c.z - playerZ;                     // > 0: CPU is behind the humans
+    const bool onlineCpu = c.aiLevel > 0;
+    const int level = std::clamp(c.aiLevel, 1, 5) - 1;   // 0..4
+    // nitro habits below follow the single-player levels: 0 cautious, 1 normal, 2 aggressive
+    const int diff = onlineCpu ? (level <= 1 ? 0 : level == 2 ? 1 : 2) : std::clamp(aiDifficulty, 0, 2);
     if (asRival) {
-        const float base[3]     = {0.95f, 1.00f, 1.04f};
-        const float maxBonus[3] = {0.04f, 0.09f, 0.14f};
-        float scale = base[diff];
-        if (gap > 0.0f) {
-            scale += std::min(maxBonus[diff], gap * 0.0015f);
-        } else if (diff == 0) {
-            scale -= std::min(0.10f, -gap * 0.0015f);
-        } else if (diff == 1) {
-            scale -= std::min(0.05f, std::max(0.0f, -gap - 40.0f) * 0.001f);
+        float scale;
+        if (onlineCpu) {
+            static const float BASE[5]      = {0.90f, 0.95f, 1.00f, 1.04f, 1.08f};
+            static const float BONUS[5]     = {0.02f, 0.05f, 0.08f, 0.11f, 0.15f};
+            static const float EASE[5]      = {0.10f, 0.06f, 0.04f, 0.0f, 0.0f};   // slow down when ahead...
+            static const float EASE_FROM[5] = {0.0f, 20.0f, 60.0f, 0.0f, 0.0f};    // ...by more than this
+            scale = BASE[level];
+            if (gap > 0.0f) scale += std::min(BONUS[level], gap * 0.0015f);
+            else            scale -= std::min(EASE[level], std::max(0.0f, -gap - EASE_FROM[level]) * 0.0015f);
+        } else {
+            const float base[3]     = {0.95f, 1.00f, 1.04f};
+            const float maxBonus[3] = {0.04f, 0.09f, 0.14f};
+            scale = base[diff];
+            if (gap > 0.0f) {
+                scale += std::min(maxBonus[diff], gap * 0.0015f);
+            } else if (diff == 0) {
+                scale -= std::min(0.10f, -gap * 0.0015f);
+            } else if (diff == 1) {
+                scale -= std::min(0.05f, std::max(0.0f, -gap - 40.0f) * 0.001f);
+            }
         }
         c.speedScale = scale;
     } else {
@@ -636,14 +682,35 @@ PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
         float r = (o.type == Obstacle::Barrier) ? o.hx : (o.type == Obstacle::Barrel ? 0.7f : 0.45f);
         addHazard(dist, off - r - CAR_HALF, off + r + CAR_HALF, o.type == Obstacle::Cone);
     }
+    // Traffic and racers alongside us (overlapping lengthwise) go into `beside`: they limit
+    // where we may steer right now, so we don't scrape along them, without hiding the
+    // hazards further ahead. Their band is measured from the road centre at OUR position,
+    // as the collision compares the two positions directly (on a bend the road centre
+    // moves between their z and ours).
+    std::vector<Hazard> beside;
     for (const Traffic &t : traffic) {
-        if (t.parked || t.speed > c.speed + 0.05f) continue;   // only traffic we are catching
+        // only traffic we are catching - or right in front of us: after bumping into it we
+        // are slower than it for a moment, and must not drive straight back into it
+        const float halfL = t.truck ? 5.6f : 4.2f;
+        const float dist = c.z - t.z - halfL;            // to its back bumper (< 0: alongside)
+        if (t.parked || dist < -2.0f * halfL || (t.speed > c.speed + 0.05f && dist > 12.0f)) continue;
         // a car changing lanes blocks both the lane it is leaving and the one it is entering
-        addHazard(c.z - t.z - 4.0f, std::min(t.lane, t.targetLane) - 2.1f, std::max(t.lane, t.targetLane) + 2.1f);
+        const float x0 = std::min(t.lane, t.targetLane) - 2.1f, x1 = std::max(t.lane, t.targetLane) + 2.1f;
+        if (dist < 0.0f) {
+            const float shift = roadCenter(t.z) - roadCenter(c.z);
+            beside.push_back({0.0f, x0 + shift, x1 + shift, false});
+        } else {
+            addHazard(dist, x0, x1);
+        }
     }
     for (size_t j = 0; j < cars.size(); ++j) {           // other racers: overtake, don't ram
         if (int(j) == carIndex) continue;
         const Car &o = cars[j];
+        if (std::fabs(c.z - o.z) < 4.2f) {
+            const float off = o.x - roadCenter(c.z);
+            beside.push_back({0.0f, off - 2.2f, off + 2.2f, false});
+            continue;
+        }
         if (o.speed > c.speed + 0.05f) continue;
         float off = o.x - roadCenter(o.z);
         addHazard(c.z - o.z - 4.0f, off - 2.2f, off + 2.2f);
@@ -655,36 +722,40 @@ PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
     // work out the free gaps across the road, and aim for the nearest point of the
     // best gap - preferring gaps that line up with the row after it.
     typedef std::pair<float, float> Gap;
-    const float EDGE = ROAD_HALF - 1.0f;
+    const float EDGE = halfWidth - 1.0f;
     const float myOff = c.x - roadCenter(c.z);
-    auto freeGaps = [&](size_t first, size_t last, std::vector<Gap> &gaps, bool hardOnly = false) {
-        gaps.assign(1, Gap(-EDGE, EDGE));
-        for (size_t k = first; k < last; ++k) {
-            if (hardOnly && hz[k].soft) continue;
-            std::vector<Gap> next;
-            for (const Gap &g : gaps) {
-                if (hz[k].x1 <= g.first || hz[k].x0 >= g.second) { next.push_back(g); continue; }
-                if (hz[k].x0 > g.first)  next.push_back(Gap(g.first, hz[k].x0));
-                if (hz[k].x1 < g.second) next.push_back(Gap(hz[k].x1, g.second));
-            }
-            gaps.swap(next);
+    auto cut = [](std::vector<Gap> &gaps, const Hazard &h) {
+        std::vector<Gap> next;
+        for (const Gap &g : gaps) {
+            if (h.x1 <= g.first || h.x0 >= g.second) { next.push_back(g); continue; }
+            if (h.x0 > g.first)  next.push_back(Gap(g.first, h.x0));
+            if (h.x1 < g.second) next.push_back(Gap(h.x1, g.second));
         }
+        gaps.swap(next);
+    };
+    // the next row also has to be reachable past whatever is alongside us now
+    auto freeGaps = [&](size_t first, size_t last, std::vector<Gap> &gaps, bool nextRow, bool hardOnly = false) {
+        gaps.assign(1, Gap(-EDGE, EDGE));
+        if (nextRow)
+            for (const Hazard &h : beside) cut(gaps, h);
+        for (size_t k = first; k < last; ++k)
+            if (!hardOnly || !hz[k].soft) cut(gaps, hz[k]);
     };
     float target = std::clamp(c.aiTarget, -EDGE, EDGE);
     float rowDist = 1e9f;
     size_t rowEnd = 0;
     bool rowBlocked = false;
-    if (!hz.empty()) {
-        rowDist = hz[0].dist;
+    if (!hz.empty() || !beside.empty()) {
+        if (!hz.empty()) rowDist = hz[0].dist;
         while (rowEnd < hz.size() && hz[rowEnd].dist <= rowDist + 6.0f) ++rowEnd;
         std::vector<Gap> gaps, gaps2;
-        freeGaps(0, rowEnd, gaps);
-        if (gaps.empty()) freeGaps(0, rowEnd, gaps, true);   // no clean gap: just go through the cones
+        freeGaps(0, rowEnd, gaps, true);
+        if (gaps.empty()) freeGaps(0, rowEnd, gaps, true, true);   // no clean gap: just go through the cones
         size_t row2End = rowEnd;
         bool haveRow2 = rowEnd < hz.size() && hz[rowEnd].dist < rowDist + 50.0f;
         if (haveRow2) {
             while (row2End < hz.size() && hz[row2End].dist <= hz[rowEnd].dist + 6.0f) ++row2End;
-            freeGaps(rowEnd, row2End, gaps2);
+            freeGaps(rowEnd, row2End, gaps2, false);
         }
         if (gaps.empty()) {
             rowBlocked = true;                           // e.g. traffic filling the only gap: wait
@@ -703,7 +774,7 @@ PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
             }
         }
     }
-    if (rowDist > 45.0f) {                               // nothing close: go and grab a nitro can
+    if (rowDist > 45.0f && beside.empty()) {           // nothing close: go and grab a nitro can
         for (const NitroPickup &np : nitroPickups) {
             float dist = c.z - np.z, off = np.x - roadCenter(np.z);
             if (np.active && dist > 0.0f && dist < 60.0f && std::fabs(off) < EDGE) { target = off; break; }
@@ -979,6 +1050,7 @@ uint32_t GameSim::worldChecksum() const
     auto mix = [&h](long v) { h = (h ^ uint32_t(v)) * 16777619u; };
     auto q = [](float v) { return long(std::lround(v * 10.0f)); };
     mix(mapIndex);
+    mix(lanes);
     mix(long(obstacles.size()));
     for (const Obstacle &o : obstacles) { mix(o.type); mix(q(o.x)); mix(q(o.z)); mix(q(o.hx)); }
     mix(long(nitroPickups.size()));

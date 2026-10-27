@@ -11,6 +11,7 @@
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QStringList>
+#include <deque>
 #include "protocol.h"
 
 class RaceClient : public QObject
@@ -28,6 +29,8 @@ public:
 
     void sendInput(quint32 seq, const sim::PlayerInput &in);
     void requestStart();
+    void requestAddCpu();      // host: add a CPU racer (random level 1-5)
+    void requestRemoveCpu();   // host: remove the last CPU racer
     void requestMap(int map);
 
     // Lobby / race state as last told by the server
@@ -76,6 +79,9 @@ private:
     float myR = 1, myG = 1, myB = 1;
     int wantMap = 0;
     int fakeLagMs = 0;
+    // lag simulator queues: messages leave them in the order they came in
+    std::deque<std::pair<net::MsgType, QByteArray>> lagIn;
+    std::deque<QByteArray> lagOut;
     QString connectHost;
 };
 

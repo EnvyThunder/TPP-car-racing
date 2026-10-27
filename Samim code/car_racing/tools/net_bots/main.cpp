@@ -3,6 +3,7 @@
 #include <QCoreApplication>
 #include <QTextStream>
 #include <QTimer>
+#include <QElapsedTimer>
 #include <memory>
 #include <vector>
 #include "raceclient.h"
@@ -14,6 +15,7 @@ struct Bot {
     sim::PlayerInput input;
     quint32 seq = 0;
     bool racing = false;
+    bool raced = false;         // one race per run: don't restart once back in the lobby
 };
 
 int main(int argc, char *argv[])
@@ -22,8 +24,9 @@ int main(int argc, char *argv[])
     QTextStream out(stdout);
     if (argc < 2) {
         out << "usage: net_bots CODE[@host[:port]] [count]   - bots join an existing room\n"
-               "       net_bots NEW@host[:port] [count] [map] - bot 1 creates a room, the rest join,\n"
-               "                                              the race runs and the results are printed"
+               "       net_bots NEW@host[:port] [count] [map] [cpus] - bot 1 creates a room (and adds\n"
+               "                                              cpus CPU racers), the rest join, the race\n"
+               "                                              runs and the results are printed"
             << Qt::endl;
         return 1;
     }
@@ -31,6 +34,7 @@ int main(int argc, char *argv[])
     const bool selfHosted = where.toUpper().startsWith("NEW");
     const int count = std::clamp((argc > 2) ? QString(argv[2]).toInt() : 7, 1, selfHosted ? 8 : 7);
     const int map = (argc > 3) ? QString(argv[3]).toInt() : 0;
+    const int cpus = (argc > 4) ? QString(argv[4]).toInt() : 0;   // NEW mode: host adds CPU racers first
     QString hostAddr = "127.0.0.1";
     quint16 hostPort = net::GAME_PORT;
     if (selfHosted && where.contains('@')) {
@@ -87,6 +91,7 @@ int main(int argc, char *argv[])
         Bot *h = bots[0].get();
         QObject::connect(&h->client, &RaceClient::welcomed, [&, h]() {
             out << "ROOM CODE " << h->client.code << Qt::endl;
+            for (int k = 0; k < cpus; ++k) h->client.requestAddCpu();
             for (int i = 1; i < count; ++i) {
                 Bot *b = bots[i].get();
                 QString to = QString("%1@%2:%3").arg(h->client.code, hostAddr).arg(hostPort);
@@ -96,8 +101,13 @@ int main(int argc, char *argv[])
             }
         });
         QObject::connect(&h->client, &RaceClient::lobbyChanged, [&, h]() {
-            if (!h->racing && h->client.players.size() == count && h->client.isHost) {
-                out << "all " << count << " in the lobby - starting" << Qt::endl;
+            int people = 0;
+            for (const net::LobbyPlayer &p : h->client.players) people += p.cpuLevel == 0 ? 1 : 0;
+            if (!h->racing && !h->raced && people == count && h->client.isHost) {
+                out << "lobby:";
+                for (const net::LobbyPlayer &p : h->client.players)
+                    out << " " << p.name << (p.cpuLevel ? QString("(L%1)").arg(p.cpuLevel) : QString());
+                out << "  -> starting" << Qt::endl;
                 h->client.requestStart();
             }
         });
@@ -107,18 +117,24 @@ int main(int argc, char *argv[])
             for (int rank = 1; rank <= int(cars.size()); ++rank)
                 for (int i = 0; i < int(cars.size()); ++i)
                     if (h->sim.rankOf(i) == rank)
-                        out << "  " << rank << ". BOT" << i + 1 << "  "
+                        out << "  " << rank << ". " << (i < h->client.players.size() ? h->client.players[i].name : QString("?")) << "  "
                             << (cars[i].finished ? QString::number(cars[i].finishTime, 'f', 2) + " s" : QString("DNF")) << Qt::endl;
             out << "ping of bot 1: " << h->client.pingMs << " ms" << Qt::endl;
+            h->raced = true;
             QCoreApplication::quit();
         });
         h->client.create(hostAddr, hostPort, "BOT1", COL[0][0], COL[0][1], COL[0][2], map);
     }
 
-    QTimer inputTimer;                                   // send keys at 60 Hz, like the game
-    QObject::connect(&inputTimer, &QTimer::timeout, [&bots]() {
-        for (auto &b : bots)
-            if (b->racing) b->client.sendInput(++b->seq, b->input);
+    QTimer inputTimer;                                   // send keys at exactly 60 Hz, like the game
+    QElapsedTimer inputClock;
+    inputClock.start();
+    qint64 inputsDue = 0;
+    QObject::connect(&inputTimer, &QTimer::timeout, [&bots, &inputClock, &inputsDue]() {
+        const qint64 due = inputClock.elapsed() * 60 / 1000;
+        for (; inputsDue < due; ++inputsDue)
+            for (auto &b : bots)
+                if (b->racing) b->client.sendInput(++b->seq, b->input);
     });
     inputTimer.setTimerType(Qt::PreciseTimer);
     inputTimer.start(16);

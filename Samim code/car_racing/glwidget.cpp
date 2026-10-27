@@ -36,15 +36,12 @@
 namespace {
 
 const float PI          = 3.14159265f;
-const float ROAD_HALF   = 7.0f;               // road is 14 units wide (3 lanes)
-const float RAIL_OFFSET = ROAD_HALF + 4.0f;   // guard rails
 const float TRACK_LEN   = 4000.0f;            // finish line distance
 const float MAX_SPEED   = 1.10f;
 const float NITRO_SPEED = 1.65f;
 const float OFFROAD_MAX = 0.45f;
 const float VIEW_DIST   = 340.0f;             // draw distance (fog end)
 const float TEMPLE_DIST = 400.0f;             // temple "backdrop" distance
-const float LANES[3]    = {-4.67f, 0.0f, 4.67f};
 
 // Sunset palette
 const float SKY_TOP[3] = {0.20f, 0.22f, 0.45f};
@@ -304,6 +301,7 @@ GLWidget::~GLWidget()
         glDeleteTextures(10, t);
         carmodel::Lists lists{carBodyList, carGlassList, carTrimList};
         carmodel::destroy(lists);
+        for (GLuint list : modelLists) glDeleteLists(list, 1);
         doneCurrent();
     }
     delete audio;
@@ -633,7 +631,8 @@ void GLWidget::updateGame()
 {
     if (!autoShotDir.isEmpty()) runAutoShot();
 
-    float realDt = elapsedTimer.restart() * 0.001f;
+    float realDt = float(elapsedTimer.nsecsElapsed() * 1e-9);   // not whole ms: they lose ~3% a frame
+    elapsedTimer.restart();
     if (realDt <= 0.0f) realDt = 0.016f;
     if (realDt > 0.25f) realDt = 0.25f;
 
@@ -656,6 +655,7 @@ void GLWidget::updateGame()
     }
 
     const float FIXED_DT = 1.0f / 60.0f;
+    if (isOnline() && !netTest.isEmpty()) { ++statFrames; if (realDt > 0.025f) ++statSlowFrames; }
     if (isOnline()) netUpdate(realDt);          // online: the server runs the race (glwidget_online.cpp)
     else simAccumulator += realDt;
 
@@ -1160,6 +1160,17 @@ void GLWidget::resizeGL(int w, int h)
 // ===========================================================================
 void GLWidget::paintGL()
 {
+    QElapsedTimer paintClock;                                   // scripted online test: drawing time
+    paintClock.start();
+    struct PaintStat {
+        GLWidget *w; QElapsedTimer &c;
+        ~PaintStat() {
+            if (w->netTest.isEmpty() || !w->isOnline()) return;
+            double ms = c.nsecsElapsed() * 1e-6;
+            w->statPaintMs += ms;
+            w->statPaintMax = std::max(w->statPaintMax, ms);
+        }
+    } paintStat{this, paintClock};
     const float dpr = float(devicePixelRatioF());
     const int W = int(width() * dpr), H = int(height() * dpr);
 
@@ -1549,8 +1560,10 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
     if (simEngine.mapDef().theme == sim::MapTheme::Coast) drawSea(me.z);
     drawRoad(me.z);
     drawSkidMarks(me.z);
-    drawArch(-6.0f, false);
-    drawArch(-sim::TRACK_LEN, true);
+    // the gates (the finish one has a whole scene around it) only when they can be seen
+    if (me.z > -60.0f) drawArch(-6.0f, false);
+    const float toFinish = me.z + sim::TRACK_LEN;
+    if (toFinish < VIEW_DIST + 120.0f && toFinish > -250.0f) drawArch(-sim::TRACK_LEN, true);
     drawProps(me.z);
     drawObstacles(me.z);
     drawNitroPickups(me.z);
@@ -1579,9 +1592,10 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
     }
 
     // Name plate above each car: "1"/"2" in split screen, "CPU" in single player, names online
+    // (your own car online: "YOU/3" = you are 3rd, the same position as in the corner)
     auto badgeFor = [&](int i) -> QByteArray {
         if (isOnline()) {
-            if (i == meIdx) return "YOU";
+            if (i == meIdx) return "YOU/" + QByteArray::number(simEngine.rankOf(i));
             return (i < racerNames.size()) ? racerNames[i].left(8).toUtf8() : QByteArray::number(i + 1);
         }
         if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i == 1) return "CPU";
@@ -1867,8 +1881,8 @@ void GLWidget::drawRoad(float camZ)
     glNormal3f(0, 1, 0);
     for (float z = startZ; z >= endZ; z -= seg) {
         float c = roadCenter(z);
-        tv(c - ROAD_HALF, 0.0f, z, -ROAD_HALF, z);
-        tv(c + ROAD_HALF, 0.0f, z,  ROAD_HALF, z);
+        tv(c - roadHalf(), 0.0f, z, -roadHalf(), z);
+        tv(c + roadHalf(), 0.0f, z,  roadHalf(), z);
     }
     glEnd();
 
@@ -1879,7 +1893,7 @@ void GLWidget::drawRoad(float camZ)
         glBegin(GL_QUAD_STRIP);
         glNormal3f(0, 1, 0);
         for (float z = startZ; z >= endZ; z -= seg) {
-            float c = roadCenter(z), x0 = c + side * ROAD_HALF, x1 = x0 + side * 0.7f;
+            float c = roadCenter(z), x0 = c + side * roadHalf(), x1 = x0 + side * 0.7f;
             int k = int(std::floor((-z + 0.001f) / 4.0f));
             glColor3fv((k % 2 == 0) ? THEMES[themeIndex()].kerbA : THEMES[themeIndex()].kerbB);
             glVertex3f(x0, 0.02f, z); glVertex3f(x1, 0.02f, z);
@@ -1894,7 +1908,7 @@ void GLWidget::drawRoad(float camZ)
         glNormal3f(0, 1, 0);
         for (float z = startZ; z >= endZ; z -= seg) {
             float c = roadCenter(z);
-            float x = c + side * (ROAD_HALF - 0.40f);
+            float x = c + side * (roadHalf() - 0.40f);
             glVertex3f(x - 0.12f, 0.025f, z);
             glVertex3f(x + 0.12f, 0.025f, z);
         }
@@ -1908,8 +1922,8 @@ void GLWidget::drawRoad(float camZ)
     float dashEndZ   = std::max(-TRACK_LEN, camZ - VIEW_DIST);
 
     glColor3f(0.96f, 0.94f, 0.88f);
-    for (int l = 0; l < 2; ++l) {
-        float off = (l == 0) ? -2.33f : 2.33f;
+    for (int l = 1; l < simEngine.laneCount(); ++l) {
+        float off = simEngine.laneX(l) - 0.5f * sim::LANE_WIDTH;
         for (float z = dashStartZ; z >= dashEndZ; z -= dashPeriod) {
             float zNear = z;
             float zFar  = z - dashLen;
@@ -1933,13 +1947,13 @@ void GLWidget::drawRoad(float camZ)
         glColor3f(0.70f, 0.72f, 0.76f);
         for (float z = postStartZ; z >= endZ; z -= postPeriod) {
             float c = roadCenter(z);
-            boxAt(c + side * RAIL_OFFSET, 0.55f, z, 0.10f, 0.55f, 0.10f);
+            boxAt(c + side * railOffset(), 0.55f, z, 0.10f, 0.55f, 0.10f);
         }
         glColor3f(0.82f, 0.84f, 0.88f);
         for (float ry : {0.50f, 0.95f}) {
             glBegin(GL_QUAD_STRIP);
             for (float z = startZ; z >= endZ; z -= seg) {
-                float c = roadCenter(z), x = c + side * RAIL_OFFSET;
+                float c = roadCenter(z), x = c + side * railOffset();
                 glNormal3f(-side, 0, 0);
                 glVertex3f(x, ry - 0.12f, z);
                 glVertex3f(x, ry + 0.12f, z);
@@ -1958,9 +1972,9 @@ void GLWidget::drawArch(float z, bool finish)
     if (!finish) {
         // Simple start line arch
         glColor3f(0.20f, 0.22f, 0.26f);
-        boxAt(-ROAD_HALF - 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
-        boxAt( ROAD_HALF + 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
-        boxAt(0, 7.2f, 0, ROAD_HALF + 1.5f, 0.4f, 0.5f);
+        boxAt(-roadHalf() - 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
+        boxAt( roadHalf() + 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
+        boxAt(0, 7.2f, 0, roadHalf() + 1.5f, 0.4f, 0.5f);
         glColor3f(0.12f, 0.14f, 0.18f);
         boxAt(0, 6.2f, 0, 6.0f, 0.9f, 0.08f);
         glDisable(GL_LIGHTING);
@@ -1971,7 +1985,7 @@ void GLWidget::drawArch(float z, bool finish)
         // ===================================================================
         // GRAND ARCADE FINISH ARCH GANTRY & SCENIC FINISH ZONE
         // ===================================================================
-        float archW = ROAD_HALF + 2.5f;
+        float archW = roadHalf() + 2.5f;
 
         // 1. Heavy dark metallic vertical pillars with industrial lattice trusses
         glColor3f(0.13f, 0.15f, 0.18f);
@@ -2112,12 +2126,12 @@ void GLWidget::drawArch(float z, bool finish)
 
         // 7. Multi-row high-contrast checkered finish line on the asphalt
         const int n = 20;
-        float sq = (ROAD_HALF * 2.0f) / n;
+        float sq = (roadHalf() * 2.0f) / n;
         for (int i = 0; i < n; ++i) {
             for (int row = 0; row < 4; ++row) {
                 if ((i + row) % 2) glColor3f(0.03f, 0.03f, 0.03f);
                 else               glColor3f(0.98f, 0.98f, 0.98f);
-                float x0 = -ROAD_HALF + i * sq, z0 = -row * sq * 0.9f;
+                float x0 = -roadHalf() + i * sq, z0 = -row * sq * 0.9f;
                 glBegin(GL_QUADS);
                 glVertex3f(x0, 0.04f, z0);
                 glVertex3f(x0 + sq, 0.04f, z0);
@@ -2129,7 +2143,8 @@ void GLWidget::drawArch(float z, bool finish)
 
         // Dark tire rubber skid trails leading up to the checkered line
         glColor4f(0.02f, 0.02f, 0.02f, 0.65f);
-        for (float lx : {-4.67f, 0.0f, 4.67f}) {
+        for (int l = 0; l < simEngine.laneCount(); ++l) {
+            const float lx = simEngine.laneX(l);
             for (float s : {-0.8f, 0.8f}) {
                 glBegin(GL_QUADS);
                 glVertex3f(lx + s - 0.22f, 0.045f, 24.0f);
@@ -2146,8 +2161,8 @@ void GLWidget::drawArch(float z, bool finish)
                 int curbStep = int(std::floor((rz + 100.0f) / 3.0f));
                 if (curbStep % 2 == 0) glColor3f(0.92f, 0.16f, 0.16f);
                 else                   glColor3f(0.98f, 0.98f, 0.98f);
-                float rx0 = side * ROAD_HALF;
-                float rx1 = side * (ROAD_HALF + 0.95f);
+                float rx0 = side * roadHalf();
+                float rx1 = side * (roadHalf() + 0.95f);
                 glBegin(GL_QUADS);
                 glVertex3f(rx0, 0.035f, rz);
                 glVertex3f(rx1, 0.035f, rz);
@@ -2160,7 +2175,7 @@ void GLWidget::drawArch(float z, bool finish)
         // 8. Roadside Sponsor Billboards
         for (float sbz : { 28.0f, 62.0f, 96.0f }) {
             for (float side : { -1.0f, 1.0f }) {
-                float bx = side * (RAIL_OFFSET + 3.2f);
+                float bx = side * (railOffset() + 3.2f);
                 glColor3f(0.25f, 0.25f, 0.28f);
                 boxAt(bx, 1.5f, sbz, 0.15f, 1.5f, 0.15f);
                 if (int(sbz) % 2 == 0) glColor3f(0.10f, 0.25f, 0.70f); // Blue
@@ -2183,19 +2198,19 @@ void GLWidget::drawArch(float z, bool finish)
         if (finTheme == sim::MapTheme::Countryside || finTheme == sim::MapTheme::Coast) {
         // A. Tropical Palm Trees along both sides of track
         const struct PalmPos { float x, z, scale, rot; } palms[] = {
-            { -ROAD_HALF - 4.5f,  20.0f, 1.05f,   35.0f },
-            { -ROAD_HALF - 7.2f,  45.0f, 0.95f,  120.0f },
-            { -ROAD_HALF - 5.0f,  75.0f, 1.15f,  210.0f },
-            { -ROAD_HALF - 4.2f, -18.0f, 1.00f,   75.0f },
-            { -ROAD_HALF - 6.8f, -48.0f, 1.10f,  160.0f },
-            { -ROAD_HALF - 8.5f, -80.0f, 1.20f,  290.0f },
+            { -roadHalf() - 4.5f,  20.0f, 1.05f,   35.0f },
+            { -roadHalf() - 7.2f,  45.0f, 0.95f,  120.0f },
+            { -roadHalf() - 5.0f,  75.0f, 1.15f,  210.0f },
+            { -roadHalf() - 4.2f, -18.0f, 1.00f,   75.0f },
+            { -roadHalf() - 6.8f, -48.0f, 1.10f,  160.0f },
+            { -roadHalf() - 8.5f, -80.0f, 1.20f,  290.0f },
 
-            {  ROAD_HALF + 4.5f,  18.0f, 1.00f,  -40.0f },
-            {  ROAD_HALF + 6.8f,  42.0f, 1.10f, -130.0f },
-            {  ROAD_HALF + 5.2f,  70.0f, 0.90f,  -85.0f },
-            {  ROAD_HALF + 4.8f, -22.0f, 1.05f,  -60.0f },
-            {  ROAD_HALF + 7.5f, -54.0f, 1.15f, -190.0f },
-            {  ROAD_HALF + 9.0f, -85.0f, 1.25f,  -20.0f }
+            {  roadHalf() + 4.5f,  18.0f, 1.00f,  -40.0f },
+            {  roadHalf() + 6.8f,  42.0f, 1.10f, -130.0f },
+            {  roadHalf() + 5.2f,  70.0f, 0.90f,  -85.0f },
+            {  roadHalf() + 4.8f, -22.0f, 1.05f,  -60.0f },
+            {  roadHalf() + 7.5f, -54.0f, 1.15f, -190.0f },
+            {  roadHalf() + 9.0f, -85.0f, 1.25f,  -20.0f }
         };
         for (const auto &p : palms) {
             glPushMatrix();
@@ -2210,33 +2225,33 @@ void GLWidget::drawArch(float z, bool finish)
         for (float hz : { 80.0f, 40.0f, 0.0f, -40.0f, -80.0f }) {
             // Left flank rolling hills
             glColor3f(0.16f, 0.54f, 0.20f);
-            boxAt(-ROAD_HALF - 18.0f, 3.5f, hz, 10.0f, 3.5f, 18.0f);
+            boxAt(-roadHalf() - 18.0f, 3.5f, hz, 10.0f, 3.5f, 18.0f);
             glColor3f(0.14f, 0.48f, 0.18f);
-            boxAt(-ROAD_HALF - 24.0f, 6.0f, hz + 5.0f, 8.0f, 6.0f, 14.0f);
+            boxAt(-roadHalf() - 24.0f, 6.0f, hz + 5.0f, 8.0f, 6.0f, 14.0f);
 
             // Right flank rolling coastal mounds
             glColor3f(0.18f, 0.56f, 0.22f);
-            boxAt( ROAD_HALF + 17.0f, 3.0f, hz, 9.0f, 3.0f, 18.0f);
+            boxAt( roadHalf() + 17.0f, 3.0f, hz, 9.0f, 3.0f, 18.0f);
         }
 
         // C. Coastal Rocky Cliff Formations overlooking the sea (Right side)
         glColor3f(0.42f, 0.40f, 0.38f);
         for (float rz : { 30.0f, -10.0f, -50.0f, -90.0f }) {
-            boxAt(ROAD_HALF + 26.0f, 4.5f, rz, 7.0f, 4.5f, 16.0f);
+            boxAt(roadHalf() + 26.0f, 4.5f, rz, 7.0f, 4.5f, 16.0f);
             glColor3f(0.36f, 0.34f, 0.32f);
-            boxAt(ROAD_HALF + 29.0f, 8.0f, rz - 6.0f, 6.0f, 8.0f, 12.0f);
+            boxAt(roadHalf() + 29.0f, 8.0f, rz - 6.0f, 6.0f, 8.0f, 12.0f);
         }
 
         // D. Scenic Lighthouse on the coastal cliff in the distance past the finish line
         glPushMatrix();
-        glTranslatef(ROAD_HALF + 32.0f, 0.0f, -95.0f);
+        glTranslatef(roadHalf() + 32.0f, 0.0f, -95.0f);
         drawLighthouse();
         glPopMatrix();
         }
 
         // E. Red & White Chevron Direction Signs on the bend past the finish line
         for (float cz : { -32.0f, -62.0f, -92.0f }) {
-            float cx = ROAD_HALF + 2.2f;
+            float cx = roadHalf() + 2.2f;
             // Sign post
             glColor3f(0.30f, 0.32f, 0.35f);
             boxAt(cx, 1.3f, cz, 0.08f, 1.3f, 0.08f);
@@ -2273,17 +2288,23 @@ void GLWidget::drawProps(float camZ)
             continue;
         }
         glScalef(p.scale, p.scale, p.scale);
+        // the models that never change are recorded once and replayed (much cheaper)
+        const int key = int(p.type) * 100;
         switch (p.type) {
-        case sim::Prop::House:      drawHouse(p.palette); break;
-        case sim::Prop::Pine:       drawPine(); break;
-        case sim::Prop::RoundTree:  drawRoundTree(); break;
+        case sim::Prop::House:      drawCachedModel(key + p.palette, [&]() { drawHouse(p.palette); }); break;
+        case sim::Prop::Pine:       drawCachedModel(key, [&]() { drawPine(); }); break;
+        case sim::Prop::RoundTree:  drawCachedModel(key, [&]() { drawRoundTree(); }); break;
         case sim::Prop::Lamp:       drawLamp(); break;
         case sim::Prop::Torch:      drawTorch(p.palette, float(simEngine.getTick()) * 0.08f); break;
-        case sim::Prop::Cactus:     drawCactus(); break;
-        case sim::Prop::Rock:       drawRock(p.palette, p.scale > 3.0f); break;
-        case sim::Prop::SnowPine:   drawPine(true); break;
-        case sim::Prop::Palm:       drawPalmTree(); break;
-        case sim::Prop::Lighthouse: drawLighthouse(); break;
+        case sim::Prop::Cactus:     drawCachedModel(key, [&]() { drawCactus(); }); break;
+        case sim::Prop::Rock: {
+            const bool mesa = p.scale > 3.0f;
+            drawCachedModel(key + p.palette * 2 + (mesa ? 1 : 0), [&]() { drawRock(p.palette, mesa); });
+            break;
+        }
+        case sim::Prop::SnowPine:   drawCachedModel(key, [&]() { drawPine(true); }); break;
+        case sim::Prop::Palm:       drawCachedModel(key, [&]() { drawPalmTree(); }); break;
+        case sim::Prop::Lighthouse: drawCachedModel(key, [&]() { drawLighthouse(); }); break;
         case sim::Prop::Building:   break;
         }
         glPopMatrix();
@@ -2458,10 +2479,10 @@ void GLWidget::drawSea(float camZ)
     struct Band { float x0, x1; float c0[4], c1[4]; float y; };
     const float wave = 0.6f * std::sin(simEngine.getTick() * 0.03f);
     const Band bands[4] = {
-        {RAIL_OFFSET + 1.0f,  RAIL_OFFSET + 15.0f, {0.86f, 0.78f, 0.58f, 1.0f}, {0.80f, 0.72f, 0.52f, 1.0f}, -0.02f},
-        {RAIL_OFFSET + 15.0f + wave, RAIL_OFFSET + 16.2f + wave, {0.95f, 0.97f, 1.0f, 0.9f}, {0.75f, 0.92f, 0.95f, 0.9f}, 0.01f},
-        {RAIL_OFFSET + 16.0f, RAIL_OFFSET + 45.0f, {0.24f, 0.66f, 0.72f, 1.0f}, {0.08f, 0.36f, 0.55f, 1.0f}, 0.0f},
-        {RAIL_OFFSET + 45.0f, RAIL_OFFSET + 700.0f, {0.08f, 0.36f, 0.55f, 1.0f}, {0.04f, 0.22f, 0.42f, 1.0f}, 0.0f},
+        {railOffset() + 1.0f,  railOffset() + 15.0f, {0.86f, 0.78f, 0.58f, 1.0f}, {0.80f, 0.72f, 0.52f, 1.0f}, -0.02f},
+        {railOffset() + 15.0f + wave, railOffset() + 16.2f + wave, {0.95f, 0.97f, 1.0f, 0.9f}, {0.75f, 0.92f, 0.95f, 0.9f}, 0.01f},
+        {railOffset() + 16.0f, railOffset() + 45.0f, {0.24f, 0.66f, 0.72f, 1.0f}, {0.08f, 0.36f, 0.55f, 1.0f}, 0.0f},
+        {railOffset() + 45.0f, railOffset() + 700.0f, {0.08f, 0.36f, 0.55f, 1.0f}, {0.04f, 0.22f, 0.42f, 1.0f}, 0.0f},
     };
     for (const Band &b : bands) {
         glBegin(GL_QUAD_STRIP);
@@ -2811,34 +2832,52 @@ void GLWidget::drawWheel(float x, float y, float z, float steerDeg, float spin, 
     glPopMatrix();
 
     glRotatef(side < 0.0f ? spin : -spin, 1, 0, 0);  // mirrored frame on the left needs the opposite sign
-    glRotatef(90, 0, 1, 0);                         // cylinder axis (local Z) -> outward X
-    glTranslatef(0, 0, -W * 0.5f);
+    drawCachedModel(100000 + int(R * 1000.0f), [&]() {   // the spinning part, recorded once per size
+        glPushMatrix();
+        glRotatef(90, 0, 1, 0);                         // cylinder axis (local Z) -> outward X
+        glTranslatef(0, 0, -W * 0.5f);
 
-    glColor3f(0.07f, 0.07f, 0.075f);                // tread + inner sidewall
-    gluCylinder(quad, R, R, W, 24, 1);
-    glPushMatrix(); glRotatef(180.0f, 0, 1, 0); gluDisk(quad, 0.0, R, 24, 1); glPopMatrix();
+        glColor3f(0.07f, 0.07f, 0.075f);                // tread + inner sidewall
+        gluCylinder(quad, R, R, W, 24, 1);
+        glPushMatrix(); glRotatef(180.0f, 0, 1, 0); gluDisk(quad, 0.0, R, 24, 1); glPopMatrix();
 
-    glTranslatef(0, 0, W);
-    glColor3f(0.11f, 0.11f, 0.12f);                 // outer sidewall
-    gluDisk(quad, rimR, R, 24, 1);
-    glColor3f(0.82f, 0.83f, 0.86f);                 // polished rim lip
-    gluDisk(quad, rimR * 0.88f, rimR, 24, 1);
+        glTranslatef(0, 0, W);
+        glColor3f(0.11f, 0.11f, 0.12f);                 // outer sidewall
+        gluDisk(quad, rimR, R, 24, 1);
+        glColor3f(0.82f, 0.83f, 0.86f);                 // polished rim lip
+        gluDisk(quad, rimR * 0.88f, rimR, 24, 1);
 
-    glTranslatef(0, 0, -0.06f);                     // dished centre
-    glColor3f(0.32f, 0.32f, 0.34f);                 // brake disc seen between the spokes
-    gluDisk(quad, 0.0, rimR * 0.88f, 20, 1);
-    glColor3f(0.78f, 0.79f, 0.83f);
-    for (int k = 0; k < 5; ++k) {
-        for (float off : {-8.0f, 8.0f}) {
-            glPushMatrix();
-            glRotatef(k * 72.0f + off, 0, 0, 1);
-            boxAt(0, rimR * 0.48f, 0.035f, 0.022f, rimR * 0.42f, 0.02f);
-            glPopMatrix();
+        glTranslatef(0, 0, -0.06f);                     // dished centre
+        glColor3f(0.32f, 0.32f, 0.34f);                 // brake disc seen between the spokes
+        gluDisk(quad, 0.0, rimR * 0.88f, 20, 1);
+        glColor3f(0.78f, 0.79f, 0.83f);
+        for (int k = 0; k < 5; ++k) {
+            for (float off : {-8.0f, 8.0f}) {
+                glPushMatrix();
+                glRotatef(k * 72.0f + off, 0, 0, 1);
+                boxAt(0, rimR * 0.48f, 0.035f, 0.022f, rimR * 0.42f, 0.02f);
+                glPopMatrix();
+            }
         }
-    }
-    glColor3f(0.20f, 0.20f, 0.22f);                 // centre hub
-    glPushMatrix(); glTranslatef(0, 0, 0.056f); gluDisk(quad, 0.0, rimR * 0.20f, 12, 1); glPopMatrix();
+        glColor3f(0.20f, 0.20f, 0.22f);                 // centre hub
+        glPushMatrix(); glTranslatef(0, 0, 0.056f); gluDisk(quad, 0.0, rimR * 0.20f, 12, 1); glPopMatrix();
+        glPopMatrix();
+    });
     glPopMatrix();
+}
+
+// Records a model that never changes into a display list the first time, then replays it.
+void GLWidget::drawCachedModel(int key, const std::function<void()> &draw)
+{
+    auto it = modelLists.constFind(key);
+    if (it == modelLists.constEnd()) {
+        GLuint list = glGenLists(1);
+        glNewList(list, GL_COMPILE);
+        draw();
+        glEndList();
+        it = modelLists.insert(key, list);
+    }
+    glCallList(it.value());
 }
 
 // Soft contact shadow: dark rounded core that fades out towards the edges.
@@ -3496,7 +3535,7 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
     }
 
     // Warnings / messages (Centered)
-    bool offroad = std::fabs(me.x - roadCenter(me.z)) > sim::ROAD_HALF;
+    bool offroad = std::fabs(me.x - roadCenter(me.z)) > roadHalf();
     if (offroad && simEngine.getState() == State::Racing && (simEngine.getTick() / 15) % 2) {
         float s = ps * 1.6f;
         drawText("OFF ROAD", (vw - textWidth("OFF ROAD", s)) * 0.5f, vh * 0.30f, s, 1.0f, 0.55f, 0.1f);
@@ -3563,7 +3602,7 @@ void GLWidget::drawMinimap(int W, int H, float dpr)
     auto mx = [&](float wx) { return x0 + mw * 0.5f + wx * kx; };
     auto my = [&](float wz) { return std::clamp(bottom + (-wz) * ky, bottom, top); };
 
-    float rw = std::max(2.5f * dpr, sim::ROAD_HALF * kx);
+    float rw = std::max(2.5f * dpr, roadHalf() * kx);
     glColor4f(0.60f, 0.60f, 0.66f, 1.0f);
     glBegin(GL_QUAD_STRIP);
     for (float d = 0; d <= sim::TRACK_LEN + 40.0f; d += 20.0f) {

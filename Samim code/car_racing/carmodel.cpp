@@ -289,6 +289,11 @@ void wheelWell(float wc, float side)
 
 GLfloat g_savedFog[4] = {0, 0, 0, 1};
 
+// Lamp lenses, recorded by build(): they sit on the curved body, which is slow to work
+// out, and every car on screen needs them every frame
+GLuint g_frontLamps = 0;   // headlights + running lights, with their colours
+GLuint g_tailLamps  = 0;   // tail lights, no colour (it changes with braking)
+
 } // namespace
 
 // ===========================================================================
@@ -421,12 +426,29 @@ Lists build()
 
     glEndList();
     gluDeleteQuadric(q);
+
+    g_frontLamps = glGenLists(1);
+    glNewList(g_frontLamps, GL_COMPILE);
+    glColor3f(1.0f, 0.97f, 0.88f);                         // headlights
+    bodyPatch(-2.16f, -1.88f, 0.155f, 0.245f, 0.010f, 5, 3);
+    bodyPatch(-2.16f, -1.88f, 0.755f, 0.845f, 0.010f, 5, 3);
+    glColor3f(0.70f, 0.88f, 1.0f);                         // daytime running light strips
+    bodyPatch(-2.17f, -1.96f, 0.100f, 0.116f, 0.010f, 4, 1);
+    bodyPatch(-2.17f, -1.96f, 0.884f, 0.900f, 0.010f, 4, 1);
+    glEndList();
+
+    g_tailLamps = glGenLists(1);
+    glNewList(g_tailLamps, GL_COMPILE);
+    faceQuad(-0.80f, 0.80f, 0.635f, 0.685f, TAIL_Z + 0.008f, 1.0f);
+    bodyPatch(2.03f, 2.24f, 0.125f, 0.185f, 0.010f, 4, 2);
+    bodyPatch(2.03f, 2.24f, 0.815f, 0.875f, 0.010f, 4, 2);
+    glEndList();
     return L;
 }
 
 void destroy(Lists &l)
 {
-    for (GLuint *id : {&l.body, &l.glass, &l.trim}) {
+    for (GLuint *id : {&l.body, &l.glass, &l.trim, &g_frontLamps, &g_tailLamps}) {
         if (*id) glDeleteLists(*id, 1);
         *id = 0;
     }
@@ -530,18 +552,11 @@ void drawWing()
 void drawLamps(float brake)
 {
     // Unlit (emissive-looking) lenses; caller disables lighting.
-    glColor3f(1.0f, 0.97f, 0.88f);                         // headlights
-    bodyPatch(-2.16f, -1.88f, 0.155f, 0.245f, 0.010f, 5, 3);
-    bodyPatch(-2.16f, -1.88f, 0.755f, 0.845f, 0.010f, 5, 3);
-    glColor3f(0.70f, 0.88f, 1.0f);                         // daytime running light strips
-    bodyPatch(-2.17f, -1.96f, 0.100f, 0.116f, 0.010f, 4, 1);
-    bodyPatch(-2.17f, -1.96f, 0.884f, 0.900f, 0.010f, 4, 1);
+    glCallList(g_frontLamps);                              // headlights + running lights
 
     float k = 0.45f + 0.55f * brake;                       // tail lights: brighter when braking
     glColor3f(k, 0.04f + 0.12f * brake, 0.03f);
-    faceQuad(-0.80f, 0.80f, 0.635f, 0.685f, TAIL_Z + 0.008f, 1.0f);
-    bodyPatch(2.03f, 2.24f, 0.125f, 0.185f, 0.010f, 4, 2);
-    bodyPatch(2.03f, 2.24f, 0.815f, 0.875f, 0.010f, 4, 2);
+    glCallList(g_tailLamps);
 
     beginGlow();
     for (float sx : {-0.72f, 0.72f}) halo(sx, 0.59f, NOSE_Z - 0.04f, 0.38f, 1.0f, 0.95f, 0.80f, 0.45f);

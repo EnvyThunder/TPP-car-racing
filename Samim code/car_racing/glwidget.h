@@ -11,11 +11,13 @@
 #include <deque>
 #include <random>
 #include <QStringList>
+#include <QHash>
+#include <functional>
 
 #include "shared/gamesim.h"
 
 class AudioEngine;
-class RaceServer;
+class HostedServer;
 class RaceClient;
 struct GLUquadric;
 
@@ -102,7 +104,7 @@ private:
     int netChoice = 0;                     // Choose screen: 0 host, 1 join, 2 back
     QString joinText;                      // room code being typed
     QString netMessage;                    // status or error line
-    RaceServer *hostServer = nullptr;      // room server running inside this game while hosting
+    HostedServer *hostServer = nullptr;    // room server running inside this game (own thread) while hosting
     RaceClient *net = nullptr;
     int mySlot = 0;                        // my car in the online race
     QStringList racerNames;
@@ -112,11 +114,16 @@ private:
     quint32 inputSeq = 0;
     sim::Car predicted;                    // my car, simulated locally so it reacts instantly
     float corrX = 0.0f, corrZ = 0.0f;      // smooths out small prediction corrections
-    struct Sample { qint64 t; std::vector<sim::Car> cars; };
+    struct Sample { double t; std::vector<sim::Car> cars; };   // t = server time (ms) of the snapshot
     std::deque<Sample> history;            // recent snapshots: other cars are drawn slightly in the past
     QElapsedTimer netClock;
+    double serverClockAhead = 0.0;         // server time minus netClock, from the quickest snapshots
     QString netTest;                       // CAR_RACING_NETTEST: scripted online test (see runNetAutoShot)
     int statSnapshots = 0, statSmallFix = 0, statSnaps = 0;   // how often the prediction was corrected
+    // more scripted-test measurements: frame times, drawing time, gaps between snapshots
+    int statFrames = 0, statSlowFrames = 0, statSnapLate = 0;
+    double statPaintMs = 0.0, statPaintMax = 0.0, statSnapGapMax = 0.0, statSnapBytes = 0.0;
+    qint64 statLastSnap = -1;
     bool trackMismatch = false;            // my track differs from the host's (different game version)
     bool isOnline() const { return netScreen == NetScreen::Race; }
     int localCar() const { return isOnline() ? mySlot : 0; }
@@ -160,12 +167,16 @@ private:
     GLuint carBodyList = 0;       // Display lists for the sculpted car model (built once)
     GLuint carGlassList = 0;
     GLuint carTrimList = 0;
+    QHash<int, GLuint> modelLists;  // scenery and wheel models, recorded once (see drawCachedModel)
+    void drawCachedModel(int key, const std::function<void()> &draw);
 
     // ---- Input & helper ----
     bool isDown(int key) const { return keys.contains(key); }
     float rnd(float a, float b);
     float roadCenter(float z) const { return simEngine.roadCenter(z); }
     float roadAngle(float z) const { return simEngine.roadAngle(z); }
+    float roadHalf() const { return simEngine.roadHalf(); }       // wider in online rooms
+    float railOffset() const { return simEngine.railOffset(); }
     int   getTick() const { return simEngine.getTick(); }
     void startRace(GameMode mode);
     void processSimEvents(const std::vector<sim::SimEvent> &events);

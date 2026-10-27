@@ -9,7 +9,7 @@
 using namespace net;
 
 RaceServer::RaceServer(QObject *parent)
-    : QObject(parent)
+    : QObject(parent), tcp(this), udp(this), timer(this)   // children: they move threads with it
 {
     connect(&tcp, &QTcpServer::newConnection, this, &RaceServer::onNewConnection);
     connect(&udp, &QUdpSocket::readyRead, this, &RaceServer::onDiscovery);
@@ -121,6 +121,12 @@ void RaceServer::handle(Player *p, MsgType type, const QByteArray &payload)
     case C_PING:
         send(p, S_PONG, payload);
         break;
+    case C_ADD_BOT:
+        if (room && room->host == p && !room->racing) addCpu(room);
+        break;
+    case C_REMOVE_BOT:
+        if (room && room->host == p && !room->racing) removeCpu(room);
+        break;
     default:
         break;
     }
@@ -172,7 +178,13 @@ void RaceServer::join(Player *p, QDataStream &in)
         room = rooms.value(code);
         if (!room)                                   { fail(p, "No room with code " + code); return; }
         if (room->racing)                            { fail(p, "Race in progress - join after it ends"); return; }
-        if (room->players.size() >= sim::MAX_RACERS) { fail(p, "Room is full (8/8)"); return; }
+        if (room->players.size() >= sim::MAX_RACERS) {
+            // a CPU racer gives its seat to a person
+            bool hasCpu = false;
+            for (Player *q : room->players) hasCpu = hasCpu || q->isCpu();
+            if (!hasCpu) { fail(p, "Room is full (8/8)"); return; }
+            removeCpu(room);
+        }
         emit log(QString("%1 joined room %2").arg(p->name, room->code));
     }
     room->players.append(p);
@@ -221,8 +233,56 @@ void RaceServer::sendLobby(Room *room)
         prepare(ds);
         ds << qint8(room->map) << qint8(me) << bool(room->host == to) << quint8(room->players.size());
         for (Player *q : room->players)
-            ds << q->name << q->r << q->g << q->b << bool(room->host == q);
+            ds << q->name << q->r << q->g << q->b << bool(room->host == q) << qint8(q->cpuLevel);
         send(to, S_LOBBY, out);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  CPU racers: seats filled by the server's own CPU drivers
+// ---------------------------------------------------------------------------
+void RaceServer::pickFreeColour(Room *room, Player *p)
+{
+    static const float PALETTE[8][3] = {
+        {0.92f, 0.14f, 0.16f}, {0.15f, 0.42f, 0.98f}, {1.00f, 0.75f, 0.10f}, {0.20f, 0.85f, 0.35f},
+        {0.85f, 0.30f, 0.95f}, {0.10f, 0.85f, 0.90f}, {0.95f, 0.50f, 0.15f}, {0.92f, 0.92f, 0.95f}};
+    for (const auto &c : PALETTE) {
+        bool used = false;
+        for (Player *q : room->players)
+            used = used || (q != p && std::fabs(q->r - c[0]) + std::fabs(q->g - c[1]) + std::fabs(q->b - c[2]) < 0.35f);
+        if (!used) { p->r = c[0]; p->g = c[1]; p->b = c[2]; return; }
+    }
+}
+
+void RaceServer::addCpu(Room *room)
+{
+    if (room->players.size() >= sim::MAX_RACERS) return;
+    Player *p = new Player;
+    p->cpuLevel = QRandomGenerator::global()->bounded(1, 6);      // random difficulty 1..5
+    for (int n = 1; ; ++n) {                                       // CPU1, CPU2, ... (first free)
+        QString name = QString("CPU%1").arg(n);
+        bool taken = false;
+        for (Player *q : room->players) taken = taken || q->name == name;
+        if (!taken) { p->name = name; break; }
+    }
+    room->players.append(p);
+    pickFreeColour(room, p);
+    roomOf.insert(p, room);
+    emit log(QString("Room %1: %2 added (level %3)").arg(room->code, p->name).arg(p->cpuLevel));
+    sendLobby(room);
+}
+
+void RaceServer::removeCpu(Room *room)
+{
+    for (int i = room->players.size() - 1; i >= 0; --i) {
+        Player *p = room->players[i];
+        if (!p->isCpu()) continue;
+        room->players.removeAt(i);
+        roomOf.remove(p);
+        emit log(QString("Room %1: %2 removed").arg(room->code, p->name));
+        delete p;
+        sendLobby(room);
+        return;
     }
 }
 
@@ -238,8 +298,9 @@ void RaceServer::startRace(Room *room)
     for (int i = 0; i < n; ++i) {
         Player *p = room->players[i];
         cars[i].r = p->r; cars[i].g = p->g; cars[i].b = p->b;
+        cars[i].aiLevel = p->cpuLevel;
         p->inputs.clear();
-        p->current = sim::PlayerInput{};
+        p->budget = 0.0f;
         p->lastSeq = 0;
     }
     room->racing = true;
@@ -265,7 +326,7 @@ void RaceServer::endRace(Room *room)
     room->racing = false;
     for (int i = room->players.size() - 1; i >= 0; --i) {  // drop players who left during the race
         Player *p = room->players[i];
-        if (!p->sock) { roomOf.remove(p); room->players.removeAt(i); delete p; }
+        if (!p->sock && !p->isCpu()) { roomOf.remove(p); room->players.removeAt(i); delete p; }
     }
     for (Player *p : room->players) send(p, S_RACE_OVER);
     sendLobby(room);
@@ -274,30 +335,54 @@ void RaceServer::endRace(Room *room)
 void RaceServer::onTick()
 {
     const float DT = 1.0f / 60.0f;
-    accumulator += clock.restart() * 0.001;
+    // in nanoseconds: whole milliseconds would drop the fraction on every call (it runs every
+    // ~5 ms), and the race would run up to 10% slower than real time - slower than the
+    // players' games send their inputs
+    const qint64 gapNs = clock.nsecsElapsed();
+    clock.restart();
+    const qint64 gapMs = gapNs / 1000000;
+    accumulator += gapNs * 1e-9;
     if (accumulator > 0.25) accumulator = 0.25;              // don't spiral after a stall
     while (accumulator >= DT) {
         accumulator -= DT;
         const auto roomList = rooms.values();
         for (Room *room : roomList) {
             if (!room->racing) continue;
+            if (room->sim.getState() == sim::GameSim::Racing && gapMs > statMaxGapMs) statMaxGapMs = int(gapMs);
             const int n = room->players.size();
-            sim::PlayerInput inputs[sim::MAX_RACERS];
+            sim::PlayerInput inputs[sim::MAX_RACERS], extra[sim::MAX_RACERS];
+            int runs[sim::MAX_RACERS];
             for (int i = 0; i < n; ++i) {
                 Player *p = room->players[i];
+                runs[i] = 1;
+                if (p->isCpu()) {                              // CPU racer: the server drives it
+                    inputs[i] = room->sim.computeAIInput(room->sim.getCars()[i], i, true);
+                    continue;
+                }
                 if (!p->sock) { inputs[i] = sim::PlayerInput{}; continue; }
-                while (p->inputs.size() > 6) {                 // client ran ahead: skip stale inputs
+                // Every input a player sends moves their car exactly once, as it did in their own
+                // game's prediction - so their car never has to be pulled back. Input not here
+                // yet (a slow frame on their side): the car waits this tick. Inputs piling up:
+                // two in one tick until it has caught up. The budget (a little over one input
+                // per tick, for clocks that run slightly differently) stops a game going faster.
+                p->budget = std::min(p->budget + 1.02f, 12.0f);
+                runs[i] = 0;
+                while (runs[i] < 2 && !p->inputs.empty() && p->budget >= 1.0f &&
+                       (runs[i] == 0 || p->inputs.size() > 2)) {
+                    (runs[i] == 0 ? inputs[i] : extra[i]) = p->inputs.front().second;
                     p->lastSeq = p->inputs.front().first;
                     p->inputs.pop_front();
+                    p->budget -= 1.0f;
+                    ++runs[i];
                 }
-                if (!p->inputs.empty()) {                      // one input per tick, like the client
-                    p->current = p->inputs.front().second;
+                if (runs[i] == 0 && room->sim.getState() == sim::GameSim::Racing) ++statStarved;
+                while (p->inputs.size() > 12) {                // 0.2 s behind: drop the oldest
                     p->lastSeq = p->inputs.front().first;
                     p->inputs.pop_front();
+                    ++statDropped;
                 }
-                inputs[i] = p->current;
             }
-            room->sim.step(inputs, n);
+            room->sim.step(inputs, n, runs, extra);
             const auto &evs = room->sim.getEvents();
             if (room->pendingEvents.size() < 300)
                 room->pendingEvents.insert(room->pendingEvents.end(), evs.begin(), evs.end());
@@ -370,4 +455,28 @@ QString RaceServer::newCode() const
         for (int i = 0; i < 4; ++i) code += QChar(ALPHABET[QRandomGenerator::global()->bounded(32)]);
     } while (rooms.contains(code));
     return code;
+}
+
+// ---------------------------------------------------------------------------
+//  HostedServer: the host's room server on its own thread
+// ---------------------------------------------------------------------------
+bool HostedServer::start()
+{
+    srv = new RaceServer;
+    srv->moveToThread(&thread);
+    thread.setObjectName("race server");
+    thread.start(QThread::HighPriority);
+    bool ok = false;
+    QMetaObject::invokeMethod(srv, [this, &ok]() {     // sockets are opened on the server's thread
+        ok = srv->start();
+        listenPort = srv->port();
+    }, Qt::BlockingQueuedConnection);
+    return ok;
+}
+
+HostedServer::~HostedServer()
+{
+    if (srv) QMetaObject::invokeMethod(srv, [s = srv]() { delete s; }, Qt::BlockingQueuedConnection);
+    thread.quit();
+    thread.wait();
 }

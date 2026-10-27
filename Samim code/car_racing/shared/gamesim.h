@@ -19,7 +19,10 @@ public:
     // racers = number of cars on the grid (2 for local modes, up to MAX_RACERS online)
     void reset(uint32_t seed = 2024, int racers = 2);
     void startRace(GameMode mode, int racers = 2);
-    void step(const PlayerInput inputs[], int inputCount);
+    // runs (online server, optional): how many inputs each car uses this tick - 0 while its
+    // player's next input hasn't arrived (the car waits), 2 to catch up; extra = the second one
+    void step(const PlayerInput inputs[], int inputCount, const int runs[] = nullptr,
+              const PlayerInput extra[] = nullptr);
 
     // Race position (1 = leading) of car idx among all cars
     int rankOf(int idx) const;
@@ -40,6 +43,12 @@ public:
 
     float roadCenter(float z) const;
     float roadAngle(float z) const;
+
+    // Road width of this race (set by reset): 3 lanes offline, 5 lanes online
+    float roadHalf() const { return halfWidth; }
+    float railOffset() const { return halfWidth + 4.0f; }   // guard rails
+    int laneCount() const { return lanes; }
+    float laneX(int i) const { return (float(i) - 0.5f * float(lanes - 1)) * LANE_WIDTH; }   // lane centre from the road centre
 
     // Simulation states & accessors
     State getState() const { return state; }
@@ -90,6 +99,8 @@ private:
     GameMode mode = ModeSingle;
     int aiDifficulty = 1;
     int mapIndex = 0;
+    float halfWidth = ROAD_HALF;
+    int lanes = 3;
 
     int tick = 0;
     float raceTimer = 0.0f;

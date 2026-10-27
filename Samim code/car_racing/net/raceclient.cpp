@@ -45,6 +45,8 @@ void RaceClient::reset()
     players.clear();
     pingMs = -1;
     joined = false;
+    lagIn.clear();
+    lagOut.clear();
 }
 
 void RaceClient::join(const QString &codeOrAddress, const QString &name, float r, float g, float b)
@@ -183,8 +185,19 @@ void RaceClient::onReadyRead()
     MsgType type;
     QByteArray payload;
     while (reader.next(type, payload)) {
-        if (fakeLagMs > 0) QTimer::singleShot(fakeLagMs / 2, this, [this, type, payload]() { dispatch(type, payload); });
-        else dispatch(type, payload);
+        if (fakeLagMs > 0) {
+            // lag simulator: each timer hands over the OLDEST waiting message, as timers due
+            // at the same moment may fire in any order (a real TCP connection never reorders)
+            lagIn.emplace_back(type, payload);
+            QTimer::singleShot(fakeLagMs / 2, Qt::PreciseTimer, this, [this]() {
+                if (lagIn.empty()) return;
+                auto m = lagIn.front();
+                lagIn.pop_front();
+                dispatch(m.first, m.second);
+            });
+        } else {
+            dispatch(type, payload);
+        }
     }
 }
 
@@ -215,7 +228,9 @@ void RaceClient::dispatch(MsgType type, const QByteArray &payload)
             players.clear();
             for (int i = 0; i < n; ++i) {
                 LobbyPlayer p;
-                in >> p.name >> p.r >> p.g >> p.b >> p.host;
+                qint8 lvl;
+                in >> p.name >> p.r >> p.g >> p.b >> p.host >> lvl;
+                p.cpuLevel = lvl;
                 players.append(p);
             }
             emit lobbyChanged();
@@ -292,6 +307,8 @@ void RaceClient::sendInput(quint32 seq, const sim::PlayerInput &in)
 }
 
 void RaceClient::requestStart() { send(C_START); }
+void RaceClient::requestAddCpu() { send(C_ADD_BOT); }
+void RaceClient::requestRemoveCpu() { send(C_REMOVE_BOT); }
 
 void RaceClient::requestMap(int map)
 {
@@ -306,10 +323,15 @@ void RaceClient::send(MsgType type, const QByteArray &payload)
 {
     if (sock.state() != QAbstractSocket::ConnectedState) return;
     QByteArray f = frame(type, payload);
-    if (fakeLagMs > 0)
-        QTimer::singleShot(fakeLagMs / 2, this, [this, f]() {
-            if (sock.state() == QAbstractSocket::ConnectedState) sock.write(f);
+    if (fakeLagMs > 0) {
+        lagOut.push_back(f);                     // in order, like lagIn
+        QTimer::singleShot(fakeLagMs / 2, Qt::PreciseTimer, this, [this]() {
+            if (lagOut.empty()) return;
+            QByteArray oldest = lagOut.front();
+            lagOut.pop_front();
+            if (sock.state() == QAbstractSocket::ConnectedState) sock.write(oldest);
         });
-    else
+    } else {
         sock.write(f);
+    }
 }

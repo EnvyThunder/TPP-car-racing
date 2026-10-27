@@ -10,13 +10,15 @@ namespace sim {
 
 // Constants
 constexpr float PI          = 3.14159265f;
-constexpr float ROAD_HALF   = 7.0f;               // Road width is 14 units (3 lanes)
-constexpr float RAIL_OFFSET = ROAD_HALF + 4.0f;   // Guard rails
+// Road: 3 lanes (14 units) in single player and split screen. Online rooms race up to
+// 8 cars, so they get 5 lanes (23.3 units). A race's own width is GameSim::roadHalf().
+constexpr float ROAD_HALF   = 7.0f;               // Half width of the 3-lane road
+constexpr float LANE_WIDTH  = 4.67f;
+constexpr int   ONLINE_LANES = 5;
 constexpr float TRACK_LEN   = 4000.0f;            // Finish line distance
 constexpr float MAX_SPEED   = 1.10f;
 constexpr float NITRO_SPEED = 1.65f;
 constexpr float OFFROAD_MAX = 0.45f;
-constexpr float LANES[3]    = {-4.67f, 0.0f, 4.67f};
 constexpr int   MAX_RACERS  = 8;                  // Online rooms hold up to 8 cars
 
 // Input frame for a vehicle
@@ -50,6 +52,7 @@ struct Car {
     float topSpeed = 0.0f;        // Max speed reached
     float finishTime = 0.0f;      // Time in seconds to finish
     float speedScale = 1.0f;      // Top-speed multiplier (CPU difficulty / catch-up); players stay at 1
+    int   aiLevel = 0;            // Online CPU racer difficulty 1..5 (0 = human, or the single-player CPU)
 
     // CPU driver memory
     float aiTarget = 0.0f;        // Sideways offset from the road centre the CPU is steering for

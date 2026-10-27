@@ -156,7 +156,7 @@ void GLWidget::netHost()
         return;
     }
     if (!hostServer) {
-        hostServer = new RaceServer(this);
+        hostServer = new HostedServer;
         if (!hostServer->start()) {
             delete hostServer;
             hostServer = nullptr;
@@ -181,7 +181,8 @@ void GLWidget::netJoin()
 void GLWidget::netLeave(const QString &message)
 {
     if (net) net->leave();
-    if (hostServer) { hostServer->deleteLater(); hostServer = nullptr; }
+    delete hostServer;                     // stops the server's thread
+    hostServer = nullptr;
     if (isOnline() || simEngine.getGameMode() == sim::GameSim::ModeOnline) simEngine.setState(State::Menu);
     netScreen = NetScreen::Choose;
     netMessage = message;
@@ -194,16 +195,32 @@ void GLWidget::netLeave(const QString &message)
 void GLWidget::onNetSnapshot(quint32 lastSeq, const QByteArray &body)
 {
     if (!isOnline()) return;
+    if (!netTest.isEmpty()) {                            // scripted test: how evenly snapshots arrive
+        const qint64 t = netClock.elapsed();
+        if (statLastSnap >= 0) {
+            statSnapGapMax = std::max(statSnapGapMax, double(t - statLastSnap));
+            if (t - statLastSnap > 50) ++statSnapLate;
+        }
+        statLastSnap = t;
+        statSnapBytes += body.size();
+    }
     QDataStream in(body);
     net::prepare(in);
     std::vector<sim::SimEvent> evs;
     simEngine.readSnapshot(in, evs);
     netEvents.insert(netEvents.end(), evs.begin(), evs.end());
 
+    // Time the snapshots by the server's clock (its tick), not by when they got here: a
+    // slow frame here or on the network delivers them unevenly, and the other cars would
+    // stutter. serverClockAhead follows the quickest deliveries, and slowly gives way when
+    // the network gets slower.
     const auto &cars = simEngine.getCars();
-    const qint64 now = netClock.elapsed();
-    history.push_back({now, cars});
-    while (history.size() > 2 && history.front().t < now - 1000) history.pop_front();
+    const double serverMs = simEngine.getTick() * (1000.0 / 60.0);
+    const double ahead = serverMs - double(netClock.elapsed());
+    if (history.empty() || ahead > serverClockAhead) serverClockAhead = ahead;
+    else serverClockAhead -= 2.0;
+    history.push_back({serverMs, cars});
+    while (history.size() > 2 && history.front().t < serverMs - 1000.0) history.pop_front();
     if (mySlot < 0 || mySlot >= int(cars.size())) return;
 
     // Reconciliation: start from where the server says my car is, then re-apply the
@@ -268,7 +285,7 @@ void GLWidget::composeOnlineCars()
 {
     auto &cars = simEngine.getCars();
     if (history.empty()) return;
-    const qint64 renderT = netClock.elapsed() - net::INTERP_DELAY_MS;
+    const double renderT = double(netClock.elapsed()) + serverClockAhead - net::INTERP_DELAY_MS;
 
     // the two snapshots around renderT
     const Sample *a = &history.front(), *b = nullptr;
@@ -281,7 +298,7 @@ void GLWidget::composeOnlineCars()
         sim::Car c = a->cars[i];
         if (b && i < int(b->cars.size()) && b->t > a->t) {
             const sim::Car &n = b->cars[i];
-            float f = std::clamp(float(renderT - a->t) / float(b->t - a->t), 0.0f, 1.0f);
+            float f = std::clamp(float((renderT - a->t) / (b->t - a->t)), 0.0f, 1.0f);
             c.x += (n.x - c.x) * f;
             c.z += (n.z - c.z) * f;
             c.heading = lerpAngle(c.heading, n.heading, f);
@@ -346,6 +363,11 @@ bool GLWidget::handleOnlineKey(QKeyEvent *event)
         } else if (k == Qt::Key_C) {
             if (QClipboard *cb = QGuiApplication::clipboard()) cb->setText(net->code);
             netMessage = "ROOM CODE COPIED - PASTE IT TO YOUR FRIENDS";
+        } else if (net->isHost && (k == Qt::Key_Plus || k == Qt::Key_Equal || k == Qt::Key_B)) {
+            if (net->players.size() < sim::MAX_RACERS) net->requestAddCpu();
+            else netMessage = "ALL 8 SEATS ARE TAKEN";
+        } else if (net->isHost && (k == Qt::Key_Minus || k == Qt::Key_Underscore)) {
+            net->requestRemoveCpu();
         } else if (net->isHost && enter) {
             net->requestStart();
         } else if (net->isHost && (k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_A || k == Qt::Key_D)) {
@@ -484,10 +506,12 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
                 centered("IF THE CODE ALONE DOES NOT WORK, FRIENDS TYPE: " + net->code + "@" + ip, y, ps * 0.62f,
                          0.85f, 0.85f, 0.55f);
             }
-            if (hostServer && net->players.size() < 2) {
+            int people = 0;
+            for (const net::LobbyPlayer &lp : net->players) people += lp.cpuLevel == 0 ? 1 : 0;
+            if (hostServer && people < 2) {
                 // shows whether friends' join attempts reach this PC at all
                 y -= 16.0f * dpr;
-                int seen = hostServer->remoteAttempts();
+                int seen = hostServer->server()->remoteAttempts();
                 if (seen == 0)
                     centered("JOIN ATTEMPTS FROM OTHER PCS: 0  -  IF A FRIEND IS TRYING, RUN ALLOW_FIREWALL.BAT ON THIS PC",
                              y, ps * 0.6f, 1.0f, 0.60f, 0.35f);
@@ -499,7 +523,11 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         y -= 30.0f * dpr;
 
         // player list
-        left(QString("PLAYERS %1/8").arg(net->players.size()), x0 + pad, y, ps * 0.85f, 0.92f, 0.35f, 1.0f);
+        int cpus = 0;
+        for (const net::LobbyPlayer &lp : net->players) cpus += lp.cpuLevel > 0 ? 1 : 0;
+        left(cpus ? QString("PLAYERS %1/8  (%2 CPU)").arg(net->players.size()).arg(cpus)
+                  : QString("PLAYERS %1/8").arg(net->players.size()),
+             x0 + pad, y, ps * 0.85f, 0.92f, 0.35f, 1.0f);
         const sim::MapDef &md = sim::MAPS[std::clamp(net->lobbyMap, 0, sim::NUM_MAPS - 1)];
         QString mapLine = QString("MAP: ") + md.name + (net->isHost ? "  < >" : "");
         left(mapLine, x1 - pad - textWidth(mapLine.toUtf8().constData(), ps * 0.85f), y, ps * 0.85f, 0.35f, 0.90f, 1.0f);
@@ -517,7 +545,19 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
                 QString line = QString("%1  %2").arg(i + 1).arg(p.name);
                 if (p.host) line += "  (HOST)";
                 if (i == net->slot) line += "  (YOU)";
-                left(line, x0 + pad + rowH + 4.0f * dpr, ty, ps * 0.8f, 1.0f, 1.0f, 1.0f);
+                if (p.cpuLevel > 0) line += QString("  CPU LEVEL %1").arg(p.cpuLevel);
+                left(line, x0 + pad + rowH + 4.0f * dpr, ty, ps * 0.8f,
+                     p.cpuLevel ? 0.75f : 1.0f, p.cpuLevel ? 0.85f : 1.0f, 1.0f);
+                if (p.cpuLevel > 0) {                          // difficulty pips, right side
+                    float pip = 8.0f * dpr, gapPip = 4.0f * dpr;
+                    float px = x1 - pad - 10.0f * dpr - 5 * (pip + gapPip);
+                    float py = ry0 + (rowH - 3.0f * dpr - pip) * 0.5f;
+                    for (int k = 0; k < 5; ++k) {
+                        if (k < p.cpuLevel) glColor4f(1.0f, 0.35f + 0.1f * (4 - k), 0.25f, 1.0f);
+                        else                glColor4f(0.22f, 0.26f, 0.35f, 1.0f);
+                        fillRect(px + k * (pip + gapPip), py, px + k * (pip + gapPip) + pip, py + pip);
+                    }
+                }
             } else {
                 left(QString("%1  WAITING FOR PLAYER...").arg(i + 1), x0 + pad + rowH + 4.0f * dpr, ty, ps * 0.8f,
                      0.35f, 0.40f, 0.50f);
@@ -525,7 +565,8 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         }
         if (!netMessage.isEmpty()) centered(netMessage, y0 + pad + 22.0f * dpr, ps * 0.66f, 0.45f, 1.0f, 0.55f);
         if (net->isHost)
-            centered(blink ? "[ENTER] START RACE   [LEFT/RIGHT] MAP   [ESC] LEAVE" : "   [LEFT/RIGHT] MAP   [ESC] LEAVE",
+            centered(blink ? "[ENTER] START   [+]/[-] ADD/REMOVE CPU   [LEFT/RIGHT] MAP   [ESC] LEAVE"
+                           : "                [+]/[-] ADD/REMOVE CPU   [LEFT/RIGHT] MAP   [ESC] LEAVE",
                      y0 + pad, ps * 0.75f, 0.45f, 1.0f, 0.55f);
         else
             centered("WAITING FOR THE HOST TO START...   [ESC] LEAVE", y0 + pad, ps * 0.75f, 0.85f, 0.85f, 0.85f);
@@ -591,6 +632,8 @@ void GLWidget::runNetAutoShot()
     if (host) {
         const int wanted = std::max(1, netTest.section(':', 1, 1).toInt());
         if (f == 45) shot("net_01_online_menu");
+        const int cpus = netTest.section(':', 2, 2).toInt();
+        if (netScreen == NetScreen::Lobby && f >= 120 && f < 120 + 10 * cpus && (f - 120) % 10 == 0) net->requestAddCpu();
         if (f == 330 && netScreen == NetScreen::Lobby) shot("net_02a_host_waiting");
         if (f == 50) netHost();
         if (!codeWritten && net && !net->code.isEmpty()) {         // tell the test script the code
@@ -614,13 +657,25 @@ void GLWidget::runNetAutoShot()
     }
     auto finish = [&]() {
         QFile stats(autoShotDir + "/net_stats.txt");        // GUI apps on Windows have no console
-        if (stats.open(QIODevice::WriteOnly))
+        if (stats.open(QIODevice::WriteOnly)) {
             stats.write(QString("snapshots %1, corrections >0.5 m: %2, large (>6 m, smoothed): %3, ping %4 ms\n")
                             .arg(statSnapshots).arg(statSmallFix).arg(statSnaps).arg(net ? net->pingMs : -1).toUtf8());
+            stats.write(QString("frames %1, slower than 25 ms: %2, drawing avg %3 ms max %4 ms\n")
+                            .arg(statFrames).arg(statSlowFrames).arg(statPaintMs / std::max(1, statFrames), 0, 'f', 2)
+                            .arg(statPaintMax, 0, 'f', 1).toUtf8());
+            stats.write(QString("snapshot gaps: longest %1 ms, over 50 ms: %2, average size %3 bytes\n")
+                            .arg(statSnapGapMax, 0, 'f', 0).arg(statSnapLate)
+                            .arg(statSnapBytes / std::max(1, statSnapshots), 0, 'f', 0).toUtf8());
+            if (hostServer)
+                stats.write(QString("server: longest pause between ticks %1 ms, ticks without a new input: %2, inputs dropped: %3\n")
+                                .arg(hostServer->server()->statMaxGapMs.load()).arg(hostServer->server()->statStarved.load())
+                                .arg(hostServer->server()->statDropped.load()).toUtf8());
+        }
         QCoreApplication::quit();
     };
     if (isOnline()) {
         if (raceFrame < 0) raceFrame = f;
+        if (f == raceFrame + 150) shot(host ? "net_04b_host_grid" : "net_04c_guest_grid");
         if (f == raceFrame + 400) shot(host ? "net_05_host_race" : "net_06_guest_race");
         if (f == raceFrame + 900) shot(host ? "net_07_host_race_later" : "net_08_guest_race_later");
         if (f == raceFrame + (host ? 1000 : 940)) finish();      // the host (server) closes last

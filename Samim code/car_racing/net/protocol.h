@@ -49,7 +49,7 @@ inline QList<QNetworkAddressEntry> lanEntries()
     return wifi + other;
 }
 
-constexpr quint16 PROTOCOL_VERSION = 2;   // 2: same track on every platform + track fingerprint
+constexpr quint16 PROTOCOL_VERSION = 4;   // 2: same track everywhere + fingerprint; 3: CPU racers; 4: wide road
 constexpr quint16 GAME_PORT        = 47800;   // TCP; a busy port makes the host try the next ones
 constexpr quint16 DISCOVERY_PORT   = 47801;   // UDP
 constexpr int     SNAPSHOT_EVERY   = 2;       // sim ticks per snapshot: 60 Hz sim -> 30 Hz snapshots
@@ -62,6 +62,8 @@ enum MsgType : quint8 {
     C_START,         // host: start the race
     C_SET_MAP,       // host: choose the map in the lobby
     C_PING,          // client clock in ms (echoed back to measure ping)
+    C_ADD_BOT,       // host: add a CPU racer (random level 1-5) to a free seat
+    C_REMOVE_BOT,    // host: remove the last CPU racer
     // server -> client
     S_WELCOME = 64,  // your slot, room code, are you the host
     S_ERROR,         // reason; the server then closes the connection
@@ -76,6 +78,7 @@ struct LobbyPlayer {
     QString name;
     float r = 1, g = 1, b = 1;
     bool host = false;
+    int cpuLevel = 0;      // 0 = a person; 1..5 = CPU racer and its difficulty
 };
 
 // Same settings on both ends: floats travel as 4 bytes
