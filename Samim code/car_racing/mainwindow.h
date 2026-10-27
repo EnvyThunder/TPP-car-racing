@@ -2,21 +2,18 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
-#include "raster_canvas.h"
-#include "engine_topview.h"
+#include "glwidget.h"
 
-class MainWindow : public QMainWindow {
+class MainWindow : public QMainWindow
+{
     Q_OBJECT
-public:
-    explicit MainWindow(QWidget *parent = nullptr);
-    ~MainWindow() override = default;
 
-protected:
-    void keyPressEvent(QKeyEvent *event) override;
+public:
+    MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
 
 private:
-    RasterCanvas *canvas;
-    TopViewEngine *engine;
+    GLWidget *glWidget;
 };
 
 #endif // MAINWINDOW_H
