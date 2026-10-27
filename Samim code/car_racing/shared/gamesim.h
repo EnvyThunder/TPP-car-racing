@@ -24,6 +24,10 @@ public:
     // Race position (1 = leading) of car idx among all cars
     int rankOf(int idx) const;
 
+    // Fingerprint of the track as built by reset(): obstacles, nitro cans, starting
+    // traffic, scenery count. Online, every player's copy must match the host's.
+    uint32_t worldChecksum() const;
+
     // ---- Network snapshots (server -> clients) ----
     // Only the parts that change during a race are sent; the track, props and the
     // starting traffic are rebuilt identically on every machine from the map + seed.

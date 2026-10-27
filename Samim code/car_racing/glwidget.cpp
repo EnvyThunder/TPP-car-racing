@@ -1192,6 +1192,12 @@ void GLWidget::paintGL()
             glViewport(0, 0, W, H);
             drawMinimap(W, H, dpr);
         }
+        if (trackMismatch && (simEngine.getTick() / 30) % 2 == 0) {
+            begin2D(W, H);
+            const char *warn = "TRACK DIFFERS FROM THE HOST - BOTH PLAYERS NEED THE SAME GAME VERSION";
+            float ps = 1.6f * dpr;
+            drawText(warn, (W - textWidth(warn, ps)) * 0.5f, H * 0.80f, ps, 1.0f, 0.3f, 0.3f);
+        }
         if (simEngine.getState() == State::Finished) {
             glViewport(0, 0, W, H);
             drawOnlineResults(W, H, dpr);

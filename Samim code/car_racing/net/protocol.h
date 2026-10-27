@@ -49,7 +49,7 @@ inline QList<QNetworkAddressEntry> lanEntries()
     return wifi + other;
 }
 
-constexpr quint16 PROTOCOL_VERSION = 1;
+constexpr quint16 PROTOCOL_VERSION = 2;   // 2: same track on every platform + track fingerprint
 constexpr quint16 GAME_PORT        = 47800;   // TCP; a busy port makes the host try the next ones
 constexpr quint16 DISCOVERY_PORT   = 47801;   // UDP
 constexpr int     SNAPSHOT_EVERY   = 2;       // sim ticks per snapshot: 60 Hz sim -> 30 Hz snapshots
@@ -66,7 +66,7 @@ enum MsgType : quint8 {
     S_WELCOME = 64,  // your slot, room code, are you the host
     S_ERROR,         // reason; the server then closes the connection
     S_LOBBY,         // map, players
-    S_RACE_START,    // map, your slot, racer names
+    S_RACE_START,    // map, your slot, racer names, track fingerprint
     S_SNAPSHOT,      // last input seq applied for you + world snapshot
     S_PONG,          // echoed client clock
     S_RACE_OVER      // race finished: back to the lobby

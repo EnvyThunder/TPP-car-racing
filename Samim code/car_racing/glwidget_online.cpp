@@ -25,6 +25,7 @@
 
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QGuiApplication>
 #include <QKeyEvent>
@@ -73,7 +74,11 @@ float lerpAngle(float a, float b, float t)
 QString GLWidget::playerName() const
 {
     QString n;
-    for (QChar c : qEnvironmentVariable("USERNAME").toUpper())
+    // Windows: USERNAME, Mac/Linux: USER, otherwise the home folder's name
+    QString raw = qEnvironmentVariable("USERNAME");
+    if (raw.isEmpty()) raw = qEnvironmentVariable("USER");
+    if (raw.isEmpty()) raw = QDir::home().dirName();
+    for (QChar c : raw.toUpper())
         if (c.isLetterOrNumber() && c.unicode() < 128) n += c;
     return n.isEmpty() ? QString("PLAYER") : n.left(10);
 }
@@ -95,10 +100,11 @@ void GLWidget::openOnline()
         connect(net, &RaceClient::lobbyChanged, this, [this]() {
             if (netScreen == NetScreen::Busy) netScreen = NetScreen::Lobby;
         });
-        connect(net, &RaceClient::raceStarted, this, [this](int map, int slot, const QStringList &names) {
+        connect(net, &RaceClient::raceStarted, this, [this](int map, int slot, const QStringList &names, quint32 world) {
             selectedMapPreset = map;
             simEngine.setMap(map);
             simEngine.startRace(sim::GameSim::ModeOnline, int(names.size()));
+            trackMismatch = (simEngine.worldChecksum() != world);
             mySlot = slot;
             racerNames = names;
             view1 = CarView();

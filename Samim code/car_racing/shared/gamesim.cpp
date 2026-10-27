@@ -1,4 +1,10 @@
 #include "gamesim.h"
+
+// Keep the maths identical on every machine: clang (Mac, especially Apple Silicon) would
+// otherwise fuse a * b + c into one FMA instruction that rounds differently from Windows.
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -27,9 +33,18 @@ GameSim::GameSim(uint32_t seed)
     reset(seed);
 }
 
+// A random float in [a, b) that is identical on every platform. std::mt19937 itself is
+// fully specified by the C++ standard, but std::uniform_real_distribution is not: Windows
+// (MinGW) and Mac (Clang) return different values. Every player's game rebuilds the track
+// (obstacles, nitro cans, traffic, scenery) from the same seed, so it must match exactly.
+static float uniformFloat(std::mt19937 &g, float a, float b)
+{
+    return a + (b - a) * float(double(g()) * (1.0 / 4294967296.0));
+}
+
 float GameSim::rnd(float a, float b)
 {
-    return std::uniform_real_distribution<float>(a, b)(rng);
+    return uniformFloat(rng, a, b);
 }
 
 float GameSim::roadCenter(float z) const
@@ -85,7 +100,7 @@ void GameSim::reset(uint32_t seed, int racers)
     events.clear();
 
     std::mt19937 gen(seed);
-    auto R = [&gen](float a, float b) { return std::uniform_real_distribution<float>(a, b)(gen); };
+    auto R = [&gen](float a, float b) { return uniformFloat(gen, a, b); };
 
     // ---- Collectible Nitro Pickups ----
     // Fewer, strategic nitro canisters spaced across the 4,000m track (approx 7-8 total)
@@ -955,6 +970,23 @@ void GameSim::collideCars(Car &a, Car &b, int idxA, int idxB)
         cr2.carIndex = idxB;
         events.push_back(cr2);
     }
+}
+
+uint32_t GameSim::worldChecksum() const
+{
+    // positions rounded to 10 cm, so tiny maths-library differences between systems don't matter
+    uint32_t h = 2166136261u;
+    auto mix = [&h](long v) { h = (h ^ uint32_t(v)) * 16777619u; };
+    auto q = [](float v) { return long(std::lround(v * 10.0f)); };
+    mix(mapIndex);
+    mix(long(obstacles.size()));
+    for (const Obstacle &o : obstacles) { mix(o.type); mix(q(o.x)); mix(q(o.z)); mix(q(o.hx)); }
+    mix(long(nitroPickups.size()));
+    for (const NitroPickup &n : nitroPickups) { mix(q(n.x)); mix(q(n.z)); }
+    mix(long(traffic.size()));
+    for (const Traffic &t : traffic) { mix(q(t.z)); mix(q(t.lane)); mix(t.truck ? 1 : 0); }
+    mix(long(props.size()));
+    return h;
 }
 
 int GameSim::rankOf(int idx) const

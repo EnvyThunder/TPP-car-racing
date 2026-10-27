@@ -53,9 +53,13 @@ int main(int argc, char *argv[])
         QObject::connect(&b->client, &RaceClient::welcomed, [&out, b, i]() {
             out << "bot" << i + 1 << " joined room " << b->client.code << " as slot " << b->client.slot << Qt::endl;
         });
-        QObject::connect(&b->client, &RaceClient::raceStarted, [b](int map, int, const QStringList &names) {
+        QObject::connect(&b->client, &RaceClient::raceStarted, [b, &out, i](int map, int, const QStringList &names, quint32 world) {
             b->sim.setMap(map);
             b->sim.startRace(sim::GameSim::ModeOnline, int(names.size()));
+            if (b->sim.worldChecksum() != world)
+                out << "bot" << i + 1 << ": TRACK DIFFERS FROM THE HOST!" << Qt::endl;
+            else if (i == 0)
+                out << "track fingerprint matches the host: " << Qt::hex << world << Qt::dec << Qt::endl;
             b->seq = 0;
             b->racing = true;
         });

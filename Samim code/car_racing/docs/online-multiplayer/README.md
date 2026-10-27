@@ -56,6 +56,22 @@ How a friend's game finds the room: it broadcasts "who has room CODE?" on the Wi
 because many routers drop broadcasts it also asks the 1,022 addresses around it directly.
 If even that fails, typing `CODE@address` (shown in the host lobby) connects straight away.
 
+## Windows and Mac together
+
+Windows and Mac players can race each other. Things to know:
+- **Mac: allow "Local Network".** Recent macOS asks before an app may talk to other
+  devices on the Wi-Fi. If the game cannot find a room: System Settings → Privacy &
+  Security → **Local Network** → switch on **Qt Creator** (or the game / Terminal, whichever
+  started it), then restart the game.
+- **Mac hosting:** when macOS asks "accept incoming connections?", click **Allow**
+  (`allow_firewall.bat` is only for Windows).
+- **Same game version on both.** Every player's game builds the track from the same random
+  seed. The track generator now uses its own formula instead of
+  `std::uniform_real_distribution`, which gives different numbers on Windows (MinGW) and Mac
+  (Clang). The host also sends a **track fingerprint** with the race start; if a player's
+  track differs, they see a red "TRACK DIFFERS FROM THE HOST" warning. Different
+  online-protocol versions refuse to connect ("Different game version").
+
 ## How it works (for the viva)
 
 ```mermaid

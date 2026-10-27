@@ -226,8 +226,10 @@ void RaceClient::dispatch(MsgType type, const QByteArray &payload)
             in >> map >> s >> n;
             QStringList names;
             for (int i = 0; i < n; ++i) { QString nm; in >> nm; names << nm; }
+            quint32 world = 0;
+            in >> world;
             slot = s;
-            emit raceStarted(map, s, names);
+            emit raceStarted(map, s, names, world);
             break;
         }
         case S_SNAPSHOT: {

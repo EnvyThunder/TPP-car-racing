@@ -42,7 +42,8 @@ signals:
     void status(const QString &text);
     void welcomed();
     void lobbyChanged();
-    void raceStarted(int map, int slot, const QStringList &names);
+    // world = the host's track fingerprint (GameSim::worldChecksum) to compare with ours
+    void raceStarted(int map, int slot, const QStringList &names, quint32 world);
     void snapshotArrived(quint32 lastSeq, const QByteArray &body);
     void raceOver();
     void failed(const QString &reason);

@@ -255,6 +255,7 @@ void RaceServer::startRace(Room *room)
         prepare(ds);
         ds << qint8(room->map) << qint8(i) << quint8(n);
         for (Player *q : room->players) ds << q->name;
+        ds << quint32(room->sim.worldChecksum());
         send(room->players[i], S_RACE_START, out);
     }
 }

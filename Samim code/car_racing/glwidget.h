@@ -117,6 +117,7 @@ private:
     QElapsedTimer netClock;
     QString netTest;                       // CAR_RACING_NETTEST: scripted online test (see runNetAutoShot)
     int statSnapshots = 0, statSmallFix = 0, statSnaps = 0;   // how often the prediction was corrected
+    bool trackMismatch = false;            // my track differs from the host's (different game version)
     bool isOnline() const { return netScreen == NetScreen::Race; }
     int localCar() const { return isOnline() ? mySlot : 0; }
     void openOnline();
