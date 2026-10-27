@@ -49,25 +49,31 @@ float GameSim::roadAngle(float z) const
     return std::atan2(roadCenter(z - 1.0f) - roadCenter(z), 1.0f);
 }
 
-void GameSim::startRace(GameMode m)
+void GameSim::startRace(GameMode m, int racers)
 {
     mode = m;
-    reset(2024);
+    reset(2024, racers);
     state = Countdown;
 }
 
-void GameSim::reset(uint32_t seed)
+void GameSim::reset(uint32_t seed, int racers)
 {
     rng.seed(seed);
     cars.clear();
 
-    Car p1;
-    p1.x = 3.0f; p1.r = 0.92f; p1.g = 0.14f; p1.b = 0.16f; // Red
-    cars.push_back(p1);
-
-    Car p2;
-    p2.x = -3.0f; p2.r = 0.15f; p2.g = 0.42f; p2.b = 0.98f; // Blue
-    cars.push_back(p2);
+    // Starting grid: two columns, rows 9 m apart behind the start line.
+    // Slots 0 and 1 are the original P1 (red, right) and P2 (blue, left).
+    static const float GRID_COL[MAX_RACERS][3] = {
+        {0.92f, 0.14f, 0.16f}, {0.15f, 0.42f, 0.98f}, {1.00f, 0.75f, 0.10f}, {0.20f, 0.85f, 0.35f},
+        {0.85f, 0.30f, 0.95f}, {0.10f, 0.85f, 0.90f}, {0.95f, 0.50f, 0.15f}, {0.92f, 0.92f, 0.95f}};
+    racers = std::clamp(racers, 1, MAX_RACERS);
+    for (int i = 0; i < racers; ++i) {
+        Car c;
+        c.x = (i % 2 == 0) ? 3.0f : -3.0f;
+        c.z = float(i / 2) * 9.0f;
+        c.r = GRID_COL[i][0]; c.g = GRID_COL[i][1]; c.b = GRID_COL[i][2];
+        cars.push_back(c);
+    }
 
     tick = 0;
     raceTimer = 0.0f;
@@ -299,18 +305,13 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
         raceTimer += 1.0f / 60.0f;
     }
 
-    // Update cars
-    if (cars.size() > 0) {
-        PlayerInput in0 = (inputCount > 0) ? inputs[0] : PlayerInput{};
-        updateCar(cars[0], in0, 0);
-    }
-
-    if (cars.size() > 1) {
-        if (mode == ModeSingle) {
-            updateAI(cars[1], 1);
+    // Update cars: car 1 is the CPU in single-player, every other car follows its input
+    for (size_t i = 0; i < cars.size(); ++i) {
+        if (mode == ModeSingle && i == 1) {
+            updateAI(cars[i], int(i));
         } else {
-            PlayerInput in1 = (inputCount > 1) ? inputs[1] : PlayerInput{};
-            updateCar(cars[1], in1, 1);
+            PlayerInput in = (int(i) < inputCount) ? inputs[i] : PlayerInput{};
+            updateCar(cars[i], in, int(i));
         }
     }
 
@@ -368,9 +369,9 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
     for (size_t i = 0; i < cars.size(); ++i) {
         collideWorld(cars[i], int(i));
     }
-    if (cars.size() >= 2) {
-        collideCars(cars[0], cars[1], 0, 1);
-    }
+    for (size_t i = 0; i < cars.size(); ++i)
+        for (size_t j = i + 1; j < cars.size(); ++j)
+            collideCars(cars[i], cars[j], int(i), int(j));
 
     // Finish line
     if (state == Racing) {
@@ -394,9 +395,11 @@ void GameSim::step(const PlayerInput inputs[], int inputCount)
                     break;
                 }
             }
-            // Transition to Finished state if all cars finished, or 3.0s after winner finishes
+            // Transition to Finished state if all cars finished, or a few seconds after the
+            // winner finishes (online gets longer so everyone can reach the line)
             float winnerFinishTime = cars[winner - 1].finishTime;
-            if (allDone || (raceTimer - winnerFinishTime >= 3.0f)) {
+            float grace = (mode == ModeOnline) ? 20.0f : 3.0f;
+            if (allDone || (raceTimer - winnerFinishTime >= grace)) {
                 state = Finished;
             }
         }
@@ -883,6 +886,41 @@ void GameSim::collideWorld(Car &c, int carIndex)
     }
 }
 
+void GameSim::predictCollisions(Car &c) const
+{
+    float fx = std::sin(c.heading), fz = -std::cos(c.heading);
+    for (const Obstacle &o : obstacles) {
+        if (o.type != Obstacle::Barrier || std::fabs(o.z - c.z) > 8.0f) continue;
+        for (float off : {1.3f, -1.3f}) {
+            float px = c.x + fx * off, pz = c.z + fz * off;
+            float qx = std::clamp(px, o.x - o.hx, o.x + o.hx);
+            float qz = std::clamp(pz, o.z - o.hz, o.z + o.hz);
+            float dx = px - qx, dz = pz - qz, d2 = dx * dx + dz * dz;
+            const float RAD = 1.0f;
+            if (d2 < RAD * RAD) {
+                float d = std::sqrt(d2), nx, nz, pen;
+                if (d < 1e-4f) { nx = 0; nz = 1; pen = RAD + (o.z + o.hz - pz); }
+                else           { nx = dx / d; nz = dz / d; pen = RAD - d; }
+                c.x += nx * pen; c.z += nz * pen;
+                c.speed *= 0.35f;
+            }
+        }
+    }
+    for (const Traffic &t : traffic) {
+        if (t.parked) continue;
+        float tx = roadCenter(t.z) + t.lane;
+        float dx = c.x - tx, dz = c.z - t.z;
+        const float halfW = 1.9f;
+        float halfL = t.truck ? 5.6f : 4.2f;
+        if (std::fabs(dx) < halfW && std::fabs(dz) < halfL) {
+            float px = halfW - std::fabs(dx), pz = halfL - std::fabs(dz);
+            if (px < pz)     { c.x += (dx > 0) ? px : -px; c.speed *= 0.93f; }
+            else if (dz > 0) { c.z += pz; c.speed = std::min(c.speed, t.speed * 0.5f); }
+            else             { c.z -= pz; }
+        }
+    }
+}
+
 void GameSim::collideCars(Car &a, Car &b, int idxA, int idxB)
 {
     float dx = a.x - b.x, dz = a.z - b.z;
@@ -917,6 +955,23 @@ void GameSim::collideCars(Car &a, Car &b, int idxA, int idxB)
         cr2.carIndex = idxB;
         events.push_back(cr2);
     }
+}
+
+int GameSim::rankOf(int idx) const
+{
+    if (idx < 0 || idx >= int(cars.size())) return 1;
+    const Car &me = cars[idx];
+    int rank = 1;
+    for (int j = 0; j < int(cars.size()); ++j) {
+        if (j == idx) continue;
+        const Car &o = cars[j];
+        bool ahead;
+        if (o.finished && me.finished) ahead = o.finishTime < me.finishTime;
+        else if (o.finished != me.finished) ahead = o.finished;
+        else ahead = o.z < me.z;                          // track runs towards -Z
+        if (ahead) ++rank;
+    }
+    return rank;
 }
 
 uint64_t GameSim::checksum() const

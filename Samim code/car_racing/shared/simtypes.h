@@ -17,6 +17,7 @@ constexpr float MAX_SPEED   = 1.10f;
 constexpr float NITRO_SPEED = 1.65f;
 constexpr float OFFROAD_MAX = 0.45f;
 constexpr float LANES[3]    = {-4.67f, 0.0f, 4.67f};
+constexpr int   MAX_RACERS  = 8;                  // Online rooms hold up to 8 cars
 
 // Input frame for a vehicle
 struct PlayerInput {

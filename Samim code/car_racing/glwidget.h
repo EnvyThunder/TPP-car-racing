@@ -8,11 +8,15 @@
 #include <QKeyEvent>
 #include <QSet>
 #include <vector>
+#include <deque>
 #include <random>
+#include <QStringList>
 
 #include "shared/gamesim.h"
 
 class AudioEngine;
+class RaceServer;
+class RaceClient;
 struct GLUquadric;
 
 // Client-side camera and rendering view state for a vehicle
@@ -80,7 +84,7 @@ private:
     // Client-side vehicle view parameters
     CarView view1;
     CarView view2;
-    float nitroBannerTimer[2] = {0.0f, 0.0f};
+    float nitroBannerTimer[sim::MAX_RACERS] = {};
 
     int menuSelection = 0;        // 0 to 6
     enum MenuModal { ModalNone, ModalOnline, ModalCarSelect, ModalMapSelect, ModalProfile, ModalSettings };
@@ -89,8 +93,46 @@ private:
     int selectedMapPreset = 0;
 
     std::vector<Particle> particles;
-    CarFx carFx[2];
+    CarFx carFx[sim::MAX_RACERS];
     std::vector<SkidMark> skidMarks;
+
+    // ---- Online multiplayer ("ONLINE MULTIPLAYER (8P)") -- glwidget_online.cpp ----
+    enum class NetScreen { Off, Choose, EnterCode, Busy, Lobby, Race };
+    NetScreen netScreen = NetScreen::Off;
+    int netChoice = 0;                     // Choose screen: 0 host, 1 join, 2 back
+    QString joinText;                      // room code being typed
+    QString netMessage;                    // status or error line
+    RaceServer *hostServer = nullptr;      // room server running inside this game while hosting
+    RaceClient *net = nullptr;
+    int mySlot = 0;                        // my car in the online race
+    QStringList racerNames;
+    std::vector<sim::SimEvent> netEvents;  // sounds/particles sent by the server
+    struct SentInput { quint32 seq; sim::PlayerInput in; };
+    std::deque<SentInput> sentInputs;      // inputs the server hasn't confirmed yet
+    quint32 inputSeq = 0;
+    sim::Car predicted;                    // my car, simulated locally so it reacts instantly
+    float corrX = 0.0f, corrZ = 0.0f;      // smooths out small prediction corrections
+    struct Sample { qint64 t; std::vector<sim::Car> cars; };
+    std::deque<Sample> history;            // recent snapshots: other cars are drawn slightly in the past
+    QElapsedTimer netClock;
+    QString netTest;                       // CAR_RACING_NETTEST: scripted online test (see runNetAutoShot)
+    int statSnapshots = 0, statSmallFix = 0, statSnaps = 0;   // how often the prediction was corrected
+    bool isOnline() const { return netScreen == NetScreen::Race; }
+    int localCar() const { return isOnline() ? mySlot : 0; }
+    void openOnline();
+    void netHost();
+    void netJoin();
+    void netLeave(const QString &message);
+    void netUpdate(float realDt);
+    void onNetSnapshot(quint32 lastSeq, const QByteArray &body);
+    void composeOnlineCars();
+    bool handleOnlineKey(QKeyEvent *event);
+    void drawOnlineScreen(int W, int H, float dpr);
+    void drawOnlineResults(int W, int H, float dpr);
+    void runNetAutoShot();
+    void myCarColor(float &r, float &g, float &b) const;
+    QString playerName() const;
+    static QString lanAddress();
 
     // Screenshots: F12 saves one; CAR_RACING_AUTOSHOT=<dir> runs a scripted capture and quits
     QString autoShotDir;
@@ -125,8 +167,8 @@ private:
     float roadAngle(float z) const { return simEngine.roadAngle(z); }
     int   getTick() const { return simEngine.getTick(); }
     void startRace(GameMode mode);
+    void processSimEvents(const std::vector<sim::SimEvent> &events);
     bool cycleMenuOption(int item, int dir);   // car / map / CPU difficulty pickers in the menu
-    void processSimEvents();
 
     // ---- particles ----
     void spawnParticle(Particle::Type t, float x, float y, float z,

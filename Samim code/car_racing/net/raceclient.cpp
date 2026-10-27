@@ -1,0 +1,273 @@
+#include "raceclient.h"
+
+#include <QNetworkDatagram>
+#include <QNetworkInterface>
+
+using namespace net;
+
+RaceClient::RaceClient(QObject *parent)
+    : QObject(parent)
+{
+    connect(&sock, &QTcpSocket::connected, this, &RaceClient::onConnected);
+    connect(&sock, &QTcpSocket::readyRead, this, &RaceClient::onReadyRead);
+    connect(&sock, &QTcpSocket::disconnected, this, &RaceClient::onDisconnected);
+    connect(&sock, &QTcpSocket::errorOccurred, this, &RaceClient::onSocketError);
+    connect(&udp, &QUdpSocket::readyRead, this, &RaceClient::onDiscoveryReply);
+    connect(&discoverTimer, &QTimer::timeout, this, &RaceClient::onDiscoveryTimer);
+    connect(&pingTimer, &QTimer::timeout, this, &RaceClient::onPingTimer);
+    pingClock.start();
+    // Lag simulator for testing/demos: CAR_RACING_LAG_MS=150 delays every message
+    // by half of that each way, like a slow internet connection.
+    fakeLagMs = qEnvironmentVariableIntValue("CAR_RACING_LAG_MS");
+}
+
+RaceClient::~RaceClient()
+{
+    // cut the socket's signals before it is destroyed (it would report "disconnected")
+    sock.disconnect(this);
+    udp.disconnect(this);
+    sock.abort();
+}
+
+void RaceClient::reset()
+{
+    discoverTimer.stop();
+    pingTimer.stop();
+    udp.close();
+    reader = FrameReader();
+    code.clear();
+    slot = -1;
+    isHost = false;
+    players.clear();
+    pingMs = -1;
+    joined = false;
+}
+
+void RaceClient::join(const QString &codeOrAddress, const QString &name, float r, float g, float b)
+{
+    leave();
+    leaving = false;
+    myName = name; myR = r; myG = g; myB = b; wantMap = 0;
+    QString text = codeOrAddress.trimmed().toUpper();
+    int at = text.indexOf('@');
+    if (at >= 0) {                                       // direct: CODE@host[:port]
+        wantCode = text.left(at);
+        QString addr = text.mid(at + 1);
+        quint16 port = GAME_PORT;
+        int colon = addr.lastIndexOf(':');
+        if (colon > 0) { port = quint16(addr.mid(colon + 1).toUInt()); addr = addr.left(colon); }
+        connectTo(addr.toLower(), port);
+        return;
+    }
+    wantCode = text;
+    emit status("LOOKING FOR ROOM " + wantCode + " ON THIS NETWORK...");
+    udp.bind(QHostAddress::AnyIPv4, 0);
+    discoverTries = 0;
+    onDiscoveryTimer();
+    discoverTimer.start(300);
+}
+
+void RaceClient::create(const QString &host, quint16 port, const QString &name, float r, float g, float b, int map)
+{
+    leave();
+    leaving = false;
+    myName = name; myR = r; myG = g; myB = b; wantMap = map;
+    wantCode.clear();
+    connectTo(host, port);
+}
+
+void RaceClient::leave()
+{
+    leaving = true;
+    reset();
+    if (sock.state() != QAbstractSocket::UnconnectedState) {
+        sock.disconnectFromHost();
+        if (sock.state() != QAbstractSocket::UnconnectedState) sock.abort();
+    }
+}
+
+void RaceClient::connectTo(const QString &host, quint16 port)
+{
+    discoverTimer.stop();
+    emit status(QString("CONNECTING TO %1...").arg(host.toUpper()));
+    sock.connectToHost(host, port);
+}
+
+// ---------------------------------------------------------------------------
+//  Discovery: ask every network we are on "who has room CODE?"
+// ---------------------------------------------------------------------------
+void RaceClient::onDiscoveryTimer()
+{
+    if (++discoverTries > 12) {                          // ~3.5 s without an answer
+        discoverTimer.stop();
+        udp.close();
+        emit failed("ROOM " + wantCode + " NOT FOUND - SAME WI-FI/HOTSPOT? OR TYPE CODE@HOST-IP");
+        return;
+    }
+    QByteArray ask = ("TURBO8?" + wantCode).toUtf8();
+    udp.writeDatagram(ask, QHostAddress::Broadcast, DISCOVERY_PORT);
+    udp.writeDatagram(ask, QHostAddress::LocalHost, DISCOVERY_PORT);
+    for (const QNetworkInterface &nif : QNetworkInterface::allInterfaces()) {
+        if (!(nif.flags() & QNetworkInterface::IsUp) || (nif.flags() & QNetworkInterface::IsLoopBack)) continue;
+        for (const QNetworkAddressEntry &e : nif.addressEntries())
+            if (e.ip().protocol() == QAbstractSocket::IPv4Protocol && !e.broadcast().isNull())
+                udp.writeDatagram(ask, e.broadcast(), DISCOVERY_PORT);
+    }
+}
+
+void RaceClient::onDiscoveryReply()
+{
+    while (udp.hasPendingDatagrams()) {
+        QNetworkDatagram d = udp.receiveDatagram();
+        QString msg = QString::fromUtf8(d.data());
+        if (!msg.startsWith("TURBO8!") || !discoverTimer.isActive()) continue;
+        QStringList parts = msg.mid(7).split(':');
+        if (parts.size() != 2 || parts[0] != wantCode) continue;
+        QHostAddress from(d.senderAddress().toIPv4Address());     // strip any IPv6 mapping
+        udp.close();
+        connectTo(from.toString(), quint16(parts[1].toUInt()));
+        return;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  TCP connection
+// ---------------------------------------------------------------------------
+void RaceClient::onConnected()
+{
+    sock.setSocketOption(QAbstractSocket::LowDelayOption, 1);
+    emit status("JOINING...");
+    QByteArray out;
+    QDataStream ds(&out, QIODevice::WriteOnly);
+    prepare(ds);
+    ds << PROTOCOL_VERSION << myName << myR << myG << myB << wantCode << qint8(wantMap);
+    send(C_JOIN, out);
+    pingTimer.start(1000);
+}
+
+void RaceClient::onReadyRead()
+{
+    reader.feed(sock.readAll());
+    MsgType type;
+    QByteArray payload;
+    while (reader.next(type, payload)) {
+        if (fakeLagMs > 0) QTimer::singleShot(fakeLagMs / 2, this, [this, type, payload]() { dispatch(type, payload); });
+        else dispatch(type, payload);
+    }
+}
+
+void RaceClient::dispatch(MsgType type, const QByteArray &payload)
+{
+    {
+        QDataStream in(payload);
+        prepare(in);
+        switch (type) {
+        case S_WELCOME: {
+            qint8 s; bool h;
+            in >> s >> code >> h;
+            slot = s; isHost = h; joined = true;
+            emit welcomed();
+            break;
+        }
+        case S_ERROR: {
+            QString reason;
+            in >> reason;
+            leaving = true;
+            emit failed(reason.toUpper());
+            break;
+        }
+        case S_LOBBY: {
+            qint8 map, me; bool host; quint8 n;
+            in >> map >> me >> host >> n;
+            lobbyMap = map; slot = me; isHost = host;
+            players.clear();
+            for (int i = 0; i < n; ++i) {
+                LobbyPlayer p;
+                in >> p.name >> p.r >> p.g >> p.b >> p.host;
+                players.append(p);
+            }
+            emit lobbyChanged();
+            break;
+        }
+        case S_RACE_START: {
+            qint8 map, s; quint8 n;
+            in >> map >> s >> n;
+            QStringList names;
+            for (int i = 0; i < n; ++i) { QString nm; in >> nm; names << nm; }
+            slot = s;
+            emit raceStarted(map, s, names);
+            break;
+        }
+        case S_SNAPSHOT: {
+            quint32 lastSeq;
+            in >> lastSeq;
+            emit snapshotArrived(lastSeq, payload.mid(4));
+            break;
+        }
+        case S_PONG: {
+            qint64 sent;
+            in >> sent;
+            pingMs = int(pingClock.elapsed() - sent);
+            break;
+        }
+        case S_RACE_OVER:
+            emit raceOver();
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void RaceClient::onDisconnected()
+{
+    pingTimer.stop();
+    if (!leaving) emit failed(joined ? "LOST CONNECTION TO THE HOST" : "COULD NOT JOIN");
+}
+
+void RaceClient::onSocketError(QAbstractSocket::SocketError)
+{
+    if (leaving || sock.state() == QAbstractSocket::ConnectedState) return;
+    if (!joined) emit failed("COULD NOT CONNECT: " + sock.errorString().toUpper());
+}
+
+void RaceClient::onPingTimer()
+{
+    QByteArray out;
+    QDataStream ds(&out, QIODevice::WriteOnly);
+    prepare(ds);
+    ds << qint64(pingClock.elapsed());
+    send(C_PING, out);
+}
+
+void RaceClient::sendInput(quint32 seq, const sim::PlayerInput &in)
+{
+    QByteArray out;
+    QDataStream ds(&out, QIODevice::WriteOnly);
+    prepare(ds);
+    ds << seq << packInput(in);
+    send(C_INPUT, out);
+}
+
+void RaceClient::requestStart() { send(C_START); }
+
+void RaceClient::requestMap(int map)
+{
+    QByteArray out;
+    QDataStream ds(&out, QIODevice::WriteOnly);
+    prepare(ds);
+    ds << qint8(map);
+    send(C_SET_MAP, out);
+}
+
+void RaceClient::send(MsgType type, const QByteArray &payload)
+{
+    if (sock.state() != QAbstractSocket::ConnectedState) return;
+    QByteArray f = frame(type, payload);
+    if (fakeLagMs > 0)
+        QTimer::singleShot(fakeLagMs / 2, this, [this, f]() {
+            if (sock.state() == QAbstractSocket::ConnectedState) sock.write(f);
+        });
+    else
+        sock.write(f);
+}

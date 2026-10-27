@@ -5,18 +5,32 @@
 #include <vector>
 #include <random>
 
+class QDataStream;
+
 namespace sim {
 
 class GameSim {
 public:
     enum State { Menu, Countdown, Racing, Paused, Finished };
-    enum GameMode { ModeSingle, ModeSplitScreen };
+    enum GameMode { ModeSingle, ModeSplitScreen, ModeOnline };
 
     explicit GameSim(uint32_t seed = 2024);
 
-    void reset(uint32_t seed = 2024);
-    void startRace(GameMode mode);
+    // racers = number of cars on the grid (2 for local modes, up to MAX_RACERS online)
+    void reset(uint32_t seed = 2024, int racers = 2);
+    void startRace(GameMode mode, int racers = 2);
     void step(const PlayerInput inputs[], int inputCount);
+
+    // Race position (1 = leading) of car idx among all cars
+    int rankOf(int idx) const;
+
+    // ---- Network snapshots (server -> clients) ----
+    // Only the parts that change during a race are sent; the track, props and the
+    // starting traffic are rebuilt identically on every machine from the map + seed.
+    // lastSentObstacles (server side) limits obstacle updates to the ones that moved.
+    void writeSnapshot(QDataStream &out, const std::vector<SimEvent> &events,
+                       std::vector<Obstacle> *lastSentObstacles) const;
+    void readSnapshot(QDataStream &in, std::vector<SimEvent> &eventsOut);
 
     uint64_t checksum() const;
 
@@ -45,6 +59,7 @@ public:
     std::vector<Car>& getCars() { return cars; }
 
     const std::vector<Traffic>& getTraffic() const { return traffic; }
+    std::vector<Traffic>& trafficMut() { return traffic; }   // online clients move traffic between snapshots
     const std::vector<Obstacle>& getObstacles() const { return obstacles; }
     const std::vector<Prop>& getProps() const { return props; }
     const std::vector<NitroPickup>& getNitroPickups() const { return nitroPickups; }
@@ -58,6 +73,9 @@ public:
     // catch-up help against player 1; false = neutral driver at normal top speed.
     PlayerInput computeAIInput(Car &c, int carIndex, bool asRival);
     void collideWorld(Car &c, int carIndex);
+    // Client-side prediction only: bump into barriers and traffic like collideWorld does,
+    // but without knocking anything over or making events (the server decides those).
+    void predictCollisions(Car &c) const;
     void collideCars(Car &a, Car &b, int idxA, int idxB);
     bool knock(Obstacle &o, float x, float z, float fx, float fz, float speed, int carIndex);
 

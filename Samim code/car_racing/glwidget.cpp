@@ -2,6 +2,8 @@
 #include "pixelfont.h"
 #include "audioengine.h"
 #include "carmodel.h"
+#include "raceserver.h"
+#include "raceclient.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -280,6 +282,7 @@ GLWidget::GLWidget(QWidget *parent)
     }
 
     autoShotDir = qEnvironmentVariable("CAR_RACING_AUTOSHOT");
+    netTest = qEnvironmentVariable("CAR_RACING_NETTEST");
 
     elapsedTimer.start();
     timer = new QTimer(this);
@@ -290,6 +293,10 @@ GLWidget::GLWidget(QWidget *parent)
 
 GLWidget::~GLWidget()
 {
+    // shut the network down while this widget is still whole (no signals into a dying widget)
+    if (net) { net->disconnect(this); delete net; net = nullptr; }
+    delete hostServer;
+    hostServer = nullptr;
     if (quad) {
         makeCurrent();
         gluDeleteQuadric(quad);
@@ -335,11 +342,9 @@ void GLWidget::startRace(GameMode mode)
     }
     view1 = CarView();
     view2 = CarView();
-    carFx[0] = CarFx();
-    carFx[1] = CarFx();
+    for (CarFx &f : carFx) f = CarFx();
     skidMarks.clear();
-    nitroBannerTimer[0] = 0.0f;
-    nitroBannerTimer[1] = 0.0f;
+    for (float &t : nitroBannerTimer) t = 0.0f;
     elapsedTimer.restart();
 }
 
@@ -514,16 +519,16 @@ void GLWidget::drawSkidMarks(float camZ)
     glEnable(GL_LIGHTING);
 }
 
-void GLWidget::processSimEvents()
+void GLWidget::processSimEvents(const std::vector<sim::SimEvent> &events)
 {
     const auto &cars = simEngine.getCars();
-    for (const auto &ev : simEngine.getEvents()) {
+    for (const auto &ev : events) {
         switch (ev.type) {
         case sim::SimEvent::Crash:
             if (audio) audio->playCrash(ev.intensity);
-            if (ev.carIndex == 0) {
+            if (ev.carIndex == localCar()) {
                 view1.shake = std::max(view1.shake, ev.intensity * 0.8f);
-            } else if (ev.carIndex == 1) {
+            } else if (ev.carIndex == 1 && !isOnline()) {
                 view2.shake = std::max(view2.shake, ev.intensity * 0.8f);
             }
             break;
@@ -575,13 +580,12 @@ void GLWidget::processSimEvents()
                               0.15f, 0.85f, 1.0f, 1.0f,
                               rnd(0.2f, 0.35f), 1.0f, 2.5f);
             }
-            if (ev.carIndex >= 0 && ev.carIndex < 2) {
+            if (ev.carIndex >= 0 && ev.carIndex < sim::MAX_RACERS) {
                 nitroBannerTimer[ev.carIndex] = 2.4f;
             }
             break;
         }
     }
-    simEngine.clearEvents();
 }
 
 void GLWidget::saveScreenshot(const QString &path)
@@ -593,8 +597,16 @@ void GLWidget::saveScreenshot(const QString &path)
 
 // Scripted capture used to make images for the project report:
 // garage menu with the map picker -> a short race on every map -> split screen -> quit.
+void GLWidget::myCarColor(float &r, float &g, float &b) const
+{
+    r = CAR_PRESETS[selectedCarPreset].r;
+    g = CAR_PRESETS[selectedCarPreset].g;
+    b = CAR_PRESETS[selectedCarPreset].b;
+}
+
 void GLWidget::runAutoShot()
 {
+    if (!netTest.isEmpty()) { runNetAutoShot(); return; }
     const int f = ++autoShotFrame;
     auto shot = [&](const QString &name) { saveScreenshot(autoShotDir + "/" + name + ".png"); };
 
@@ -625,7 +637,7 @@ void GLWidget::updateGame()
     if (realDt <= 0.0f) realDt = 0.016f;
     if (realDt > 0.25f) realDt = 0.25f;
 
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < sim::MAX_RACERS; ++i) {
         if (nitroBannerTimer[i] > 0.0f) {
             nitroBannerTimer[i] = std::max(0.0f, nitroBannerTimer[i] - realDt);
         }
@@ -643,10 +655,11 @@ void GLWidget::updateGame()
         return;
     }
 
-    simAccumulator += realDt;
     const float FIXED_DT = 1.0f / 60.0f;
+    if (isOnline()) netUpdate(realDt);          // online: the server runs the race (glwidget_online.cpp)
+    else simAccumulator += realDt;
 
-    while (simAccumulator >= FIXED_DT) {
+    while (!isOnline() && simAccumulator >= FIXED_DT) {
         simAccumulator -= FIXED_DT;
 
         // Prepare inputs
@@ -664,7 +677,8 @@ void GLWidget::updateGame()
         inputs[1].nitro = isDown(Qt::Key_Space);
 
         simEngine.step(inputs, 2);
-        processSimEvents();
+        processSimEvents(simEngine.getEvents());
+        simEngine.clearEvents();
         for (int i = 0; i < 2 && i < int(simEngine.getCars().size()); ++i)
             updateCarFx(i, simEngine.getCars()[i]);
     }
@@ -681,13 +695,14 @@ void GLWidget::updateGame()
         v.camDist += (targetDist - v.camDist) * (0.05f * step);
     };
 
-    if (cars.size() > 0) updateCarView(view1, cars[0]);
-    if (cars.size() > 1) updateCarView(view2, cars[1]);
+    if (int(cars.size()) > localCar()) updateCarView(view1, cars[localCar()]);
+    if (cars.size() > 1 && !isOnline()) updateCarView(view2, cars[1]);
 
     updateParticles(realDt);
 
-    if (audio && cars.size() > 0) {
-        audio->update(std::fabs(cars[0].speed) / sim::MAX_SPEED, cars[0].isDrifting, cars[0].nitroOn);
+    if (audio && int(cars.size()) > localCar()) {
+        const sim::Car &me = cars[localCar()];
+        audio->update(std::fabs(me.speed) / sim::MAX_SPEED, me.isDrifting, me.nitroOn);
     }
 
     update();
@@ -723,6 +738,8 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
 {
     if (event->isAutoRepeat()) return;
     int k = event->key();
+
+    if (netScreen != NetScreen::Off && k != Qt::Key_F12 && handleOnlineKey(event)) return;
 
     // Universal restart: Pressing 'R' restarts race immediately from any gameplay state
     if (k == Qt::Key_R) {
@@ -783,6 +800,8 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
                 startRace(sim::GameSim::ModeSingle);
             } else if (menuSelection == 1) {
                 startRace(sim::GameSim::ModeSplitScreen);
+            } else if (menuSelection == 2) {
+                openOnline();
             } else {
                 cycleMenuOption(menuSelection, 1);
             }
@@ -839,7 +858,7 @@ void GLWidget::focusOutEvent(QFocusEvent *event)
 
 void GLWidget::mouseMoveEvent(QMouseEvent *event)
 {
-    if (simEngine.getState() == State::Menu && activeModal == ModalNone) {
+    if (simEngine.getState() == State::Menu && activeModal == ModalNone && netScreen == NetScreen::Off) {
         float dpr = float(devicePixelRatioF());
         float mx = float(event->position().x()) * dpr;
         float my = float(height() - event->position().y()) * dpr;
@@ -869,6 +888,7 @@ void GLWidget::mouseMoveEvent(QMouseEvent *event)
 void GLWidget::mousePressEvent(QMouseEvent *event)
 {
     setFocus();
+    if (netScreen != NetScreen::Off) return;     // online screens are keyboard-driven
     if (simEngine.getState() == State::Menu) {
         if (activeModal != ModalNone) {
             activeModal = ModalNone;
@@ -896,6 +916,8 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
                     startRace(sim::GameSim::ModeSingle);
                 } else if (i == 1) {
                     startRace(sim::GameSim::ModeSplitScreen);
+                } else if (i == 2) {
+                    openOnline();
                 } else {
                     cycleMenuOption(i, 1);
                 }
@@ -1150,10 +1172,30 @@ void GLWidget::paintGL()
     const sim::Car &c1 = (cars.size() > 0) ? cars[0] : dummyCar;
     const sim::Car &c2 = (cars.size() > 1) ? cars[1] : dummyCar;
 
+    if (netScreen != NetScreen::Off && !isOnline()) {         // online menu / lobby over the garage
+        drawShowcaseScene(W, H);
+        glViewport(0, 0, W, H);
+        drawOnlineScreen(W, H, dpr);
+        return;
+    }
+
     if (simEngine.getState() == State::Menu) {
         drawShowcaseScene(W, H);
         glViewport(0, 0, W, H);
         drawMainMenu(W, H, dpr);
+        return;
+    }
+
+    if (isOnline()) {
+        if (mySlot >= 0 && mySlot < int(cars.size())) {
+            renderView(cars[mySlot], view1, cars[mySlot], view2, mySlot + 1, 0, 0, W, H);
+            glViewport(0, 0, W, H);
+            drawMinimap(W, H, dpr);
+        }
+        if (simEngine.getState() == State::Finished) {
+            glViewport(0, 0, W, H);
+            drawOnlineResults(W, H, dpr);
+        }
         return;
     }
 
@@ -1513,8 +1555,12 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
         if (t.parked || t.z > me.z + 25.0f || t.z < me.z - VIEW_DIST) continue;
         drawShadow(roadCenter(t.z) + t.lane, t.z, roadAngle(t.z), t.truck ? 1.25f : 1.1f, t.truck ? 3.6f : 2.3f);
     }
-    if (meView.camMode == 0) drawShadow(me.x, me.z, me.heading, 1.1f, 2.3f);
-    drawShadow(other.x, other.z, other.heading, 1.1f, 2.3f);
+    const auto &allCars = simEngine.getCars();
+    const int meIdx = (&me >= allCars.data() && &me < allCars.data() + allCars.size()) ? int(&me - allCars.data()) : 0;
+    for (int i = 0; i < int(allCars.size()); ++i) {
+        if (i == meIdx && meView.camMode != 0) continue;     // no own shadow from the hood camera
+        drawShadow(allCars[i].x, allCars[i].z, allCars[i].heading, 1.1f, 2.3f);
+    }
     glDepthMask(GL_TRUE); glEnable(GL_LIGHTING);
 
     // traffic
@@ -1526,16 +1572,22 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
         else         drawCar(tx, t.z, ta, 0.0f, 0.0f, 0.0f, spin, t.r, t.g, t.b, false);
     }
 
-    const char *myBadge = (playerNum == 1 ? "1" : "2");
-    const char *otherBadge = (simEngine.getGameMode() == sim::GameSim::ModeSingle) ? "CPU" : (playerNum == 1 ? "2" : "1");
-
-    const int meIdx = (playerNum == 1) ? 0 : 1, otherIdx = 1 - meIdx;
-    if (meView.camMode == 0) {
-        drawCar(me.x, me.z, me.heading, me.roll, me.pitch, me.steerVis, me.wheelSpin, me.r, me.g, me.b, me.nitroOn, myBadge,
-                carFx[meIdx].brakeGlow);
+    // Name plate above each car: "1"/"2" in split screen, "CPU" in single player, names online
+    auto badgeFor = [&](int i) -> QByteArray {
+        if (isOnline()) {
+            if (i == meIdx) return "YOU";
+            return (i < racerNames.size()) ? racerNames[i].left(8).toUtf8() : QByteArray::number(i + 1);
+        }
+        if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i == 1) return "CPU";
+        return QByteArray::number(i + 1);
+    };
+    for (int i = 0; i < int(allCars.size()); ++i) {
+        if (i == meIdx && meView.camMode != 0) continue;
+        const sim::Car &c = allCars[i];
+        QByteArray badge = badgeFor(i);
+        drawCar(c.x, c.z, c.heading, c.roll, c.pitch, c.steerVis, c.wheelSpin, c.r, c.g, c.b, c.nitroOn,
+                badge.constData(), (i < sim::MAX_RACERS) ? carFx[i].brakeGlow : 0.0f);
     }
-    drawCar(other.x, other.z, other.heading, other.roll, other.pitch, other.steerVis, other.wheelSpin, other.r, other.g, other.b, other.nitroOn, otherBadge,
-            carFx[otherIdx].brakeGlow);
 
     drawParticles();
 
@@ -1801,7 +1853,7 @@ void GLWidget::drawRoad(float camZ)
     glColor3f(1, 1, 1);
 
     const float seg = 2.0f;
-    float startZ = std::min(0.0f, std::ceil((camZ + 30.0f) / seg) * seg);
+    float startZ = std::min(40.0f, std::ceil((camZ + 30.0f) / seg) * seg);   // incl. the grid behind the line
     float endZ   = std::max(-TRACK_LEN - 30.0f, camZ - VIEW_DIST);
 
     // 1. Asphalt Road Surface
@@ -1846,7 +1898,7 @@ void GLWidget::drawRoad(float camZ)
     // 4. Center Dashed Lane Divider Lines (Strictly Fixed in World Space)
     const float dashPeriod = 8.0f;
     const float dashLen = 4.0f;
-    float dashStartZ = std::min(0.0f, std::ceil((camZ + 30.0f) / dashPeriod) * dashPeriod);
+    float dashStartZ = std::min(40.0f, std::ceil((camZ + 30.0f) / dashPeriod) * dashPeriod);
     float dashEndZ   = std::max(-TRACK_LEN, camZ - VIEW_DIST);
 
     glColor3f(0.96f, 0.94f, 0.88f);
@@ -1870,7 +1922,7 @@ void GLWidget::drawRoad(float camZ)
 
     // 5. Guard Rails and Posts (Posts strictly locked to fixed 12m intervals)
     const float postPeriod = 12.0f;
-    float postStartZ = std::min(0.0f, std::ceil((camZ + 30.0f) / postPeriod) * postPeriod);
+    float postStartZ = std::min(40.0f, std::ceil((camZ + 30.0f) / postPeriod) * postPeriod);
     for (float side : {-1.0f, 1.0f}) {
         glColor3f(0.70f, 0.72f, 0.76f);
         for (float z = postStartZ; z >= endZ; z -= postPeriod) {
@@ -3004,11 +3056,14 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
     // =======================================================================
     // 1. TOP-LEFT: COMPACT RACE STATUS BADGE (P1/P2, Position, Lap, Distance)
     // =======================================================================
-    bool first = me.z <= other.z;
-    bool isFinished = (simEngine.getState() == State::Finished) || me.finished;
-    bool won = (simEngine.getWinner() == playerNum) || (isFinished && first);
-    const char *posStr = (won || first) ? "1ST" : "2ND";
-    const char *pTag = (playerNum == 1) ? "P1" : "P2";
+    (void)other;
+    static const char *ORD[8] = {"1ST", "2ND", "3RD", "4TH", "5TH", "6TH", "7TH", "8TH"};
+    const auto &hudCars = simEngine.getCars();
+    const int myIdx = (&me >= hudCars.data() && &me < hudCars.data() + hudCars.size()) ? int(&me - hudCars.data()) : 0;
+    const char *posStr = ORD[std::clamp(simEngine.rankOf(myIdx), 1, 8) - 1];
+    char pTagBuf[8];
+    snprintf(pTagBuf, sizeof pTagBuf, "P%d", playerNum);
+    const char *pTag = pTagBuf;
 
     float prog = std::clamp((0.0f - me.z) / sim::TRACK_LEN, 0.0f, 1.0f);
     int lapNum = std::min(3, 1 + int(prog * 2.99f));
@@ -3028,7 +3083,7 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
     rect(statX, statY, statX + statW, statY + statH);
 
     // Subtle border
-    if (first || won) glColor4f(1.0f, 0.85f, 0.20f, 0.85f);
+    if (simEngine.rankOf(myIdx) == 1) glColor4f(1.0f, 0.85f, 0.20f, 0.85f);   // gold border when leading
     else              glColor4f(0.30f, 0.75f, 0.95f, 0.75f);
     rect(statX, statY, statX + statW, statY + bThk);
     rect(statX, statY + statH - bThk, statX + statW, statY + statH);
@@ -3339,7 +3394,7 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
 
     // Nitro collection notification (brief pop-up above speedometer card)
     int carIdx = playerNum - 1;
-    if (carIdx >= 0 && carIdx < 2 && nitroBannerTimer[carIdx] > 0.0f) {
+    if (carIdx >= 0 && carIdx < sim::MAX_RACERS && nitroBannerTimer[carIdx] > 0.0f) {
         const char *alertTxt = (playerNum == 1) ? "+1 NITRO! [ENTER]" : "+1 NITRO! [SPACE]";
         float aPs = s * 1.05f;
         float ax = cardX;
@@ -3445,6 +3500,7 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
         float s = ps * 6.0f;
         drawText(buf, (vw - textWidth(buf, s)) * 0.5f, vh * 0.52f, s, 1.0f, 0.85f, 0.2f);
         const char *hint = (simEngine.getGameMode() == sim::GameSim::ModeSingle) ? "ARROWS + ENTER NITRO"
+                         : isOnline() ? "ARROWS/WASD + ENTER/SPACE NITRO"
                          : (playerNum == 2 ? "WASD + SPACE NITRO" : "ARROWS + ENTER NITRO");
         float hs = ps * 1.15f;
         drawText(hint, (vw - textWidth(hint, hs)) * 0.5f, vh * 0.42f, hs, 1.0f, 1.0f, 1.0f);
@@ -3461,10 +3517,12 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
             const char *finMsg = "FINISHED!";
             drawText(finMsg, (vw - textWidth(finMsg, s)) * 0.5f, vh * 0.54f, s, 1.0f, 0.85f, 0.2f);
         } else {
-            const char *loseMsg = (simEngine.getGameMode() == sim::GameSim::ModeSingle) ? "CPU WINS!" : "OPPONENT WINS!";
+            QByteArray online = (winner - 1 < racerNames.size() ? racerNames[winner - 1] : QString("P%1").arg(winner)).toUtf8() + " WINS!";
+            const char *loseMsg = isOnline() ? online.constData()
+                                : (simEngine.getGameMode() == sim::GameSim::ModeSingle) ? "CPU WINS!" : "OPPONENT WINS!";
             drawText(loseMsg, (vw - textWidth(loseMsg, s)) * 0.5f, vh * 0.54f, s, 1.0f, 0.35f, 0.35f);
         }
-        const char *rstMsg = "PRESS [R] TO RESTART";
+        const char *rstMsg = isOnline() ? "WAITING FOR THE OTHERS..." : "PRESS [R] TO RESTART";
         float rstPs = ps * 1.10f;
         drawText(rstMsg, (vw - textWidth(rstMsg, rstPs)) * 0.5f, vh * 0.44f, rstPs, 0.9f, 0.9f, 0.9f);
     }
@@ -3544,17 +3602,16 @@ void GLWidget::drawMinimap(int W, int H, float dpr)
     };
 
     const auto &cars = simEngine.getCars();
-    static sim::Car dummyCar;
-    const sim::Car &c1 = (cars.size() > 0) ? cars[0] : dummyCar;
-    const sim::Car &c2 = (cars.size() > 1) ? cars[1] : dummyCar;
-
-    if (simEngine.getGameMode() == sim::GameSim::ModeSingle) {
-        dot(c2, "CPU");
-        dot(c1, "YOU");
-    } else {
-        dot(c2, "P2");
-        dot(c1, "P1");
+    const int me = localCar();
+    for (int i = int(cars.size()) - 1; i >= 0; --i) {       // my own dot last, so it is on top
+        if (i == me && (isOnline() || simEngine.getGameMode() == sim::GameSim::ModeSingle)) continue;
+        char lbl[8];
+        if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i == 1) snprintf(lbl, sizeof lbl, "CPU");
+        else snprintf(lbl, sizeof lbl, "P%d", i + 1);
+        dot(cars[i], lbl);
     }
+    if (me < int(cars.size()) && (isOnline() || simEngine.getGameMode() == sim::GameSim::ModeSingle))
+        dot(cars[me], "YOU");
 }
 
 void GLWidget::drawMainMenu(int W, int H, float dpr)
