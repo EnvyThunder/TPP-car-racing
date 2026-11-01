@@ -1,4 +1,4 @@
-// Online multiplayer: the "ONLINE MULTIPLAYER (8P)" screens and the networked race.
+// Online multiplayer: the "ONLINE MULTIPLAYER (6P)" screens and the networked race.
 //
 // One player picks HOST A RACE: their game starts a RaceServer and shows a 4-letter
 // room code. Friends pick JOIN WITH A CODE and type it; their game finds the host on
@@ -29,11 +29,15 @@
 #include <QFile>
 #include <QGuiApplication>
 #include <QKeyEvent>
+#ifndef __EMSCRIPTEN__
 #include <QNetworkInterface>
+#endif
+#include <QSettings>
 #include <QTimer>
 #include <QDebug>
 #include <algorithm>
 #include <cmath>
+#include "gl1redirect.h"   // (the drawing goes through gl1shim: OpenGL ES 2 / WebGL)
 
 namespace {
 
@@ -71,16 +75,13 @@ float lerpAngle(float a, float b, float t)
 // ===========================================================================
 //  Joining, hosting, leaving
 // ===========================================================================
-QString GLWidget::playerName() const
+QString GLWidget::savedName() const
 {
-    QString n;
-    // Windows: USERNAME, Mac/Linux: USER, otherwise the home folder's name
-    QString raw = qEnvironmentVariable("USERNAME");
-    if (raw.isEmpty()) raw = qEnvironmentVariable("USER");
-    if (raw.isEmpty()) raw = QDir::home().dirName();
-    for (QChar c : raw.toUpper())
-        if (c.isLetterOrNumber() && c.unicode() < 128) n += c;
-    return n.isEmpty() ? QString("PLAYER") : n.left(10);
+    // the name you gave yourself in a lobby before (kept on this computer); empty = the
+    // room names you CAR1, CAR2, ... Scripted tests never use or change it.
+    if (!netTest.isEmpty()) return QString();
+    if (!accountUser.isEmpty()) return accountUser;      // logged in: your username
+    return net::cleanName(QSettings("TPP", "CarRacing").value("online/name").toString());
 }
 
 QString GLWidget::lanAddress()
@@ -100,13 +101,15 @@ void GLWidget::openOnline()
         connect(net, &RaceClient::lobbyChanged, this, [this]() {
             if (netScreen == NetScreen::Busy) netScreen = NetScreen::Lobby;
         });
-        connect(net, &RaceClient::raceStarted, this, [this](int map, int slot, const QStringList &names, quint32 world) {
+        connect(net, &RaceClient::raceStarted, this, [this](int map, int laps, int slot, const QStringList &names, quint32 world) {
             selectedMapPreset = map;
             simEngine.setMap(map);
+            simEngine.setLaps(laps);
             simEngine.startRace(sim::GameSim::ModeOnline, int(names.size()));
             trackMismatch = (simEngine.worldChecksum() != world);
             mySlot = slot;
             racerNames = names;
+            nameEditing = false;
             view1 = CarView();
             view2 = CarView();
             for (CarFx &f : carFx) f = CarFx();
@@ -123,9 +126,13 @@ void GLWidget::openOnline()
             simAccumulator = 0.0f;
             elapsedTimer.restart();
             netScreen = NetScreen::Race;
+            beginOnlineStory();                          // the story scene first (the server waits)
         });
+        connect(net, &RaceClient::storyEnded, this, [this]() { endOnlineStory(); });
         connect(net, &RaceClient::snapshotArrived, this, &GLWidget::onNetSnapshot);
         connect(net, &RaceClient::raceOver, this, [this]() {
+            if (story != StoryScreen::Off) endOnlineStory();
+            netStoryHold = false;
             netScreen = NetScreen::Lobby;
             simEngine.setState(State::Menu);
             keys.clear();
@@ -141,8 +148,34 @@ void GLWidget::openOnline()
     joinText.clear();
 }
 
+// The internet race server runs beside the accounts API (docs/online/README.md): the same site,
+// over a WebSocket at /race
+QString GLWidget::raceUrl() const
+{
+    const QString env = qEnvironmentVariable("CAR_RACING_RACE");
+    if (!env.isEmpty()) return env;
+    QString base = apiBase();
+    if (base.startsWith("https://")) base = "wss://" + base.mid(8);
+    else if (base.startsWith("http://")) base = "ws://" + base.mid(7);
+    return base + "/race";
+}
+
+void GLWidget::netHostInternet()
+{
+    float r, g, b;
+    myCarColor(r, g, b);
+    net->token = accountToken;                           // (logged in: the server knows you)
+    netScreen = NetScreen::Busy;
+    netMessage = "CREATING A ROOM ON THE INTERNET SERVER...";
+    net->create(raceUrl(), 0, savedName(), r, g, b, selectedMapPreset, simEngine.getLaps());
+}
+
 void GLWidget::netHost()
 {
+#ifdef __EMSCRIPTEN__
+    netMessage = "IN THE BROWSER, HOST ON THE INTERNET SERVER";   // (a web page can't be a server)
+    return;
+#endif
     float r, g, b;
     myCarColor(r, g, b);
     // CAR_RACING_SERVER=host[:port] hosts the room on a dedicated server instead of this PC
@@ -152,7 +185,7 @@ void GLWidget::netHost()
         int colon = server.lastIndexOf(':');
         if (colon > 0) { port = quint16(server.mid(colon + 1).toUInt()); server = server.left(colon); }
         netScreen = NetScreen::Busy;
-        net->create(server, port, playerName(), r, g, b, selectedMapPreset);
+        net->create(server, port, savedName(), r, g, b, selectedMapPreset, simEngine.getLaps());
         return;
     }
     if (!hostServer) {
@@ -166,7 +199,7 @@ void GLWidget::netHost()
     }
     netScreen = NetScreen::Busy;
     netMessage = "CREATING ROOM...";
-    net->create("127.0.0.1", hostServer->port(), playerName(), r, g, b, selectedMapPreset);
+    net->create("127.0.0.1", hostServer->port(), savedName(), r, g, b, selectedMapPreset, simEngine.getLaps());
 }
 
 void GLWidget::netJoin()
@@ -175,7 +208,9 @@ void GLWidget::netJoin()
     float r, g, b;
     myCarColor(r, g, b);
     netScreen = NetScreen::Busy;
-    net->join(joinText, playerName(), r, g, b);
+    net->internetUrl = raceUrl();                        // (not on this Wi-Fi: the internet server is asked next)
+    net->token = accountToken;
+    net->join(joinText, savedName(), r, g, b);
 }
 
 void GLWidget::netLeave(const QString &message)
@@ -186,6 +221,7 @@ void GLWidget::netLeave(const QString &message)
     if (isOnline() || simEngine.getGameMode() == sim::GameSim::ModeOnline) simEngine.setState(State::Menu);
     netScreen = NetScreen::Choose;
     netMessage = message;
+    nameEditing = false;
     keys.clear();
 }
 
@@ -228,7 +264,7 @@ void GLWidget::onNetSnapshot(quint32 lastSeq, const QByteArray &body)
     while (!sentInputs.empty() && sentInputs.front().seq <= lastSeq) sentInputs.pop_front();
     sim::Car p = cars[mySlot];
     p.aiTarget = predicted.aiTarget; p.aiReverse = predicted.aiReverse;     // test autopilot memory
-    p.aiCheckTimer = predicted.aiCheckTimer; p.aiCheckZ = predicted.aiCheckZ;
+    p.aiCheckTimer = predicted.aiCheckTimer; p.aiCheckProg = predicted.aiCheckProg;
     for (const SentInput &si : sentInputs) {
         simEngine.updateCar(p, si.in, mySlot);
         simEngine.predictCollisions(p);
@@ -258,6 +294,7 @@ void GLWidget::netUpdate(float realDt)
         in.left  = isDown(Qt::Key_Left) || isDown(Qt::Key_A);
         in.right = isDown(Qt::Key_Right) || isDown(Qt::Key_D);
         in.nitro = isDown(Qt::Key_Return) || isDown(Qt::Key_Enter) || isDown(Qt::Key_Space) || isDown(Qt::Key_N);
+        in.boost = isDown(Qt::Key_L);
         if (!netTest.isEmpty() && mySlot < int(cars.size()))
             in = simEngine.computeAIInput(predicted, mySlot, false);   // scripted test: CPU drives
         net->sendInput(++inputSeq, in);
@@ -269,8 +306,7 @@ void GLWidget::netUpdate(float realDt)
             simEngine.predictCollisions(predicted);
         }
         for (sim::Traffic &t : simEngine.trafficMut()) {                             // traffic between snapshots
-            if (t.parked) continue;
-            t.z -= t.speed;
+            t.s = simEngine.wrapS(t.s + t.speed);
             t.lane += (t.targetLane - t.lane) * 0.06f;
         }
         for (int i = 0; i < int(cars.size()) && i < sim::MAX_RACERS; ++i) updateCarFx(i, cars[i]);
@@ -301,6 +337,26 @@ void GLWidget::composeOnlineCars()
             float f = std::clamp(float((renderT - a->t) / (b->t - a->t)), 0.0f, 1.0f);
             c.x += (n.x - c.x) * f;
             c.z += (n.z - c.z) * f;
+            if (c.path != n.path) {                      // changed road between the snapshots
+                c.path = n.path; c.s = n.s; c.d = n.d; c.lap = n.lap; c.progress = n.progress;
+            } else if (c.path == 1) {                    // on the shortcut
+                c.s += (n.s - c.s) * f;
+                c.d += (n.d - c.d) * f;
+                c.progress += (n.progress - c.progress) * f;
+            } else {
+                c.d += (n.d - c.d) * f;
+                c.progress += (n.progress - c.progress) * f;   // the race order follows the distance raced
+                if (simEngine.sprint()) {                // a sprint: metres past the start line
+                    c.lap = 0;
+                    c.s = c.progress + simEngine.startLine();
+                } else {
+                    c.lap = int(std::floor(c.progress / simEngine.lapLength()));
+                    c.s = c.progress - float(c.lap) * simEngine.lapLength();
+                }
+            }
+            c.hint = int(c.s);
+            c.y += (n.y - c.y) * f;
+            c.air = n.air;
             c.heading = lerpAngle(c.heading, n.heading, f);
             c.steerVis += (n.steerVis - c.steerVis) * f;
             c.roll += (n.roll - c.roll) * f;
@@ -335,12 +391,13 @@ bool GLWidget::handleOnlineKey(QKeyEvent *event)
     case NetScreen::Off:
         return false;
     case NetScreen::Choose:
-        if (k == Qt::Key_Up || k == Qt::Key_W)        netChoice = (netChoice + 2) % 3;
-        else if (k == Qt::Key_Down || k == Qt::Key_S) netChoice = (netChoice + 1) % 3;
+        if (k == Qt::Key_Up || k == Qt::Key_W)        netChoice = (netChoice + 3) % 4;
+        else if (k == Qt::Key_Down || k == Qt::Key_S) netChoice = (netChoice + 1) % 4;
         else if (k == Qt::Key_Escape)                 netScreen = NetScreen::Off;
         else if (enter || k == Qt::Key_Space) {
             if (netChoice == 0)      netHost();
-            else if (netChoice == 1) { netScreen = NetScreen::EnterCode; joinText.clear(); netMessage.clear(); }
+            else if (netChoice == 1) netHostInternet();
+            else if (netChoice == 2) { netScreen = NetScreen::EnterCode; joinText.clear(); netMessage.clear(); }
             else                     netScreen = NetScreen::Off;
         }
         break;
@@ -358,25 +415,53 @@ bool GLWidget::handleOnlineKey(QKeyEvent *event)
         if (k == Qt::Key_Escape) netLeave(QString());
         break;
     case NetScreen::Lobby:
+        if (nameEditing) {                               // typing a new name for yourself
+            if (k == Qt::Key_Escape) {
+                nameEditing = false;
+            } else if (enter) {
+                const QString n = net::cleanName(nameText);
+                if (!n.isEmpty()) {
+                    net->requestName(n);
+                    if (netTest.isEmpty()) QSettings("TPP", "CarRacing").setValue("online/name", n);   // next time too
+                }
+                nameEditing = false;
+            } else if (k == Qt::Key_Backspace) {
+                nameText.chop(1);
+            } else {
+                for (QChar c : event->text().toUpper())
+                    if (((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == '-' || c == '_' || c == '.')
+                        && nameText.size() < net::MAX_NAME)
+                        nameText += c;
+            }
+            break;
+        }
         if (k == Qt::Key_Escape) {
             netLeave("YOU LEFT THE ROOM");
+        } else if (k == Qt::Key_N) {
+            nameEditing = true;
+            nameText = (net->slot >= 0 && net->slot < net->players.size()) ? net->players[net->slot].name : QString();
+            netMessage.clear();
         } else if (k == Qt::Key_C) {
             if (QClipboard *cb = QGuiApplication::clipboard()) cb->setText(net->code);
             netMessage = "ROOM CODE COPIED - PASTE IT TO YOUR FRIENDS";
         } else if (net->isHost && (k == Qt::Key_Plus || k == Qt::Key_Equal || k == Qt::Key_B)) {
             if (net->players.size() < sim::MAX_RACERS) net->requestAddCpu();
-            else netMessage = "ALL 8 SEATS ARE TAKEN";
+            else netMessage = QString("ALL %1 SEATS ARE TAKEN").arg(sim::MAX_RACERS);
         } else if (net->isHost && (k == Qt::Key_Minus || k == Qt::Key_Underscore)) {
             net->requestRemoveCpu();
         } else if (net->isHost && enter) {
             net->requestStart();
         } else if (net->isHost && (k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_A || k == Qt::Key_D)) {
             int dir = (k == Qt::Key_Left || k == Qt::Key_A) ? -1 : 1;
-            net->requestMap((net->lobbyMap + dir + sim::NUM_MAPS) % sim::NUM_MAPS);
+            net->requestMap((net->lobbyMap + dir + sim::NUM_MAPS) % sim::NUM_MAPS, net->lobbyLaps);
         }
         break;
     case NetScreen::Race:
-        if (k == Qt::Key_Escape) { netLeave("YOU LEFT THE RACE"); return true; }
+        if (k == Qt::Key_Escape) {
+            if (story != StoryScreen::Off || netStoryHold) return false;   // (the story scene: ESC skips it for everyone)
+            netLeave("YOU LEFT THE RACE");
+            return true;
+        }
         if (k == Qt::Key_C) { view1.camMode = (view1.camMode + 1) % 3; return true; }
         if (k == Qt::Key_R || k == Qt::Key_P) return true;   // no restart / pause online
         return false;                                         // driving keys
@@ -429,12 +514,14 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
     case NetScreen::Choose: {
         centered("ONLINE MULTIPLAYER", y, ps * 1.5f, 1.0f, 1.0f, 1.0f);
         y -= 18.0f * dpr + 7.0f * ps;
-        centered("UP TO 8 PLAYERS - ONE HOSTS, EVERYONE ELSE JOINS WITH THE ROOM CODE", y, ps * 0.75f, 0.70f, 0.78f, 0.92f);
+        centered(QString("UP TO %1 RACERS - ONE HOSTS, EVERYONE ELSE JOINS WITH THE ROOM CODE").arg(sim::MAX_RACERS),
+                 y, ps * 0.75f, 0.70f, 0.78f, 0.92f);
         y -= 40.0f * dpr;
-        static const char *OPTS[3] = {"HOST A RACE", "JOIN WITH A CODE", "BACK"};
-        static const char *SUB[3] = {"YOU GET A CODE TO SHARE", "TYPE THE CODE YOUR FRIEND GOT", "MAIN MENU"};
+        static const char *OPTS[4] = {"HOST A RACE ON THIS PC", "HOST ON THE INTERNET SERVER", "JOIN WITH A CODE", "BACK"};
+        static const char *SUB[4] = {"FRIENDS ON THE SAME WI-FI JOIN WITH YOUR CODE", "ANYONE, ANYWHERE JOINS WITH YOUR CODE",
+                                     "TYPE THE CODE YOUR FRIEND GOT (WI-FI FIRST, THEN THE INTERNET)", "MAIN MENU"};
         const float bw = pw * 0.62f, bh = 54.0f * dpr, bx = (W - bw) * 0.5f;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             float by1 = y, by0 = y - bh;
             bool sel = (netChoice == i);
             glColor4f(sel ? 0.40f : 0.06f, sel ? 0.12f : 0.10f, sel ? 0.50f : 0.18f, 0.95f);
@@ -449,7 +536,8 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         if (!netMessage.isEmpty()) message(y - 10.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
         {
             QString ip = lanAddress();
-            centered("YOUR NAME: " + playerName() + "   -   THIS PC: " + (ip.isEmpty() ? QString("NO NETWORK!") : ip),
+            const QString mine = savedName().isEmpty() ? QString("CAR + A NUMBER ([N] IN THE LOBBY TO CHANGE)") : savedName();
+            centered("YOUR NAME: " + mine + "   -   THIS PC: " + (ip.isEmpty() ? QString("NO NETWORK!") : ip),
                      y0 + pad + 16.0f * dpr, ps * 0.62f, 0.60f, 0.70f, 0.85f);
         }
         centered("[UP/DOWN] CHOOSE   [ENTER] OK   [ESC] BACK", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
@@ -471,7 +559,7 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         y -= bh + 26.0f * dpr;
         centered("4 LETTERS, FOR EXAMPLE K7Q2", y, ps * 0.7f, 0.65f, 0.72f, 0.85f);
         y -= 18.0f * dpr;
-        centered("DIFFERENT NETWORK? TYPE CODE@ADDRESS, FOR EXAMPLE K7Q2@203.0.113.5", y, ps * 0.62f, 0.55f, 0.62f, 0.78f);
+        centered("NOT ON THIS WI-FI? THE INTERNET SERVER IS ASKED NEXT - OR TYPE CODE@ADDRESS", y, ps * 0.62f, 0.55f, 0.62f, 0.78f);
         if (!netMessage.isEmpty()) message(y - 30.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
         centered("[ENTER] JOIN   [BACKSPACE] DELETE   [ESC] BACK", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
         break;
@@ -525,14 +613,16 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         // player list
         int cpus = 0;
         for (const net::LobbyPlayer &lp : net->players) cpus += lp.cpuLevel > 0 ? 1 : 0;
-        left(cpus ? QString("PLAYERS %1/8  (%2 CPU)").arg(net->players.size()).arg(cpus)
-                  : QString("PLAYERS %1/8").arg(net->players.size()),
+        left(cpus ? QString("PLAYERS %1/%2  (%3 CPU)").arg(net->players.size()).arg(sim::MAX_RACERS).arg(cpus)
+                  : QString("PLAYERS %1/%2").arg(net->players.size()).arg(sim::MAX_RACERS),
              x0 + pad, y, ps * 0.85f, 0.92f, 0.35f, 1.0f);
         const sim::MapDef &md = sim::MAPS[std::clamp(net->lobbyMap, 0, sim::NUM_MAPS - 1)];
-        QString mapLine = QString("MAP: ") + md.name + (net->isHost ? "  < >" : "");
+        QString mapLine = QString("MAP: ") + md.name + (net->isHost ? " < >" : "")
+                          + (sim::GameSim::isSprintMap(net->lobbyMap) ? QString("   SPRINT")
+                                                                        : QString("   LAPS: %1").arg(sim::GameSim::LAPS));
         left(mapLine, x1 - pad - textWidth(mapLine.toUtf8().constData(), ps * 0.85f), y, ps * 0.85f, 0.35f, 0.90f, 1.0f);
         y -= 12.0f * dpr;
-        const float rowH = std::min(26.0f * dpr, (y - (y0 + pad + 50.0f * dpr)) / 8.0f);
+        const float rowH = std::min(30.0f * dpr, (y - (y0 + pad + 50.0f * dpr)) / float(sim::MAX_RACERS));
         for (int i = 0; i < sim::MAX_RACERS; ++i) {
             float ry1 = y - i * rowH, ry0 = ry1 - rowH + 3.0f * dpr;
             glColor4f(0.07f, 0.10f, 0.17f, 0.9f);
@@ -542,34 +632,41 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
                 const net::LobbyPlayer &p = net->players[i];
                 glColor4f(p.r, p.g, p.b, 1.0f);
                 fillRect(x0 + pad + 8.0f * dpr, ry0 + 5.0f * dpr, x0 + pad + 8.0f * dpr + (rowH - 13.0f * dpr), ry1 - 8.0f * dpr);
-                QString line = QString("%1  %2").arg(i + 1).arg(p.name);
-                if (p.host) line += "  (HOST)";
-                if (i == net->slot) line += "  (YOU)";
-                if (p.cpuLevel > 0) line += QString("  CPU LEVEL %1").arg(p.cpuLevel);
-                left(line, x0 + pad + rowH + 4.0f * dpr, ty, ps * 0.8f,
-                     p.cpuLevel ? 0.75f : 1.0f, p.cpuLevel ? 0.85f : 1.0f, 1.0f);
-                if (p.cpuLevel > 0) {                          // difficulty pips, right side
-                    float pip = 8.0f * dpr, gapPip = 4.0f * dpr;
-                    float px = x1 - pad - 10.0f * dpr - 5 * (pip + gapPip);
-                    float py = ry0 + (rowH - 3.0f * dpr - pip) * 0.5f;
-                    for (int k = 0; k < 5; ++k) {
-                        if (k < p.cpuLevel) glColor4f(1.0f, 0.35f + 0.1f * (4 - k), 0.25f, 1.0f);
-                        else                glColor4f(0.22f, 0.26f, 0.35f, 1.0f);
-                        fillRect(px + k * (pip + gapPip), py, px + k * (pip + gapPip) + pip, py + pip);
-                    }
+                const float ts = ps * 0.8f;
+                const float numX = x0 + pad + rowH + 4.0f * dpr;
+                left(QString::number(i + 1), numX, ty, ts, 0.60f, 0.65f, 0.75f);
+                // every name gets the same space (10 letters): longer ones are written smaller
+                const float nameX = numX + textWidth("0  ", ts), nameW = textWidth("WWWWWWWWWW", ts);
+                const bool editing = nameEditing && i == net->slot;
+                const QByteArray nb = (editing ? nameText + (blink ? "_" : " ") : p.name).toUtf8();
+                const float ns = fitSize(nb.constData(), ts, nameW);
+                if (editing) {
+                    glColor4f(1.0f, 0.82f, 0.25f, 0.22f);
+                    fillRect(nameX - 4.0f * dpr, ry0 + 2.0f * dpr, nameX + nameW + 4.0f * dpr, ry1 - 2.0f * dpr);
                 }
+                drawText(nb.constData(), nameX, ty + 3.5f * (ts - ns), ns, editing ? 1.0f : (p.cpuLevel ? 0.75f : 1.0f),
+                         editing ? 0.88f : (p.cpuLevel ? 0.85f : 1.0f), editing ? 0.30f : 1.0f);
+                QStringList tags;
+                if (p.host) tags << "HOST";
+                if (i == net->slot) tags << "YOU";
+                if (p.cpuLevel > 0) tags << QString("BOT (ADAPTS)");
+                left(tags.join("  "), nameX + nameW + 16.0f * dpr, ty + 3.5f * ts * 0.2f, ts * 0.8f, 0.55f, 0.85f, 1.0f);
+
             } else {
                 left(QString("%1  WAITING FOR PLAYER...").arg(i + 1), x0 + pad + rowH + 4.0f * dpr, ty, ps * 0.8f,
                      0.35f, 0.40f, 0.50f);
             }
         }
         if (!netMessage.isEmpty()) centered(netMessage, y0 + pad + 22.0f * dpr, ps * 0.66f, 0.45f, 1.0f, 0.55f);
-        if (net->isHost)
-            centered(blink ? "[ENTER] START   [+]/[-] ADD/REMOVE CPU   [LEFT/RIGHT] MAP   [ESC] LEAVE"
-                           : "                [+]/[-] ADD/REMOVE CPU   [LEFT/RIGHT] MAP   [ESC] LEAVE",
+        if (nameEditing)
+            centered(QString("TYPE YOUR NAME (UP TO %1 LETTERS)   [ENTER] SAVE   [ESC] CANCEL").arg(net::MAX_NAME),
+                     y0 + pad, ps * 0.75f, 1.0f, 0.88f, 0.30f);
+        else if (net->isHost)
+            centered(blink ? "[ENTER] START   [+]/[-] CPU   [N] NAME   [LEFT/RIGHT] MAP   [ESC] LEAVE"
+                           : "                [+]/[-] CPU   [N] NAME   [LEFT/RIGHT] MAP   [ESC] LEAVE",
                      y0 + pad, ps * 0.75f, 0.45f, 1.0f, 0.55f);
         else
-            centered("WAITING FOR THE HOST TO START...   [ESC] LEAVE", y0 + pad, ps * 0.75f, 0.85f, 0.85f, 0.85f);
+            centered("WAITING FOR THE HOST TO START...   [N] YOUR NAME   [ESC] LEAVE", y0 + pad, ps * 0.75f, 0.85f, 0.85f, 0.85f);
         break;
     }
     default:
@@ -602,15 +699,22 @@ void GLWidget::drawOnlineResults(int W, int H, float dpr)
             QString name = (i < racerNames.size()) ? racerNames[i] : QString("P%1").arg(i + 1);
             QString time = c.finished ? QString("%1:%2").arg(int(c.finishTime) / 60)
                                             .arg(c.finishTime - 60.0f * (int(c.finishTime) / 60), 5, 'f', 2, QChar('0'))
-                                      : QString("DNF");
-            QString line = QString("%1  %2  %3").arg(ordinal(rank), -4).arg(name, -12).arg(time);
+                                      : QString(c.out ? "OUT" : "DNF");
             bool me = (i == mySlot);
-            float rowW = textWidth("1ST   WWWWWWWWWWWW  0:00.00", ps * 1.1f) + 50.0f * dpr;
+            const float ts = ps * 1.1f;
+            const float rankW = textWidth("1ST  ", ts), nameW = textWidth("WWWWWWWWWW", ts);
+            float rowW = rankW + nameW + textWidth("  0:00.00", ts) + 50.0f * dpr;
             float rx = (W - rowW) * 0.5f;
             glColor4f(c.r, c.g, c.b, 1.0f);
-            fillRect(rx, y - 2.0f * dpr, rx + 14.0f * dpr, y + 7.0f * ps * 1.1f);
-            QByteArray t = line.toUtf8();
-            drawText(t.constData(), rx + 26.0f * dpr, y, ps * 1.1f, me ? 1.0f : 0.88f, me ? 0.88f : 0.92f, me ? 0.30f : 0.98f);
+            fillRect(rx, y - 2.0f * dpr, rx + 14.0f * dpr, y + 7.0f * ts);
+            const float cr = me ? 1.0f : 0.88f, cg = me ? 0.88f : 0.92f, cb = me ? 0.30f : 0.98f;
+            float tx = rx + 26.0f * dpr;
+            drawText(ordinal(rank), tx, y, ts, cr, cg, cb);
+            const QByteArray nb = name.toUtf8();
+            const float ns = fitSize(nb.constData(), ts, nameW);
+            drawText(nb.constData(), tx + rankW, y + 3.5f * (ts - ns), ns, cr, cg, cb);
+            const QByteArray tb = time.toUtf8();
+            drawText(tb.constData(), tx + rankW + nameW + textWidth("  ", ts), y, ts, cr, cg, cb);
             y -= 9.0f * ps * 1.1f + 8.0f * dpr;
         }
     }
@@ -633,9 +737,14 @@ void GLWidget::runNetAutoShot()
         const int wanted = std::max(1, netTest.section(':', 1, 1).toInt());
         if (f == 45) shot("net_01_online_menu");
         const int cpus = netTest.section(':', 2, 2).toInt();
-        if (netScreen == NetScreen::Lobby && f >= 120 && f < 120 + 10 * cpus && (f - 120) % 10 == 0) net->requestAddCpu();
+        static int inLobby = -1;                        // (CPUs are added once the lobby is there: over the internet it takes a moment)
+        if (netScreen == NetScreen::Lobby && inLobby < 0) inLobby = std::max(f, 120);
+        if (inLobby > 0 && f >= inLobby && f < inLobby + 10 * cpus && (f - inLobby) % 10 == 0) net->requestAddCpu();
         if (f == 330 && netScreen == NetScreen::Lobby) shot("net_02a_host_waiting");
-        if (f == 50) netHost();
+        if (f == 50) {                                  // (CAR_RACING_NETTEST_INTERNET: on the internet server, CAR_RACING_RACE)
+            if (qEnvironmentVariableIsSet("CAR_RACING_NETTEST_INTERNET")) netHostInternet();
+            else netHost();
+        }
         if (!codeWritten && net && !net->code.isEmpty()) {         // tell the test script the code
             QFile file(autoShotDir + "/room.txt");
             if (file.open(QIODevice::WriteOnly)) file.write(net->code.toUtf8());
@@ -655,11 +764,15 @@ void GLWidget::runNetAutoShot()
             QCoreApplication::quit();
         }
     }
+    // CAR_RACING_NETTEST_NAME: rename in the lobby (checks long names fit their space)
+    if (lobbyFrame > 0 && f == lobbyFrame + 12 && !qEnvironmentVariable("CAR_RACING_NETTEST_NAME").isEmpty())
+        net->requestName(qEnvironmentVariable("CAR_RACING_NETTEST_NAME"));
     auto finish = [&]() {
         QFile stats(autoShotDir + "/net_stats.txt");        // GUI apps on Windows have no console
         if (stats.open(QIODevice::WriteOnly)) {
-            stats.write(QString("snapshots %1, corrections >0.5 m: %2, large (>6 m, smoothed): %3, ping %4 ms\n")
-                            .arg(statSnapshots).arg(statSmallFix).arg(statSnaps).arg(net ? net->pingMs : -1).toUtf8());
+            stats.write(QString("snapshots %1, corrections >0.5 m: %2, large (>6 m, smoothed): %3, ping %4 ms, jumps landed %5\n")
+                            .arg(statSnapshots).arg(statSmallFix).arg(statSnaps).arg(net ? net->pingMs : -1)
+                            .arg(statLandings).toUtf8());
             stats.write(QString("frames %1, slower than 25 ms: %2, drawing avg %3 ms max %4 ms\n")
                             .arg(statFrames).arg(statSlowFrames).arg(statPaintMs / std::max(1, statFrames), 0, 'f', 2)
                             .arg(statPaintMax, 0, 'f', 1).toUtf8());
@@ -677,10 +790,12 @@ void GLWidget::runNetAutoShot()
         if (raceFrame < 0) raceFrame = f;
         if (f == raceFrame + 150) shot(host ? "net_04b_host_grid" : "net_04c_guest_grid");
         if (f == raceFrame + 400) shot(host ? "net_05_host_race" : "net_06_guest_race");
-        if (f == raceFrame + 900) shot(host ? "net_07_host_race_later" : "net_08_guest_race_later");
-        if (f == raceFrame + (host ? 1000 : 940)) finish();      // the host (server) closes last
+        // CAR_RACING_NETTEST_FRAMES: race longer than 1000 frames (e.g. to cross a jump)
+        const int len = std::max(1000, qEnvironmentVariableIntValue("CAR_RACING_NETTEST_FRAMES"));
+        if (f == raceFrame + len - 100) shot(host ? "net_07_host_race_later" : "net_08_guest_race_later");
+        if (f == raceFrame + (host ? len : len - 60)) finish();  // the host (server) closes last
     } else if (raceFrame > 0) {
         finish();                                                 // the race ended for us early
     }
-    if (f > 60 * 150) QCoreApplication::quit();                   // safety net
+    if (f > 60 * 200) QCoreApplication::quit();                   // safety net
 }

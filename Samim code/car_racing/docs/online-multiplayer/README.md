@@ -1,4 +1,4 @@
-# Online multiplayer: share a code, race up to 8 players
+# Online multiplayer: share a code, race up to 6 players
 
 It works like skribbl.io: one player hosts and gets a **4-letter room code**, everyone
 else types that code and joins the race from their own computer.
@@ -8,13 +8,14 @@ else types that code and joins the race from their own computer.
 ## How to play
 
 **Everyone on the same Wi-Fi or the same phone hotspot (easiest):**
-1. Host: main menu → **ONLINE MULTIPLAYER (8P)** → **HOST A RACE**. A room code appears,
+1. Host: main menu → **ONLINE MULTIPLAYER (6P)** → **HOST A RACE**. A room code appears,
    for example `7XP8`. Press **C** to copy it and send it to your friends.
-2. Friends: **ONLINE MULTIPLAYER (8P)** → **JOIN WITH A CODE** → type `7XP8` → Enter.
+2. Friends: **ONLINE MULTIPLAYER (6P)** → **JOIN WITH A CODE** → type `7XP8` → Enter.
    Their game finds the host on the network by itself; nobody types an IP address.
-3. The lobby shows everyone who joined (up to 8). The host can fill empty seats with CPU
-   racers (**+** / **-**, see below), picks the map with Left/Right and presses **Enter**
-   to start.
+3. The lobby shows everyone who joined. A room holds **6 racers**, people and CPUs
+   together. The host can fill empty seats with CPU racers (**+** / **-**, see below),
+   picks the map with Left/Right and the number of laps (1-5) with Up/Down, and presses
+   **Enter** to start. Anyone can press **N** to change their name (see below).
 4. Drive with arrows **or** WASD, nitro with Enter **or** Space. Esc leaves the race.
    After the finish the results stay on screen, then everyone is back in the lobby.
 
@@ -25,11 +26,22 @@ click **Allow** (private networks).
 ![Joining with the code](3_join_with_code.jpg)
 ![Race seen by the guest](6_guest_race.jpg)
 
+### Your name
+
+Everyone starts as **CAR1, CAR2, ...** in the order they join. Press **N** in the lobby,
+type a new name (up to 16 letters, numbers, spaces, `-`, `_` or `.`) and press **Enter**;
+**Esc** cancels. Your game remembers the name for next time. Every name gets the same
+space (about 10 letters) in the lobby, on the results and on the plate above the car:
+longer names are written smaller instead of pushing everything else off the screen. Two
+players never share a name: a number is added to the second one.
+
+![Lobby with a long name](10_lobby_names.jpg)
+
 ### CPU racers
 
 In the lobby the host presses **+** (or **B**) to add a CPU racer and **-** to remove the
 last one. Any number from 0 up to the free seats works: with 4 people in the room the host
-can add 0 to 4 CPUs. Each CPU gets a **random level from 1 to 5**, shown as `CPU LEVEL n`
+can add 0 to 2 CPUs. Each CPU gets a **random level from 1 to 5**, shown as `CPU LEVEL n`
 and as pips on its row. The host's computer drives the CPUs, so the friends' games need
 nothing extra. If the room is full and another friend joins, a CPU gives up its seat.
 
@@ -51,7 +63,8 @@ Each track also has a few more nitro cans now: about 10 per track instead of 7 o
 
 ### Wider road and simpler obstacles online
 
-Single player and split screen keep the 3-lane road. Online races (up to 8 cars) get:
+Split screen and vs CPU against a single CPU keep the 3-lane road. Online races, and vs
+CPU with 2 or more CPUs (a pack of up to 6 cars), get:
 - **A 5-lane road** (23 m wide instead of 14 m), with the guard rails and scenery moved out.
 - **A wider starting grid:** rows of 4 cars instead of 2, so the field doesn't pile up at
   the first bend.
@@ -67,7 +80,8 @@ along its side.
 ![Online grid on the wide road](8_wide_road_grid.jpg)
 ![Racing on the wide road](9_wide_road_race.jpg)
 
-Measured with `tools/ai_bench.cpp`, 15 races of 8 cars (3 reference drivers + levels 1-5):
+Measured with `tools/ai_bench.cpp`, 15 races of 8 cars (3 reference drivers + levels 1-5),
+when rooms still held 8 (now 6 cars: 90 of 90 finish, about 5 crashes per car):
 
 | | Before | Now |
 |---|---|---|
@@ -149,15 +163,25 @@ flowchart LR
   network (port 47801). The PC hosting room 7XP8 answers with its game port, and the
   joiner connects to it over TCP (port 47800).
 - **Messages (TCP).** Each message is `[length][type][data]`: JOIN, INPUT (sequence
-  number + 5 key bits = 6 bytes), START, SET_MAP, PING, ADD_BOT, REMOVE_BOT going to the
-  server; WELCOME, LOBBY, RACE_START, SNAPSHOT, PONG, RACE_OVER coming back.
+  number + 5 key bits = 6 bytes), START, SET_MAP (map and laps), PING, ADD_BOT,
+  REMOVE_BOT, SET_NAME going to the server; WELCOME, LOBBY, RACE_START, SNAPSHOT, PONG,
+  RACE_OVER coming back. Online version 6 (the circuits): cars carry their place on the
+  circuit (s, d, lap, lap start, best lap), traffic its s, and the lobby and race start the
+  number of laps. Version 7 (hills): nothing new is sent, since every computer works out
+  heights from s and d, but the driving changed, so older games can't join. Version 8
+  (jumps): each car's height, vertical speed and time in the air. Version 9: tunnels,
+  bridges and Neon City's raised highway (the track changed). Version 10: shortcuts (which
+  road each car is on). Version 11: the finished circuits (the track changed). Version 12: Sunset Valley and
+  Coastal Highway are sprints (the lap setting does not apply to them). Version 13: crashes
+  (each car's health, wreck and ghost time, where and how fast its wreck began, its wrecks
+  and rams). The race now waits a quarter of the winner's time for the others (20 to 45 s).
 - **CPU racers live on the server.** A CPU seat is a player without a connection. Every
   tick the server asks the same CPU driver used offline (`computeAIInput`) for that car's
   keys, at the seat's level. To everyone else it is just one more car in the snapshots.
 - **Snapshots, not the whole world.** The track, scenery and starting traffic are rebuilt
   identically on every PC from the map, the race type (online = 5 lanes) and a random seed.
-  A snapshot only carries what changes: up to 8 cars, traffic, knocked-over obstacles that moved, nitro cans, and
-  sound/particle events (about 1 KB, 30 times a second).
+  A snapshot only carries what changes: up to 6 cars, traffic, obstacles that moved or
+  were put back, nitro cans, and sound/particle events (about 1.2 KB, 30 times a second).
 - **Client-side prediction (your car).** Your game moves your car the moment you press a
   key, using the same physics as the server, and remembers every input it sent. Each
   snapshot says which input the server processed last. The game resets your car to the
@@ -174,7 +198,8 @@ flowchart LR
   on when they arrived, so a slow frame or a busy network doesn't make the other cars
   stutter.
 
-**Measured** with two game windows on one PC (host + guest + 6 CPU racers, 8 cars):
+**Measured** with two game windows on one PC (host + guest + 6 CPU racers, 8 cars, when
+rooms still held 8):
 
 | | Before the lag fixes | After |
 |---|---|---|
@@ -204,13 +229,15 @@ smoothly than two laptops.
 - **Lag simulator:** start the game with `CAR_RACING_LAG_MS=150` to feel a slow
   internet connection (good for showing prediction in the viva).
 - **Scripted race with measurements:** `CAR_RACING_AUTOSHOT=<folder>` plus
-  `CAR_RACING_NETTEST=host:8:6` in one game and `CAR_RACING_NETTEST=join:CODE` in another
+  `CAR_RACING_NETTEST=host:6:4` in one game and `CAR_RACING_NETTEST=join:CODE` in another
   (the code is written to `<folder>/room.txt`). Each game writes `net_stats.txt`: frame
   times, corrections, gaps between snapshots and, on the host, how the server kept up.
+  `CAR_RACING_NETTEST_NAME=SOME NAME` renames that player in the lobby. Scripted tests
+  never use or change the name saved on the PC.
 - **Bots:** `net_bots 7XP8 3` adds 3 CPU-driven players to room 7XP8.
-  `net_bots NEW@127.0.0.1 8` makes 8 bots create a room, race and print the results
-  (needs `turbo8_server.exe` running). `net_bots NEW@127.0.0.1 4 0 4` is 4 players plus
-  4 CPU racers on map 0.
+  `net_bots NEW@127.0.0.1 6` makes 6 bots create a room, race and print the results
+  (needs `turbo8_server.exe` running). `net_bots NEW@127.0.0.1 4 0 2` is 4 players plus
+  2 CPU racers on map 0; a 5th number sets the laps (bots race 1 lap unless told).
 - **Dedicated server:** open `server/server.pro` in Qt Creator, or run `turbo8_server.exe [port]`.
 
 ## Files
@@ -219,5 +246,5 @@ smoothly than two laptops.
 - `net/raceclient.cpp/.h`: discovery, connection, lobby state, lag simulator
 - `glwidget_online.cpp`: online menu, lobby, results, prediction, interpolation
 - `shared/netsnapshot.cpp`: writing/reading race snapshots
-- `shared/gamesim.cpp`: up to 8 cars, online mode, rank, prediction collisions
+- `shared/gamesim.cpp`: up to 6 cars, online mode, rank, prediction collisions
 - `server/`: dedicated server; `tools/net_bots/`: test bots

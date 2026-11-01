@@ -24,22 +24,25 @@ int main(int argc, char *argv[])
     QTextStream out(stdout);
     if (argc < 2) {
         out << "usage: net_bots CODE[@host[:port]] [count]   - bots join an existing room\n"
-               "       net_bots NEW@host[:port] [count] [map] [cpus] - bot 1 creates a room (and adds\n"
-               "                                              cpus CPU racers), the rest join, the race\n"
-               "                                              runs and the results are printed"
+               "       net_bots NEW@host[:port] [count] [map] [cpus] [laps] - bot 1 creates a room\n"
+               "                                              (and adds cpus CPU racers), the rest join,\n"
+               "                                              the race runs and the results are printed"
             << Qt::endl;
         return 1;
     }
     QString where = argv[1];
     const bool selfHosted = where.toUpper().startsWith("NEW");
-    const int count = std::clamp((argc > 2) ? QString(argv[2]).toInt() : 7, 1, selfHosted ? 8 : 7);
+    const int count = std::clamp((argc > 2) ? QString(argv[2]).toInt() : sim::MAX_RACERS - 1, 1,
+                                 selfHosted ? sim::MAX_RACERS : sim::MAX_RACERS - 1);
     const int map = (argc > 3) ? QString(argv[3]).toInt() : 0;
     const int cpus = (argc > 4) ? QString(argv[4]).toInt() : 0;   // NEW mode: host adds CPU racers first
+    const int laps = (argc > 5) ? QString(argv[5]).toInt() : 1;
     QString hostAddr = "127.0.0.1";
     quint16 hostPort = net::GAME_PORT;
     if (selfHosted && where.contains('@')) {
         QString a = where.mid(where.indexOf('@') + 1);
-        int colon = a.lastIndexOf(':');
+        const bool web = a.startsWith("ws://", Qt::CaseInsensitive) || a.startsWith("wss://", Qt::CaseInsensitive);   // NEW@wss://host/race
+        int colon = web ? -1 : a.lastIndexOf(':');
         if (colon > 0) { hostPort = quint16(a.mid(colon + 1).toUInt()); a = a.left(colon); }
         hostAddr = a;
     }
@@ -57,8 +60,10 @@ int main(int argc, char *argv[])
         QObject::connect(&b->client, &RaceClient::welcomed, [&out, b, i]() {
             out << "bot" << i + 1 << " joined room " << b->client.code << " as slot " << b->client.slot << Qt::endl;
         });
-        QObject::connect(&b->client, &RaceClient::raceStarted, [b, &out, i](int map, int, const QStringList &names, quint32 world) {
+        b->client.autoStory = true;                      // (bots never hold up the story scene)
+        QObject::connect(&b->client, &RaceClient::raceStarted, [b, &out, i](int map, int laps, int, const QStringList &names, quint32 world) {
             b->sim.setMap(map);
+            b->sim.setLaps(laps);
             b->sim.startRace(sim::GameSim::ModeOnline, int(names.size()));
             if (b->sim.worldChecksum() != world)
                 out << "bot" << i + 1 << ": TRACK DIFFERS FROM THE HOST!" << Qt::endl;
@@ -94,7 +99,8 @@ int main(int argc, char *argv[])
             for (int k = 0; k < cpus; ++k) h->client.requestAddCpu();
             for (int i = 1; i < count; ++i) {
                 Bot *b = bots[i].get();
-                QString to = QString("%1@%2:%3").arg(h->client.code, hostAddr).arg(hostPort);
+                const bool web = hostAddr.startsWith("ws", Qt::CaseInsensitive);
+                QString to = web ? h->client.code + "@" + hostAddr : QString("%1@%2:%3").arg(h->client.code, hostAddr).arg(hostPort);
                 QTimer::singleShot(150 * i, [b, to, i]() {
                     b->client.join(to, QString("BOT%1").arg(i + 1), COL[i][0], COL[i][1], COL[i][2]);
                 });
@@ -123,7 +129,8 @@ int main(int argc, char *argv[])
             h->raced = true;
             QCoreApplication::quit();
         });
-        h->client.create(hostAddr, hostPort, "BOT1", COL[0][0], COL[0][1], COL[0][2], map);
+        h->client.token = qEnvironmentVariable("CAR_RACING_BOT_TOKEN");   // (bot 1 logged in: an account session)
+        h->client.create(hostAddr, hostPort, "BOT1", COL[0][0], COL[0][1], COL[0][2], map, laps);
     }
 
     QTimer inputTimer;                                   // send keys at exactly 60 Hz, like the game

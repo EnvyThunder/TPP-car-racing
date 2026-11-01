@@ -1,0 +1,117 @@
+<!doctype html>
+<!-- The browser version's page (docs/browser/README.md). tools/wasm/build_wasm.bat copies it next
+     to car_racing.js / .wasm as index.html. It keeps the game's saved files - profiles, clones,
+     races waiting to upload - in the browser's IndexedDB, so they survive a reload. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, height=device-height, user-scalable=0">
+  <title>TPP Car Racing</title>
+  <style>
+    :root { --bg: #0b1020; --fg: #e8ecf8; --dim: #8a93b0; --accent: #ffcc33; --bar: #1f2a48; }
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+                 font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    #screen { width: 100%; height: 100%; display: none; }
+    #loading { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+               justify-content: center; gap: 14px; padding: 0 16px; text-align: center; }
+    #loading h1 { margin: 0; font-size: clamp(28px, 6vw, 52px); letter-spacing: 0.08em; color: var(--accent); }
+    #loading p { margin: 0; color: var(--dim); font-size: 15px; }
+    #bar { width: min(360px, 80vw); height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; }
+    #bar div { width: 30%; height: 100%; background: var(--accent); animation: slide 1.2s ease-in-out infinite; }
+    @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+    #status.error { color: #ff7a7a; }
+  </style>
+</head>
+<body>
+  <div id="loading">
+    <h1>TPP CAR RACING</h1>
+    <div id="bar"><div></div></div>
+    <p id="status">Loading the game (about 10 MB)...</p>
+    <p>Keyboard: arrows to drive, Enter for nitro. Click the game once to turn the sound on.</p>
+    <noscript><p>The game needs JavaScript.</p></noscript>
+  </div>
+  <div id="screen"></div>
+
+  <script>
+    // ---- Saved files: /home/web_user (Qt's app data folder is inside it) lives in IndexedDB ----
+    const SAVE_DIR = '/home/web_user';
+    let saving = false, saveAgain = false, fsRef = null;
+    function saveFiles() {                     // write what changed back to IndexedDB
+      if (!fsRef) return;
+      if (saving) { saveAgain = true; return; }
+      saving = true;
+      fsRef.syncfs(false, () => {
+        saving = false;
+        if (saveAgain) { saveAgain = false; saveFiles(); }
+      });
+    }
+    // (between the module being ready and Qt calling main(): the game starts once its saves are in)
+    function mountSaves(instance) {
+      return new Promise((resolve) => {
+        const FS = instance.FS;
+        try { FS.mkdirTree(SAVE_DIR); } catch (e) {}
+        try {
+          FS.mount(FS.filesystems.IDBFS, {}, SAVE_DIR);
+        } catch (e) {                          // (no IndexedDB, e.g. some private windows: play without saving)
+          console.warn('saves stay in memory:', e);
+          resolve();
+          return;
+        }
+        FS.syncfs(true, (err) => {
+          if (err) console.warn('could not load saves:', err);
+          fsRef = FS;
+          setInterval(saveFiles, 3000);
+          resolve();
+        });
+      });
+    }
+    addEventListener('pagehide', saveFiles);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) saveFiles(); });
+
+    // ---- Page zoom or a move to another screen changes the pixel ratio: Qt re-measures on a resize ----
+    (function watchRatio() {
+      const mq = matchMedia(`(resolution: ${devicePixelRatio}dppx)`);
+      mq.addEventListener('change', () => { dispatchEvent(new Event('resize')); watchRatio(); }, { once: true });
+    })();
+
+    // ---- Keys the game uses must not scroll the page or trigger the browser ----
+    addEventListener('keydown', (e) => {
+      if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Tab', 'Backspace'].includes(e.key)
+          && !(e.target instanceof HTMLInputElement)) e.preventDefault();
+    }, { passive: false });
+
+    async function start() {
+      const loading = document.querySelector('#loading');
+      const screen = document.querySelector('#screen');
+      const status = document.querySelector('#status');
+      try {
+        await qtLoad({
+          qt: {
+            onLoaded: () => { loading.style.display = 'none'; screen.style.display = 'block'; },
+            onExit: (exit) => {
+              saveFiles();
+              screen.style.display = 'none';
+              loading.style.display = 'flex';
+              status.textContent = 'The game stopped' + (exit.text ? ': ' + exit.text : '') + '. Reload the page to play again.';
+              status.className = 'error';
+            },
+            entryFunction: async (config) => {
+              const instance = await window.car_racing_entry(config);
+              await mountSaves(instance);
+              return instance;
+            },
+            containerElements: [screen],
+          },
+        });
+      } catch (e) {
+        console.error(e);
+        status.textContent = 'The game could not start in this browser (' + e.message + '). Try a recent Chrome, Edge or Firefox.';
+        status.className = 'error';
+      }
+    }
+    addEventListener('load', start);
+  </script>
+  <script src="car_racing.js"></script>
+  <script src="qtloader.js"></script>
+</body>
+</html>

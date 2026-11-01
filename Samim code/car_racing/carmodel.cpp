@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include "gl1redirect.h"   // (the drawing goes through gl1shim: OpenGL ES 2 / WebGL)
 
 namespace carmodel {
 namespace {

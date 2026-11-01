@@ -9,13 +9,28 @@ TEMPLATE = app
 INCLUDEPATH += ../shared ../net
 
 SOURCES += \
+    ../net/link.cpp \
     main.cpp \
     ../net/raceserver.cpp \
     ../shared/gamesim.cpp \
+    ../shared/playermodel.cpp \
+    ../shared/aidriver.cpp \
+    ../shared/brain.cpp \
+    ../shared/clone.cpp \
+    ../shared/director.cpp \
+    ../shared/roster.cpp \
+    ../shared/track.cpp \
+    ../shared/circuits.cpp \
     ../shared/netsnapshot.cpp
 
 HEADERS += \
+    ../net/link.h \
     ../net/raceserver.h \
     ../net/protocol.h \
     ../shared/gamesim.h \
+    ../shared/playermodel.h \
+    ../shared/aidriver.h \
+    ../shared/brain.h \
+    ../shared/clone.h \
+    ../shared/track.h \
     ../shared/simtypes.h

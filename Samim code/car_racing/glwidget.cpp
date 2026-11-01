@@ -1,4 +1,8 @@
 #include "glwidget.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/html5.h>
+#endif
+QString profilePath(const std::string &name);   // (glwidget_profile.cpp)
 #include "pixelfont.h"
 #include "audioengine.h"
 #include "carmodel.h"
@@ -22,6 +26,8 @@
 #include <QMouseEvent>
 #include <QDebug>
 #include <QDir>
+#include <QStandardPaths>
+#include <QSettings>
 #include <QFileInfo>
 #include <QDateTime>
 #include <QCoreApplication>
@@ -29,6 +35,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include "gl1redirect.h"   // (the drawing goes through gl1shim: OpenGL ES 2 / WebGL)
 
 // ===========================================================================
 //  CONSTANTS
@@ -36,12 +43,10 @@
 namespace {
 
 const float PI          = 3.14159265f;
-const float TRACK_LEN   = 4000.0f;            // finish line distance
 const float MAX_SPEED   = 1.10f;
 const float NITRO_SPEED = 1.65f;
 const float OFFROAD_MAX = 0.45f;
 const float VIEW_DIST   = 340.0f;             // draw distance (fog end)
-const float TEMPLE_DIST = 400.0f;             // temple "backdrop" distance
 
 // Sunset palette
 const float SKY_TOP[3] = {0.20f, 0.22f, 0.45f};
@@ -242,28 +247,75 @@ struct MenuItem {
     bool isOrange;
 };
 
-static const MenuItem MENU_ITEMS[7] = {
+// the menu's items, top to bottom
+// (the story is no menu item: it plays inside every mode, before each race)
+// (no LAPS item: every circuit race is 2 laps)
+enum MenuIdx { M_VSCPU, M_SPLIT, M_ONLINE, M_CAR, M_MAP, M_CPUS, M_PROFILE, M_TAUNTS, M_CLONE, M_BOARD };
+static const MenuItem MENU_ITEMS[10] = {
     {"PLAY VS CPU",            true},
     {"SPLIT SCREEN (2P)",       false},
-    {"ONLINE MULTIPLAYER (8P)", true},
+    {"ONLINE MULTIPLAYER (6P)", true},
     {"CHOOSE CAR",              false},
-    {"CHOOSE MAP",              false},
-    {"LOBBY & PROFILE",         true},
-    {"CPU DIFFICULTY",          false}
+    {"CHOOSE MAP",              true},
+    {"CPU RACERS",              false},    // title shows the count (drawMainMenu)
+    {"MY PROFILE",              true},     // (the CPUs adapt to it: no difficulty to choose)
+    {"TAUNTS",                  false},    // title shows ON / OFF (drawMainMenu)
+    {"YOUR CLONE",              true},     // title shows ON / OFF and how well it copies you
+    {"LEADERBOARD",             false}     // the best laps from every player's account
 };
-static const int NUM_MENU_ITEMS = 7;
+static const int NUM_MENU_ITEMS = 10;
 
 } // namespace
+
+// How each map builds its tunnels and bridges (milestone 1d)
+struct StructureLook {
+    float tunnelH;        // ceiling above the road
+    float hill;           // ground over a tunnel, above the road
+    float depth;          // valley under a bridge, below the deck
+    float darkness;       // how much darker it is deep in a tunnel
+    int   water;          // under a bridge: 0 none, 1 a river 5 m below the deck, 2 the sea
+    bool  oneSided;       // an avalanche gallery: open (columns) on the valley side
+    float wall[3], parapet[3], deck[3];
+};
+
+const StructureLook &structureLook(sim::MapTheme t)
+{
+    static const StructureLook LOOKS[5] = {
+        // Sunset Valley: a wooden bridge over a river
+        {6.5f, 12.0f, 6.0f, 0.55f, 1, false, {0.62f, 0.58f, 0.52f}, {0.48f, 0.32f, 0.18f}, {0.55f, 0.52f, 0.48f}},
+        // Canyon Run: a tunnel through a sandstone mesa
+        {6.5f, 15.0f, 6.0f, 0.55f, 0, false, {0.74f, 0.50f, 0.34f}, {0.62f, 0.46f, 0.32f}, {0.60f, 0.52f, 0.44f}},
+        // Alpine Pass: an avalanche gallery, a stone bridge over a gorge
+        {6.5f, 22.0f, 25.0f, 0.30f, 0, true, {0.70f, 0.70f, 0.72f}, {0.60f, 0.60f, 0.62f}, {0.62f, 0.62f, 0.64f}},
+        // Neon City: a street tunnel with its roof at street level, the raised highway
+        {4.5f, 4.75f, 0.0f, 0.35f, 0, false, {0.50f, 0.52f, 0.56f}, {0.55f, 0.57f, 0.62f}, {0.52f, 0.54f, 0.58f}},
+        // Coastal Highway: a tunnel under the headland, a steel bridge over the harbour
+        {6.5f, 14.0f, 6.0f, 0.55f, 2, false, {0.66f, 0.64f, 0.60f}, {0.42f, 0.50f, 0.60f}, {0.56f, 0.58f, 0.62f}},
+    };
+    return LOOKS[int(t)];
+}
 
 // ===========================================================================
 //  CONSTRUCTION
 // ===========================================================================
-GLWidget::GLWidget(QWidget *parent)
+#ifdef __EMSCRIPTEN__
+GLWidget::GLWidget(GLParent *parent)
+    : QOpenGLWindow(QOpenGLWindow::NoPartialUpdate, parent), rng(std::random_device{}())
+{
+#else
+GLWidget::GLWidget(GLParent *parent)
     : QOpenGLWidget(parent), rng(std::random_device{}())
 {
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
+#endif
+    tauntsOn = QSettings("TPP", "CarRacing").value("taunts", true).toBool();   // (the TAUNTS menu item)
+    cloneOn = QSettings("TPP", "CarRacing").value("clone", true).toBool();     // (the YOUR CLONE menu item)
+    accountLoad();                                       // (logged in? then the profile and clone are your account's)
+    cloneLoad();
+#ifndef __EMSCRIPTEN__
     setMinimumSize(800, 450);
+#endif
     audio = new AudioEngine(this);
     simEngine.setState(State::Menu);
     menuSelection = 0;
@@ -290,6 +342,7 @@ GLWidget::GLWidget(QWidget *parent)
 
 GLWidget::~GLWidget()
 {
+    if (cloneThread.joinable()) cloneThread.join();      // (a clone still training: let it finish)
     // shut the network down while this widget is still whole (no signals into a dying widget)
     if (net) { net->disconnect(this); delete net; net = nullptr; }
     delete hostServer;
@@ -313,16 +366,24 @@ float GLWidget::rnd(float a, float b)
 }
 
 
-// Menu pickers: 3 = car, 4 = map, 6 = CPU difficulty. Returns false for other items.
+// Menu pickers: 3 = car, 4 = map, 5 = number of CPU racers, 6 = CPU difficulty.
+// Returns false for other items.
 bool GLWidget::cycleMenuOption(int item, int dir)
 {
-    if (item == 3) {
+    if (item == M_CPUS) {
+        const int most = sim::MAX_RACERS - 1;
+        cpuCount = 1 + (cpuCount - 1 + dir + most) % most;
+    } else if (item == M_TAUNTS) {
+        tauntsOn = !tauntsOn;
+        QSettings("TPP", "CarRacing").setValue("taunts", tauntsOn);
+    } else if (item == M_CLONE) {
+        cloneOn = !cloneOn;
+        QSettings("TPP", "CarRacing").setValue("clone", cloneOn);
+    } else if (item == M_CAR) {
         selectedCarPreset = (selectedCarPreset + dir + NUM_CAR_PRESETS) % NUM_CAR_PRESETS;
-    } else if (item == 4) {
+    } else if (item == M_MAP) {
         selectedMapPreset = (selectedMapPreset + dir + sim::NUM_MAPS) % sim::NUM_MAPS;
         simEngine.setMap(selectedMapPreset);
-    } else if (item == 6) {
-        simEngine.setAiDifficulty((simEngine.getAiDifficulty() + dir + 3) % 3);
     } else {
         return false;
     }
@@ -332,17 +393,70 @@ bool GLWidget::cycleMenuOption(int item, int dir)
 void GLWidget::startRace(GameMode mode)
 {
     simEngine.setMap(selectedMapPreset);
-    simEngine.startRace(mode);
-    if (!simEngine.getCars().empty()) {
-        simEngine.getCars()[0].r = CAR_PRESETS[selectedCarPreset].r;
-        simEngine.getCars()[0].g = CAR_PRESETS[selectedCarPreset].g;
-        simEngine.getCars()[0].b = CAR_PRESETS[selectedCarPreset].b;
+    // the CPUs: new personalities and choices every race, their skill spread around yours
+    simEngine.setAiSeed(uint32_t(rng()));
+    simEngine.setCpuSkill(cpuSkillFor(loadProfile(profileName(0))));
+    // what the race director knows of you (and of player 2 in split screen)
+    simEngine.clearPlayerHints();
+    simEngine.setPlayerHints(0, hintsFor(loadProfile(profileName(0)), selectedMapPreset));
+    if (mode == sim::GameSim::ModeSplitScreen) simEngine.setPlayerHints(1, hintsFor(loadProfile(profileName(1)), selectedMapPreset));
+    simEngine.startRace(mode, mode == sim::GameSim::ModeSingle ? 1 + cpuCount : 2);
+    auto &cars = simEngine.getCars();
+    if (!cars.empty()) {
+        cars[0].r = CAR_PRESETS[selectedCarPreset].r;
+        cars[0].g = CAR_PRESETS[selectedCarPreset].g;
+        cars[0].b = CAR_PRESETS[selectedCarPreset].b;
+    }
+    if (mode == sim::GameSim::ModeSingle) {
+        // Every CPU is the CPU driver with its own mind (personality, mood, skill around yours:
+        // shared/aidriver.cpp), on the wide road, whether there is 1 CPU or 5. Every CPU gets a
+        // colour that doesn't look like yours or another CPU's.
+        static const float PALETTE[8][3] = {
+            {0.15f, 0.42f, 0.98f}, {1.00f, 0.75f, 0.10f}, {0.20f, 0.85f, 0.35f}, {0.85f, 0.30f, 0.95f},
+            {0.10f, 0.85f, 0.90f}, {0.95f, 0.50f, 0.15f}, {0.92f, 0.92f, 0.95f}, {0.92f, 0.14f, 0.16f}};
+        std::vector<int> used;
+        for (size_t i = 1; i < cars.size(); ++i) {
+            cars[i].aiLevel = 1;                         // (a CPU)
+            for (int k = 0; k < 8; ++k) {
+                const float *c = PALETTE[k];
+                const bool likeMine = std::fabs(c[0] - cars[0].r) + std::fabs(c[1] - cars[0].g) + std::fabs(c[2] - cars[0].b) < 0.45f;
+                if (likeMine || std::find(used.begin(), used.end(), k) != used.end()) continue;
+                cars[i].r = c[0]; cars[i].g = c[1]; cars[i].b = c[2];
+                used.push_back(k);
+                break;
+            }
+        }
     }
     view1 = CarView();
     view2 = CarView();
     for (CarFx &f : carFx) f = CarFx();
     skidMarks.clear();
+    popups.clear();
+    for (auto &q : carMsgs) q.clear();
+    feed.clear();
+    // vs CPU: the CPUs are named drivers from the roster (shared/roster.cpp), each different
+    if (mode == sim::GameSim::ModeSingle) {
+        int order[sim::ROSTER_SIZE];
+        for (int k = 0; k < sim::ROSTER_SIZE; ++k) order[k] = k;
+        for (int k = sim::ROSTER_SIZE - 1; k > 0; --k) std::swap(order[k], order[int(rng() % unsigned(k + 1))]);
+        for (size_t i = 1; i < cars.size(); ++i) {
+            const sim::RosterDriver &R = sim::rosterDriver(order[(i - 1) % sim::ROSTER_SIZE]);
+            cars[i].rosterId = order[(i - 1) % sim::ROSTER_SIZE];
+            cars[i].aiPersona = R.persona;
+            cars[i].r = R.car[0]; cars[i].g = R.car[1]; cars[i].b = R.car[2];
+        }
+    }
+    rivalSummary.clear();
+    tauntUntil = -1;
+    if (story != StoryScreen::Off) storyDressCars();
+    else {
+        nameOverride.assign(cars.size(), QByteArray());
+        for (size_t i = 0; i < cars.size(); ++i)
+            if (cars[i].rosterId >= 0) nameOverride[i] = sim::rosterDriver(cars[i].rosterId).name;
+    }
+    cloneSetupRace(mode);                               // your clone in the race, and recording you
     for (float &t : nitroBannerTimer) t = 0.0f;
+    profileSaved = false;
     elapsedTimer.restart();
 }
 
@@ -355,10 +469,11 @@ void GLWidget::spawnParticle(Particle::Type t, float x, float y, float z,
                              float r, float g, float b, float a,
                              float size, float life, float decay)
 {
-    if (particles.size() > 300) return;
+    if (particles.size() > 700) return;
     Particle p;
     p.type = t;
     p.x = x; p.y = y; p.z = z;
+    p.floor = y - 0.45f;                                 // effects start about 0.45 m above the road
     p.vx = vx; p.vy = vy; p.vz = vz;
     p.r = r; p.g = g; p.b = b; p.a = a;
     p.size = size; p.life = life; p.decay = decay;
@@ -404,7 +519,7 @@ void GLWidget::updateParticles(float dt)
         p.z += p.vz * dt * 60.0f;
         if (p.type == Particle::Spark) {
             p.vy -= 0.012f * dt * 60.0f;
-            if (p.y < 0.05f) { p.y = 0.05f; p.vy = -p.vy * 0.4f; p.vx *= 0.6f; p.vz *= 0.6f; }
+            if (p.y < p.floor + 0.05f) { p.y = p.floor + 0.05f; p.vy = -p.vy * 0.4f; p.vx *= 0.6f; p.vz *= 0.6f; }
         } else if (p.type == Particle::Smoke || p.type == Particle::Dust) {
             p.size += 1.1f * dt;   // puffs billow outwards as they age
             p.a = p.life * 0.6f;
@@ -487,16 +602,38 @@ void GLWidget::updateCarFx(int idx, const sim::Car &c)
         if (mark && fx.marking) {
             float dx = wx - fx.lastX[w], dz = wz - fx.lastZ[w];
             if (dx * dx + dz * dz < 0.25f) continue;          // wait for 0.5 m of travel
-            skidMarks.push_back({fx.lastX[w], fx.lastZ[w], wx, wz, c.isDrifting ? 0.60f : 0.45f});
         }
+        const float wy = mark ? simEngine.heightNear(wx, wz, c.s, c.path) : c.y;
+        if (mark && fx.marking)
+            skidMarks.push_back({fx.lastX[w], fx.lastZ[w], wx, wz, c.isDrifting ? 0.60f : 0.45f, fx.lastY[w], wy});
         fx.lastX[w] = wx;
         fx.lastZ[w] = wz;
+        fx.lastY[w] = wy;
     }
     fx.marking = mark;
     if (skidMarks.size() > 1600) skidMarks.erase(skidMarks.begin(), skidMarks.begin() + 200);
+
+    // a wreck burns and smokes; a badly damaged car smokes from the bonnet
+    const int tk = simEngine.getTick();
+    if (c.wreck > 0) {
+        if ((tk + idx) % 2 == 0)
+            spawnParticle(Particle::Smoke, c.x + rnd(-0.6f, 0.6f), c.y + 0.9f, c.z + rnd(-0.6f, 0.6f),
+                          rnd(-0.02f, 0.02f), rnd(0.04f, 0.08f), rnd(-0.02f, 0.02f),
+                          0.18f, 0.18f, 0.20f, 0.7f, rnd(0.5f, 0.9f), 1.0f, 0.9f);
+        if (c.wreck < 90 && (tk + idx) % 3 == 0)
+            spawnParticle(Particle::Flame, c.x + rnd(-0.5f, 0.5f), c.y + 0.7f, c.z + rnd(-0.5f, 0.5f),
+                          rnd(-0.02f, 0.02f), rnd(0.03f, 0.07f), rnd(-0.02f, 0.02f),
+                          1.0f, rnd(0.45f, 0.75f), 0.15f, 1.0f, rnd(0.35f, 0.6f), 1.0f, 4.0f);
+    } else if (c.health < 40.0f && (tk + idx) % (c.health < 20.0f ? 2 : 4) == 0) {
+        const float hx = c.x + fx0 * 1.7f, hz = c.z + fz0 * 1.7f;
+        const float grey = c.health < 20.0f ? 0.15f : 0.55f;
+        spawnParticle(Particle::Smoke, hx + rnd(-0.3f, 0.3f), c.y + 0.85f, hz + rnd(-0.3f, 0.3f),
+                      -fx0 * 0.05f + rnd(-0.01f, 0.01f), rnd(0.03f, 0.06f), -fz0 * 0.05f + rnd(-0.01f, 0.01f),
+                      grey, grey, grey + 0.03f, 0.55f, rnd(0.25f, 0.45f), 1.0f, 1.6f);
+    }
 }
 
-void GLWidget::drawSkidMarks(float camZ)
+void GLWidget::drawSkidMarks()
 {
     if (skidMarks.empty()) return;
     glDisable(GL_LIGHTING);
@@ -504,13 +641,13 @@ void GLWidget::drawSkidMarks(float camZ)
     glDepthMask(GL_FALSE);
     glBegin(GL_QUADS);
     for (const SkidMark &m : skidMarks) {
-        if (m.z0 > camZ + 30.0f || m.z0 < camZ - VIEW_DIST) continue;
+        if (!inView(m.x0, m.z0)) continue;
         float dx = m.x1 - m.x0, dz = m.z1 - m.z0, l = std::sqrt(dx * dx + dz * dz);
         if (l < 1e-4f) continue;
         float nx = -dz / l * 0.13f, nz = dx / l * 0.13f;     // half tyre width
         glColor4f(0.04f, 0.04f, 0.045f, m.alpha);
-        glVertex3f(m.x0 - nx, 0.035f, m.z0 - nz); glVertex3f(m.x0 + nx, 0.035f, m.z0 + nz);
-        glVertex3f(m.x1 + nx, 0.035f, m.z1 + nz); glVertex3f(m.x1 - nx, 0.035f, m.z1 - nz);
+        glVertex3f(m.x0 - nx, m.y0 + 0.035f, m.z0 - nz); glVertex3f(m.x0 + nx, m.y0 + 0.035f, m.z0 + nz);
+        glVertex3f(m.x1 + nx, m.y1 + 0.035f, m.z1 + nz); glVertex3f(m.x1 - nx, m.y1 + 0.035f, m.z1 - nz);
     }
     glEnd();
     glDepthMask(GL_TRUE);
@@ -582,6 +719,157 @@ void GLWidget::processSimEvents(const std::vector<sim::SimEvent> &events)
                 nitroBannerTimer[ev.carIndex] = 2.4f;
             }
             break;
+        case sim::SimEvent::DirtDust:
+            spawnParticle(Particle::Smoke, ev.x + rnd(-0.6f, 0.6f), ev.y, ev.z + rnd(-0.6f, 0.6f),
+                          rnd(-0.03f, 0.03f), rnd(0.01f, 0.03f), rnd(-0.03f, 0.03f),
+                          0.62f, 0.52f, 0.38f, 0.45f, rnd(0.6f, 1.0f), 1.0f, 1.3f);
+            break;
+        case sim::SimEvent::Damage: {
+            const int i = ev.carIndex, o = ev.count;
+            if (i < 0 || i >= sim::MAX_RACERS || ev.intensity < 1.5f) break;
+            const int amount = int(std::lround(ev.intensity));
+            DamagePopup p;
+            p.car = i; p.amount = amount; p.fault = ev.highPitch; p.born = simEngine.getTick();
+            popups.push_back(p);
+            if (!isLocalCar(i) || (ev.intensity < 2.5f && o != sim::SimEvent::ByBoost)) break;
+            if (o == sim::SimEvent::ByLanding && stuntTick[i] == simEngine.getTick()) break;   // (said with the landing)
+            QByteArray txt;
+            float r = 1.0f, g = 0.86f, b = 0.30f;                // yellow: it happened to you
+            if (o >= 0) {
+                if (ev.highPitch) { txt = "YOU RAMMED " + carName(o); r = 1.0f; g = 0.35f; b = 0.25f; }
+                else              txt = carName(o) + " HIT YOU";
+            } else if (o == sim::SimEvent::ByTraffic) {
+                txt = ev.highPitch ? "YOU HIT TRAFFIC" : "TRAFFIC HIT YOU";
+                if (ev.highPitch) { r = 1.0f; g = 0.35f; b = 0.25f; }
+            } else if (o == sim::SimEvent::ByBarrier) {
+                txt = "HIT A BARRIER"; r = 1.0f; g = 0.35f; b = 0.25f;
+            } else if (o == sim::SimEvent::ByRail) {
+                txt = "SCRAPED THE RAIL";
+            } else if (o == sim::SimEvent::ByLanding) {
+                txt = ev.intensity >= 12.0f ? "BAD LANDING" : "LANDING";
+                if (ev.intensity >= 12.0f) { r = 1.0f; g = 0.35f; b = 0.25f; }
+            } else if (o == sim::SimEvent::ByWater) {
+                txt = "INTO THE RIVER"; r = 1.0f; g = 0.35f; b = 0.25f;
+            } else if (o == sim::SimEvent::ByOffroad) {
+                txt = "FLEW OFF THE ROAD"; r = 1.0f; g = 0.35f; b = 0.25f;
+            } else if (o == sim::SimEvent::ByBoost) {
+                txt = "ENGINE BURNT OUT - TOO MUCH BOOST"; r = 1.0f; g = 0.35f; b = 0.25f;
+            } else if (o == sim::SimEvent::ByRampSide) {
+                txt = "HIT THE RAMP'S SIDE"; r = 1.0f; g = 0.35f; b = 0.25f;
+            } else {
+                txt = "HIT A BARREL";
+            }
+            pushMsg(carMsgs[i], txt + "  -" + QByteArray::number(amount), r, g, b, 100);
+            if (i == localCar()) view1.shake = std::max(view1.shake, std::min(1.0f, ev.intensity / 40.0f));
+            else if (i == 1 && !isOnline()) view2.shake = std::max(view2.shake, std::min(1.0f, ev.intensity / 40.0f));
+            break;
+        }
+        case sim::SimEvent::Wrecked: {
+            if (audio) { audio->playCrash(1.0f); audio->playCrash(0.9f); }
+            spawnSparks(ev.x, ev.y, ev.z, 30);
+            for (int k = 0; k < 24; ++k)                         // a burst of smoke and fire
+                spawnParticle(k % 3 ? Particle::Smoke : Particle::Flame, ev.x + rnd(-1.2f, 1.2f), ev.y + rnd(0.0f, 0.8f),
+                              ev.z + rnd(-1.2f, 1.2f), rnd(-0.06f, 0.06f), rnd(0.03f, 0.12f), rnd(-0.06f, 0.06f),
+                              k % 3 ? 0.30f : 1.0f, k % 3 ? 0.30f : 0.55f, k % 3 ? 0.32f : 0.15f, 0.8f,
+                              rnd(0.5f, 1.1f), 1.0f, rnd(0.8f, 1.4f));
+            const int i = ev.carIndex;
+            if (i < 0 || i >= sim::MAX_RACERS) break;
+            QByteArray line = carName(i) + (isLocalCar(i) && carName(i) == "YOU" ? " WERE WRECKED" : " WRECKED");
+            if (ev.count >= 0) line += " BY " + carName(ev.count);
+            pushMsg(feed, line, isLocalCar(i) ? 1.0f : 0.95f, isLocalCar(i) ? 0.40f : 0.75f, isLocalCar(i) ? 0.30f : 0.40f, 300);
+            if (i == localCar()) view1.shake = 1.0f;
+            else if (i == 1 && !isOnline()) view2.shake = 1.0f;
+            break;
+        }
+        case sim::SimEvent::Respawn: {
+            for (int k = 0; k < 16; ++k) {                       // a ring of sparkles round the car
+                const float a = float(k) * PI / 8.0f;
+                spawnParticle(Particle::Spark, ev.x + std::cos(a) * 1.6f, ev.y + 0.4f, ev.z + std::sin(a) * 1.6f,
+                              std::cos(a) * 0.03f, rnd(0.05f, 0.12f), std::sin(a) * 0.03f,
+                              0.4f, 1.0f, 0.6f, 1.0f, rnd(0.15f, 0.25f), 1.0f, 2.0f);
+            }
+            if (ev.carIndex >= 0 && ev.carIndex < sim::MAX_RACERS && isLocalCar(ev.carIndex))
+                pushMsg(carMsgs[ev.carIndex], "BACK IN THE RACE!", 0.40f, 1.0f, 0.55f, 90);
+            break;
+        }
+        case sim::SimEvent::Stunt: {
+            // how a jump was landed (side ramps): a word for it over your car, a nitro refill
+            // for a clean barrel roll
+            const int i = ev.carIndex;
+            if (i < 0 || i >= sim::MAX_RACERS || !isLocalCar(i)) break;
+            static const char *WORD[5] = {"PERFECT LANDING", "BARREL ROLL! NITRO FULL", "SPIN SAVED", "ROUGH LANDING", "CRASH LANDING!"};
+            static const float COL[5][3] = {{0.35f, 1.0f, 0.55f}, {0.35f, 0.95f, 1.0f}, {0.35f, 1.0f, 0.55f},
+                                            {1.0f, 0.75f, 0.25f}, {1.0f, 0.30f, 0.25f}};
+            const int k = std::clamp(ev.count, 0, 4);
+            QByteArray w = WORD[k];
+            if (ev.intensity >= 1.5f) w += "  -" + QByteArray::number(int(std::lround(ev.intensity)));
+            pushMsg(carMsgs[i], w, COL[k][0], COL[k][1], COL[k][2], 110);
+            stuntTick[i] = simEngine.getTick();          // (its damage line is this one)
+            if (k <= 2) ++statLandings;
+            break;
+        }
+        case sim::SimEvent::Splash: {
+            // came down off the road: a fountain of water, or a cloud of earth
+            if (audio) audio->playCrash(0.7f);
+            const bool water = ev.count == 0;
+            for (int k = 0; k < 40; ++k)
+                spawnParticle(Particle::Smoke, ev.x + rnd(-2.0f, 2.0f), ev.y + rnd(0.0f, 0.6f), ev.z + rnd(-2.0f, 2.0f),
+                              rnd(-0.08f, 0.08f), rnd(0.10f, 0.32f), rnd(-0.08f, 0.08f),
+                              water ? 0.75f : 0.55f, water ? 0.88f : 0.45f, water ? 1.0f : 0.32f, 0.85f,
+                              rnd(0.6f, 1.3f), 1.0f, rnd(1.0f, 1.8f));
+            if (ev.carIndex >= 0 && ev.carIndex < sim::MAX_RACERS)
+                pushMsg(feed, carName(ev.carIndex) + (water ? " FELL IN THE RIVER" : ev.count == 2 ? " FELL INTO THE GORGE" : " FLEW OFF THE ROAD"),
+                        0.55f, 0.85f, 1.0f, 240);
+            break;
+        }
+        case sim::SimEvent::Bounty: {
+            const int i = ev.carIndex, v = ev.count;
+            if (i < 0 || i >= sim::MAX_RACERS || v < 0 || v >= sim::MAX_RACERS) break;
+            pushMsg(feed, carName(i) + (carName(i) == "YOU" ? " GOT A BOUNTY +15 FOR " : " BOUNTY +15 FOR ") + carName(v), 1.0f, 0.85f, 0.25f, 240);
+            if (isLocalCar(i)) pushMsg(carMsgs[i], "BOUNTY! +15 HP (MOST DAMAGE TO " + carName(v) + ")", 1.0f, 0.85f, 0.25f, 150);
+            if (audio) audio->playNitroPickup();
+            break;
+        }
+        case sim::SimEvent::Eliminated: {
+            const int i = ev.carIndex;
+            if (i < 0 || i >= sim::MAX_RACERS) break;
+            pushMsg(feed, carName(i) + (carName(i) == "YOU" ? " WERE ELIMINATED" : " ELIMINATED"), 1.0f, 0.30f, 0.25f, 400);
+            break;
+        }
+        case sim::SimEvent::Taunt: {
+            // a named driver says something to a person - shown to that person only
+            const int sp = ev.carIndex, target = int(ev.vx);
+            if (!tauntsOn || sp < 0 || sp >= int(simEngine.getCars().size()) || !isLocalCar(target)) break;
+            const sim::Car &c = simEngine.getCars()[size_t(sp)];
+            if (c.rosterId < 0 && !c.aiClone) break;
+            tauntText = carName(sp) + ": " + (c.aiClone ? sim::cloneTauntLine(ev.count, int(ev.intensity))
+                                                       : sim::tauntLine(c.rosterId, ev.count, int(ev.intensity)));
+            tauntCol[0] = c.r; tauntCol[1] = c.g; tauntCol[2] = c.b;
+            tauntUntil = simEngine.getTick() + 180;
+            pushMsg(feed, tauntText, 0.85f, 0.88f, 0.95f, 240);
+            break;
+        }
+        case sim::SimEvent::Boost:
+            if (ev.carIndex >= 0 && ev.carIndex < sim::MAX_RACERS && isLocalCar(ev.carIndex) && audio) audio->playNitroPickup();
+            break;
+        case sim::SimEvent::Landing: {
+            // a jump ends: dust, a shake as hard as the landing, "BIG AIR" after a long flight
+            const float hard = std::clamp((ev.intensity - 6.0f) / 14.0f, 0.0f, 1.0f);
+            if (ev.carIndex == localCar()) {
+                view1.shake = std::max(view1.shake, hard * 0.8f);
+                ++statLandings;
+            }
+            else if (ev.carIndex == 1 && !isOnline()) view2.shake = std::max(view2.shake, hard * 0.8f);
+            for (int k = 0; k < 6 + int(hard * 14.0f); ++k)
+                spawnParticle(Particle::Smoke, ev.x + rnd(-1.4f, 1.4f), ev.y + 0.3f, ev.z + rnd(-1.4f, 1.4f),
+                              rnd(-0.04f, 0.04f), rnd(0.01f, 0.04f), rnd(-0.04f, 0.04f),
+                              0.62f, 0.57f, 0.50f, 0.55f, rnd(0.7f, 1.2f), 1.0f, 1.1f);
+            if (ev.carIndex >= 0 && ev.carIndex < sim::MAX_RACERS && ev.count >= 30) {
+                carFx[ev.carIndex].bigAir = float(ev.count) / 60.0f;
+                carFx[ev.carIndex].bigAirUntil = simEngine.getTick() + 100;
+            }
+            break;
+        }
         }
     }
 }
@@ -608,28 +896,508 @@ void GLWidget::runAutoShot()
     const int f = ++autoShotFrame;
     auto shot = [&](const QString &name) { saveScreenshot(autoShotDir + "/" + name + ".png"); };
 
-    if (f == 40)  { menuSelection = 4; cycleMenuOption(4, 1); }      // highlight the map picker
-    if (f == 90)  shot("01_menu_map_picker");
-    if (f == 95)  cycleMenuOption(4, -1);
+    // CAR_RACING_AUTOSHOT_STORY: the menu, every line of the prologue (with its live crash)
+    // and of chapter 1's scene, its rules card, then the start of the vs CPU race
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_STORY")) {
+        static int next = 60, n = 0;
+        if (f == 40) shot("story_00_menu");               // (no STORY MODE item: it is inside every mode)
+        if (f == 56) { cpuCount = 5; storyMode = sim::GameSim::ModeSingle; storyBeginScene(0, 0); next = f + 100; }
+        if (f >= next && story == StoryScreen::Scene && storyRules == 1) {   // the rules card before the race
+            shot(QString("story_%1_ch%2_rules").arg(++n, 2, 10, QChar('0')).arg(storyChapter));
+            storyRules = 2;
+            storyEndScene();
+            next = f + 30;
+        } else if (f >= next && story == StoryScreen::Scene) {
+            shot(QString("story_%1_ch%2_line%3").arg(++n, 2, 10, QChar('0')).arg(storyChapter).arg(storyLine));
+            storyNextLine();                             // (shows the whole line)
+            storyNextLine();                             // the next line
+            const bool live = storyChapter == 0 && storyLine == 3;
+            next = f + (live ? 160 : 100);
+            if (live) n += 0;
+        }
+        if (story == StoryScreen::Scene && storyChapter == 0 && storyLine == 3 && f == next - 60)
+            shot(QString("story_%1_ch0_live_crash").arg(++n, 2, 10, QChar('0')));
+        if (story == StoryScreen::Race && f >= next) {
+            static int raceAt = -1;
+            if (raceAt < 0) raceAt = f;
+            if (f == raceAt + 150) shot("story_90_race_goal");
+            if (f == raceAt + 160) QCoreApplication::quit();
+        }
+        if (f > 60 * 90) QCoreApplication::quit();
+        return;
+    }
 
-    // one race per map: countdown (3 s), then ~3 s of flat-out driving, then a screenshot
-    const int PER_MAP = 420, FIRST = 120;
+    // CAR_RACING_AUTOSHOT_CRASH: crashes - health bars over damaged cars, the drivers close up,
+    // a wreck that throws your driver out (seen from the side, frame by frame through the
+    // flight, the fall, the run back and the hop in), then a wreck from the chase camera
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_CRASH")) {
+        static int wreckAt = -1, shotMask = 0, second = -1;
+        static float wy = 0, wfx = 0, wfz = 0;
+        auto &cars = simEngine.getCars();
+        if (f == 10) { cpuCount = 4; selectedMapPreset = 1; startRace(sim::GameSim::ModeSingle); autoDrive = true; }
+        if (cars.empty()) return;
+        sim::Car &me = cars[0];
+        if (f == 400 && cars.size() > 3) { cars[1].health = 55.0f; cars[2].health = 28.0f; cars[3].health = 12.0f; }
+        if (f == 440) shot("crash_health_bars");
+        if (f >= 450 && f < 480) {                       // beside your car, looking at the driver
+            const float fx = std::sin(me.heading), fz = -std::cos(me.heading), rx = -fz, rz = fx;
+            camOverride = true;
+            camEye[0] = me.x - rx * 1.4f + fx * 3.6f; camEye[1] = me.y + 1.9f; camEye[2] = me.z - rz * 1.4f + fz * 3.6f;
+            camAt[0] = me.x - rx * 0.34f; camAt[1] = me.y + 0.95f; camAt[2] = me.z - rz * 0.34f;
+        }
+        if (f == 478) shot("crash_driver_closeup");
+        if (f == 490) {
+            camOverride = false;
+            wy = me.y; wfx = std::sin(me.heading); wfz = -std::cos(me.heading);
+            simEngine.forceWreck(0, true);
+            wreckAt = f;
+        }
+        if (wreckAt > 0 && second < 0) {                 // a camera at the side, following the car and its driver
+            const float rx = -wfz, rz = wfx;
+            float tx = me.x, tz = me.z, ty = me.y + 1.0f;
+            EjectedDriver ed;
+            if (ejectedDriver(me, ed)) { tx = 0.5f * (tx + ed.x); tz = 0.5f * (tz + ed.z); ty = std::max(ty, 0.5f * (ty + ed.y + 0.6f)); }
+            camOverride = true;
+            camEye[0] = tx - rx * 11.0f - wfx * 4.0f; camEye[1] = wy + 3.0f; camEye[2] = tz - rz * 11.0f - wfz * 4.0f;
+            camAt[0] = tx; camAt[1] = ty; camAt[2] = tz;
+            static const int AT[8] = {6, 20, 40, 65, 100, 130, 155, 172};
+            for (int k = 0; k < 8; ++k)
+                if (!(shotMask & (1 << k)) && me.wreck >= AT[k]) {
+                    shotMask |= 1 << k;
+                    shot(QString("crash_eject_%1_t%2").arg(k + 1).arg(me.wreck));
+                }
+            if (me.wreck == 0 && me.ghost > 0 && !(shotMask & 256)) { shotMask |= 256; shot("crash_back_ghost"); }
+            if (me.wreck == 0 && me.ghost == 0 && (shotMask & 256)) { camOverride = false; second = f + 120; }
+        }
+        if (second > 0 && f == second) simEngine.forceWreck(0, false);
+        if (second > 0 && f == second + 20) shot("crash_chase_wrecked");
+        if (second > 0 && f == second + 70) shot("crash_chase_settled");
+        if (second > 0 && f == second + 200) QCoreApplication::quit();
+        if (f > 60 * 120) QCoreApplication::quit();
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_RAMPS: River Serpent - a side ramp and a twisted one from beside and
+    // behind (run-up, in the air, landed), holding L (the boost line: 2 s, 5 s, 11 s), the
+    // LAST CHANCE line after a wreck, being eliminated, and the story's rules cards
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_RAMPS")) {
+        static int phase = 0, at = 0, mask = 0;
+        auto &cars = simEngine.getCars();
+        auto putBefore = [&](const sim::GameSim::SideRamp &r, float back) {
+            sim::Car &me = cars[0];
+            me.path = 0; me.s = simEngine.wrapS(r.s - back); me.d = r.d; me.hint = int(me.s);
+            simEngine.pointAt(me.s, me.d, me.x, me.z);
+            me.y = simEngine.heightAt(me.s, me.d); me.heading = simEngine.headingAt(me.s);
+            me.speed = 1.1f; me.air = 0; me.vy = 0.0f;
+            simEngine.locate(me);
+            autoLaneS = r.s; autoLaneD = r.d;
+        };
+        auto findRamp = [&](bool twist) -> int {
+            const auto &R = simEngine.sideRamps();
+            for (int k = 0; k < int(R.size()); ++k) if ((R[size_t(k)].twist != 0.0f) == twist && R[size_t(k)].fromLap == 0) return k;
+            return -1;
+        };
+        if (f == 10) { cpuCount = 3; selectedMapPreset = 5; startRace(sim::GameSim::ModeSingle); autoDrive = true; }
+        if (cars.empty()) return;
+        sim::Car &me = cars[0];
+        if (f == 20) {                                   // a still of a ramp from beside the road
+            const int k = findRamp(false);
+            if (k >= 0) {
+                const auto &r = simEngine.sideRamps()[size_t(k)];
+                float x, z, ax, az;
+                simEngine.pointAt(r.s - 30.0f, -r.d * 0.2f, x, z);
+                simEngine.pointAt(r.s - 8.0f, r.d, ax, az);
+                camOverride = true;
+                camEye[0] = x; camEye[1] = simEngine.heightAt(r.s, 0.0f) + 4.0f; camEye[2] = z;
+                camAt[0] = ax; camAt[1] = simEngine.heightAt(r.s, 0.0f) + 0.8f; camAt[2] = az;
+            }
+        }
+        if (f == 40) shot("ramp_01_side_ramp");
+        if (f == 44) {
+            const int k = findRamp(true);
+            if (k >= 0) {
+                const auto &r = simEngine.sideRamps()[size_t(k)];
+                float x, z, ax, az;
+                simEngine.pointAt(r.s - 34.0f, -r.d * 0.2f, x, z);
+                simEngine.pointAt(r.s - 6.0f, r.d, ax, az);
+                camEye[0] = x; camEye[1] = simEngine.heightAt(r.s, 0.0f) + 5.0f; camEye[2] = z;
+                camAt[0] = ax; camAt[1] = simEngine.heightAt(r.s, 0.0f) + 0.8f; camAt[2] = az;
+            }
+        }
+        if (f == 64) { shot("ramp_02_twisted_ramp"); camOverride = false; }
+        // a run at each kind once the race is on
+        for (int kind = 0; kind < 2; ++kind) {
+            const int f0 = 260 + kind * 420;
+            if (f == f0) { const int k = findRamp(kind == 1); if (k >= 0) putBefore(simEngine.sideRamps()[size_t(k)], 110.0f); mask = 0; at = 0; }
+            if (f > f0 && f < f0 + 400) {
+                if (me.air > 0 && !(mask & 1) && me.air > 8)  { mask |= 1; shot(QString("ramp_%1_air_takeoff").arg(kind ? "twist" : "side")); }
+                if (me.air > 0 && !(mask & 2) && me.air > 32) { mask |= 2; shot(QString("ramp_%1_air_high").arg(kind ? "twist" : "side")); }
+                if (me.air > 0 && !(mask & 8) && me.air > 50) { mask |= 8; shot(QString("ramp_%1_air_late").arg(kind ? "twist" : "side")); }
+                if (me.air == 0 && (mask & 2) && !(mask & 4)) { mask |= 4; at = f; }
+                if ((mask & 4) && f == at + 12) { shot(QString("ramp_%1_landed").arg(kind ? "twist" : "side")); autoLaneS = -1.0f; }
+            }
+        }
+        // holding L on River Serpent's long start straight
+        if (f == 1120) { me.s = simEngine.wrapS(150.0f); me.d = 0.0f; me.hint = int(me.s); simEngine.pointAt(me.s, me.d, me.x, me.z);
+                         me.heading = simEngine.headingAt(me.s); me.health = 100.0f; me.speed = 1.0f; simEngine.locate(me); keys.insert(Qt::Key_L); }
+        if (f == 1120 + 120) shot("boost_2s");
+        if (f == 1120 + 300) shot("boost_5s");
+        if (f == 1120 + 660) shot("boost_11s_overheat");
+        if (f == 1120 + 700) keys.remove(Qt::Key_L);
+        if (f == 1120 + 760) shot("boost_after");
+        if (f == 1950) { me.lastWreckProg = me.progress - 2500.0f; }
+        if (f == 1980) shot("last_chance");
+        if (f == 2000) { me.lastWreckProg = me.progress - 100.0f; me.health = 3.0f; }
+        if (f == 2001) keys.insert(Qt::Key_L);
+        if (me.out && !(mask & 64)) { mask |= 64; at = f; }
+        if ((mask & 64) && f == at + 60) { shot("eliminated"); keys.remove(Qt::Key_L); }
+        if ((mask & 64) && f == at + 70) { phase = 1; openStory(); storyUnlocked = 5; storyPick = 0; storyRules = 1; }
+        if (phase == 1) {
+            const int t = f - at - 70;
+            if (t > 0 && t % 30 == 0 && t / 30 <= 6) { shot(QString("rules_%1").arg(t / 30)); storyPick = t / 30; }
+            if (t == 30 * 7) QCoreApplication::quit();
+        }
+        if (f > 60 * 120) QCoreApplication::quit();
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_BOARD: with CAR_RACING_API pointing at a test server - the account
+    // TESTB3AA (sharing races) races Canyon Run once; the race and its recording go up; then
+    // MY PROFILE and the LEADERBOARD
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_BOARD")) {
+        static int phase = 0, at = 0;
+        auto step = [&](int next) { phase = next; at = f; };
+        if (f == 5) { accountForget(); cloneName = "TESTB3AA"; openAccountScreen(true); acctUser = "TESTB3AA";
+                      acctPass = acctPass2 = "test-pass-b3"; acctShare = true; accountSubmit(); step(1); }
+        if (phase == 1 && syncState == SyncState::Synced) { cpuCount = 2; selectedMapPreset = 1; simEngine.setLaps(1);
+                                                            startRace(sim::GameSim::ModeSingle); autoDrive = true; step(2); }
+        if (phase == 2 && simEngine.getState() == State::Finished && f > at + 120) step(3);
+        if (phase == 3 && f == at + 240) { simEngine.setState(State::Menu); autoDrive = false; shownProfile = loadProfile(profileName(0)); profileOpen = true; }
+        if (phase == 3 && f == at + 260) { shot("board_profile"); profileOpen = false; openLeaderboard(1); step(4); }
+        if (phase == 4 && !boardBusy && f > at + 20) {
+            shot("board");
+            std::printf("BOARD TEST: %d rows, first %s %.1f, share %d, status '%s'\n", int(boardRows.size()),
+                        boardRows.empty() ? "-" : boardRows[0].user.toLatin1().constData(), boardRows.empty() ? 0.0 : double(boardRows[0].best),
+                        int(accountShare), boardStatus.toLatin1().constData());
+            std::fflush(stdout);
+            QCoreApplication::quit();
+        }
+        if (f > 60 * 240) { std::printf("BOARD TEST: timed out in phase %d\n", phase); std::fflush(stdout); QCoreApplication::quit(); }
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_OBST: every map, the car standing 30 m before its first concrete block
+    // and its first tyre stack (the obstacles the owner asked for), and before its last big ramp
+    // (CAR_RACING_AUTOSHOT_OBST)
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_OBST")) {
+        static const char *KIND[] = {"concrete", "tyres", "ramp"};
+        const int k = (f - 10) / 60, map = k / 3, kind = k % 3, at = (f - 10) % 60;
+        if (map >= sim::NUM_MAPS) { QCoreApplication::quit(); return; }
+        if (f < 10) return;
+        if (at == 0) {
+            keys.clear();
+            cpuCount = 1;
+            selectedMapPreset = map;
+            startRace(sim::GameSim::ModeSingle);
+            simEngine.setState(State::Racing);
+            float target = -1.0f;
+            int lap = 0;
+            for (const sim::Obstacle &o : simEngine.getObstacles())
+                if (((kind == 0 && o.type == sim::Obstacle::Concrete) || (kind == 1 && o.type == sim::Obstacle::Tyres))) { target = o.s; lap = o.fromLap; break; }
+            if (kind == 2 && !simEngine.ramps().empty()) target = simEngine.ramps().back().lip;
+            if (target < 0.0f) return;
+            for (int i = 0; i < int(simEngine.getCars().size()); ++i) {
+                sim::Car &c = simEngine.getCars()[i];
+                c.s = simEngine.wrapS(target - (i == 0 ? 20.0f : 400.0f));
+                c.d = 0.0f; c.lap = lap; c.hint = int(c.s); c.speed = 0.0f;
+                simEngine.pointAt(c.s, c.d, c.x, c.z);
+                c.y = simEngine.heightAt(c.s, c.d);
+                c.heading = simEngine.headingAt(c.s);
+                simEngine.locate(c);
+                c.aiCheckProg = c.progress;
+            }
+            view1.camMode = 0;
+        }
+        if (at == 50) shot(QString("obst_map%1_%2").arg(map + 1).arg(KIND[kind]));
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_GATE: Canyon Run, you leading two CPUs: the shortcut is closed to you -
+    // the barrier across it and the HUD line, just before the fork
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_GATE")) {
+        if (f == 10) { cpuCount = 2; selectedMapPreset = 1; simEngine.setLaps(1); startRace(sim::GameSim::ModeSingle); autoDrive = true; }
+        if (f > 60 * 8 && simEngine.getState() == State::Racing && !simEngine.getCars().empty()) {
+            const sim::Car &me = simEngine.getCars()[0];
+            const float to = simEngine.toShortcut(me);
+            if (to < 55.0f && to > 30.0f) {
+                std::printf("GATE: place %d, closed %d\n", simEngine.rankOf(0), int(me.cutClosed));
+                std::fflush(stdout);
+                shot("shortcut_closed");
+                QCoreApplication::quit();
+            }
+        }
+        if (f > 60 * 150) QCoreApplication::quit();
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_ACCOUNT: with CAR_RACING_API pointing at a test server - create the
+    // account TESTB2AA, race once (the profile goes up), log out, a wrong password, then log in
+    // again with this PC's profile gone (it comes back down from the server). Its own settings
+    // (acctApp): your real login is never touched.
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_ACCOUNT")) {
+        static int phase = 0, at = 0;
+        auto step = [&](int next) { phase = next; at = f; };
+        if (f == 5) { accountForget(); openAccountScreen(true); acctUser = "TESTB2AA"; acctPass = acctPass2 = "test-pass-b2"; acctShare = false; acctRow = 4; }
+        if (f == 20) shot("account_create");
+        if (f == 25) { accountSubmit(); step(1); }
+        if (phase == 1 && syncState == SyncState::Synced) { menuSelection = M_PROFILE; step(2); }
+        if (phase == 2 && f == at + 20) shot("account_menu");
+        if (phase == 2 && f == at + 25) { shownProfile = loadProfile(profileName(0)); profileOpen = true; }
+        if (phase == 2 && f == at + 40) { shot("account_profile_new"); profileOpen = false; cpuCount = 2; selectedMapPreset = 1;
+                                          simEngine.setLaps(1); startRace(sim::GameSim::ModeSingle); autoDrive = true; step(3); }
+        if (phase == 3 && simEngine.getState() == State::Finished && syncState == SyncState::Synced && f > at + 120) step(4);
+        if (phase == 4 && f == at + 30) { simEngine.setState(State::Menu); autoDrive = false; accountLogout();
+                                          QFile::remove(profilePath("TESTB2AA")); openAccountScreen(false);
+                                          acctUser = "TESTB2AA"; acctPass = "wrong-password"; acctRow = 2; accountSubmit(); step(5); }
+        if (phase == 5 && !acctBusy && f > at + 10) { shot("account_wrong"); acctPass = "test-pass-b2"; accountSubmit(); step(6); }
+        if (phase == 6 && syncState == SyncState::Synced && f > at + 10) { shownProfile = loadProfile(profileName(0)); profileOpen = true; step(7); }
+        if (phase == 7 && f == at + 20) {
+            shot("account_profile_synced");
+            std::printf("ACCOUNT TEST: user %s, profile races after download %d, sync %d\n", accountUser.toLatin1().constData(),
+                        shownProfile.races, int(syncState));
+            std::fflush(stdout);
+            QCoreApplication::quit();
+        }
+        if (f > 60 * 240) { std::printf("ACCOUNT TEST: timed out in phase %d (%s)\n", phase, acctStatus.toLatin1().constData()); std::fflush(stdout); QCoreApplication::quit(); }
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_CLONE: the TEST_CLONE profile's clone (tools/ai_bench clonefiles
+    // into the profiles folder first): the menu item, MY PROFILE, a race with the clone in it
+    // and F4 on, and the results once this race (recorded) has trained the clone again
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_CLONE")) {
+        static int doneAt = -1;
+        if (f == 5) { cloneName = "TEST_CLONE"; cloneLoad(); menuSelection = M_CLONE; }
+        if (f == 20) shot("clone_menu");
+        if (f == 30) { shownProfile = loadProfile(cloneName); profileOpen = true; }
+        if (f == 45) shot("clone_profile");
+        if (f == 50) { profileOpen = false; cpuCount = 5; selectedMapPreset = 1; simEngine.setLaps(1); startRace(sim::GameSim::ModeSingle);
+                       autoDrive = true; showCpuMinds = true; }
+        if (f > 60 * 8 && simEngine.getState() == State::Racing && !simEngine.getCars().empty()) {
+            static bool shotRace = false;                // when the clone itself drives, close to us
+            const auto &cs = simEngine.getCars();
+            const sim::Car &cl = cs.back();
+            if (!shotRace && cl.aiClone && cl.aiBrainDriving && std::fabs(simEngine.aheadOf(cs[0].s, cl.s)) < 40.0f) { shotRace = true; shot("clone_race_f4"); }
+            if (!shotRace && f == 60 * 40) { shotRace = true; shot("clone_race_f4"); }
+        }
+        if (simEngine.getState() == State::Finished && !cloneTraining && cloneSummary.startsWith("YOUR CLONE LEARNED") && doneAt < 0) doneAt = f;
+        if (doneAt >= 0 && f == doneAt + 60) { shot("clone_results"); QCoreApplication::quit(); }
+        if (f > 60 * 200) QCoreApplication::quit();
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_PROFILE: a vs CPU race on River Serpent with F3 on (the player
+    // model's live view), then the MY PROFILE screen built from that race and two made-up ones
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_PROFILE")) {
+        static int doneAt = -1;
+        if (f == 10) { cpuCount = 5; selectedMapPreset = 5; simEngine.setLaps(1); startRace(sim::GameSim::ModeSingle); autoDrive = true; showAiDebug = true; }
+        if (f == 60 * 5) { showAiDebug = false; showCpuMinds = true; }
+        if (f >= 60 * 6 && f <= 60 * 6 + 20 && !simEngine.getCars().empty()) {   // looking back at the pack
+            const sim::Car &me = simEngine.getCars()[0];
+            const float fx = std::sin(me.heading), fz = -std::cos(me.heading);
+            camOverride = true;
+            camEye[0] = me.x + fx * 10.0f; camEye[1] = me.y + 4.5f; camEye[2] = me.z + fz * 10.0f;
+            camAt[0] = me.x - fx * 30.0f; camAt[1] = me.y + 1.0f; camAt[2] = me.z - fz * 30.0f;
+        }
+        if (f == 60 * 6 + 20) shot("cpu_minds_f4");
+        if (f == 60 * 7) { showCpuMinds = false; showAiDebug = true; camOverride = false; }
+        if (f == 60 * 40) shot("profile_f3_overlay");
+        static bool tauntShot = false;
+        if (!tauntShot && tauntUntil > simEngine.getTick() + 150 && simEngine.getState() == State::Racing) {
+            tauntShot = true;
+            shot("taunt_bubble");
+        }
+        if (simEngine.getState() == State::Finished && doneAt < 0) doneAt = f;
+        if (doneAt > 0 && f == doneAt + 20) shot("results_rival_line");
+        if (doneAt > 0 && f == doneAt + 30) {
+            showAiDebug = false;
+            sim::PlayerProfile p;
+            p.name = profileName(0);
+            for (int k = 0; k < 3; ++k) {
+                const sim::Car &c = simEngine.getCars()[0];
+                sim::RaceSummary r;
+                r.map = k == 0 ? simEngine.getMap() : (k == 1 ? 1 : 3);
+                r.place = k == 0 ? simEngine.rankOf(0) : 2 + k; r.cars = 6; r.wrecks = k == 2 ? 1 : c.wrecks;
+                r.rams = c.crashesCaused; r.bestLap = c.bestLap; r.km = simEngine.raceObs(0).metres / 1000.0f;
+                p.addRace(simEngine.raceObs(0), r, simEngine.rivalRaces(0));
+            }
+            {                                            // saved and read back: the same profile?
+                sim::PlayerProfile t = p;
+                t.name = "TEST_ROUNDTRIP";
+                saveProfile(t);
+                const sim::PlayerProfile back = loadProfile(t.name);
+                const bool same = back.races == t.races && std::fabs(back.traits.skill - t.traits.skill) < 1e-4f
+                    && std::fabs(back.traits.risk - t.traits.risk) < 1e-4f && back.recent.size() == t.recent.size()
+                    && back.habits[size_t(t.recent[0].map)].rampsOffered == t.habits[size_t(t.recent[0].map)].rampsOffered;
+                QFile out(autoShotDir + "/roundtrip.txt");
+                if (out.open(QIODevice::WriteOnly)) out.write(same ? "ROUNDTRIP OK\n" : "ROUNDTRIP DIFFERENT\n");
+                QFile::remove(QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/profiles/TEST_ROUNDTRIP.json");
+            }
+            shownProfile = p;
+            simEngine.setState(State::Menu);
+            profileOpen = true;
+        }
+        if (doneAt > 0 && f == doneAt + 60) shot("profile_screen");
+        if ((doneAt > 0 && f == doneAt + 70) || f > 60 * 200) QCoreApplication::quit();
+        return;
+    }
+
+    // CAR_RACING_AUTOSHOT_FINISH: one whole vs CPU race against 5 CPUs, with the CPU logic
+    // driving your car too, then a picture of the results screen
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_FINISH")) {
+        static int doneAt = -1;
+        if (f == 10) { cpuCount = 5; selectedMapPreset = 4; startRace(sim::GameSim::ModeSingle); autoDrive = true; }
+        if (f == 600) shot("race_5_cpus");
+        static int lapShots = 0;                         // the new-lap banners: LAP 2/3, FINAL LAP
+        const sim::Car &me = simEngine.getCars()[0];
+        if (lapShots < 2 && me.lap == lapShots + 1 && me.s > 40.0f) shot(++lapShots == 1 ? "lap_2_banner" : "final_lap_banner");
+        if (simEngine.getState() == State::Finished && doneAt < 0) doneAt = f;
+        if (doneAt > 0 && f == doneAt + 60) shot("finish_screen");
+        if ((doneAt > 0 && f == doneAt + 70) || f > 60 * 260) QCoreApplication::quit();
+        return;
+    }
+
+    if (f == 40)  { menuSelection = M_MAP; cycleMenuOption(M_MAP, 1); }   // highlight the map picker
+    if (f == 90)  shot("01_menu_map_picker");
+    if (f == 95)  cycleMenuOption(M_MAP, -1);
+    // the big map card with other maps and CPU levels (back to the defaults afterwards)
+    if (f == 98)  { menuSelection = M_PROFILE; cycleMenuOption(M_MAP, -1); cycleMenuOption(M_PROFILE, 1); }   // Coastal Highway, HARD
+    if (f == 104) shot("01_menu_coastal_hard");
+    if (f == 106) { cycleMenuOption(M_MAP, 2); cycleMenuOption(M_PROFILE, 1); }                            // Canyon Run, EASY
+    if (f == 112) shot("01_menu_canyon_easy");
+    if (f == 114) { cycleMenuOption(M_MAP, -1); cycleMenuOption(M_PROFILE, 1); menuSelection = M_VSCPU; }  // back: Sunset, MEDIUM
+
+    // one race per map (the CPU logic drives your car): the grid facing the start/finish
+    // gantry during the countdown, then a screenshot after ~4 s of racing
+    const int PER_MAP = 460, FIRST = 120;
     int m = (f - FIRST) / PER_MAP, t = (f - FIRST) % PER_MAP;
+    const QString mapName = (m < sim::NUM_MAPS) ? QString(sim::MAPS[m].name).replace(' ', '_').toLower() : QString();
     if (f >= FIRST && m < sim::NUM_MAPS) {
-        if (t == 0) { selectedMapPreset = m; startRace(sim::GameSim::ModeSingle); }
-        keys.insert(Qt::Key_Up);
-        if (t == 390) shot(QString("map%1_%2").arg(m + 1).arg(QString(sim::MAPS[m].name).replace(' ', '_').toLower()));
+        if (t == 0) { selectedMapPreset = m; startRace(sim::GameSim::ModeSingle); autoDrive = true; }
+        if (t == 150) shot(QString("map%1_%2_grid").arg(m + 1).arg(mapName));
+        if (t == 440) shot(QString("map%1_%2").arg(m + 1).arg(mapName));
     }
     const int SPLIT = FIRST + sim::NUM_MAPS * PER_MAP;
-    if (f == SPLIT) { keys.clear(); selectedMapPreset = 3; startRace(sim::GameSim::ModeSplitScreen); }
-    if (f > SPLIT) { keys.insert(Qt::Key_Up); keys.insert(Qt::Key_W); }
-    if (f == SPLIT + 380) shot("split_screen_city");
-    if (f == SPLIT + 400) QCoreApplication::quit();
+    if (f == SPLIT) { keys.clear(); selectedMapPreset = 3; startRace(sim::GameSim::ModeSplitScreen); autoDrive = true; }
+    if (f == SPLIT + 420) shot("split_screen_city");
+
+    // Places worth a look, your car put there during the countdown: Neon City's flat crossing
+    // (a bridge from milestone 1d on) from both roads, and the hills and banked corners
+    struct Spot { int map; float s; int cam; const char *name; int path = 0; };
+    static const Spot SPOTS[] = {
+        {3, 105.0f, 0, "neon_crossing_main"}, {3, 2245.0f, 0, "neon_crossing_other"},
+        {0, 3300.0f, 0, "hill_sunset_climb"}, {1, 1375.0f, 0, "hill_canyon_banked"},
+        {1, 1405.0f, 1, "hill_canyon_banked_hood"}, {2, 651.0f, 0, "hill_alpine_switchbacks"},
+        {2, 1500.0f, 0, "hill_alpine_summit"}, {2, 2251.0f, 0, "hill_alpine_descent"},
+        {3, 520.0f, 0, "hill_neon_cutting"}, {4, 3500.0f, 0, "hill_coastal_cliffs"},
+        {0, 5050.0f, 0, "struct_sunset_bridge"}, {0, 5190.0f, 0, "struct_sunset_on_bridge"},
+        {1, 2163.0f, 0, "struct_canyon_tunnel"}, {1, 2323.0f, 0, "struct_canyon_in_tunnel"},
+        {2, 1551.0f, 0, "struct_alpine_gallery"}, {2, 1691.0f, 0, "struct_alpine_in_gallery"},
+        {2, 1920.0f, 0, "struct_alpine_bridge"}, {3, 750.0f, 0, "struct_neon_in_tunnel"},
+        {3, 2150.0f, 0, "struct_neon_highway"}, {4, 4080.0f, 0, "struct_coastal_tunnel"},
+        {4, 5790.0f, 0, "struct_coastal_bridge"},
+        {1, 1139.0f, 0, "cut_canyon_fork"}, {1, 150.0f, 0, "cut_canyon_on", 1},
+        {2, 120.0f, 0, "cut_alpine_on", 1}, {3, 120.0f, 0, "cut_neon_on", 1},
+        {0, 110.0f, 0, "start_sunset"}, {1, 3510.0f, 0, "start_canyon"}, {2, 3280.0f, 0, "start_alpine"},
+        {4, 110.0f, 0, "start_coastal"}, {0, 8760.0f, 0, "finish_sunset"},
+        {4, 8775.0f, 0, "finish_coastal"}, {4, 1500.0f, 0, "sprint_coastal_traffic"},
+    };
+    const int SPOT0 = SPLIT + 440, NSPOTS = int(sizeof(SPOTS) / sizeof(SPOTS[0]));
+    for (int k = 0; k < NSPOTS; ++k) {
+        if (f == SPOT0 + k * 40) {
+            keys.clear();
+            autoDrive = false;
+            selectedMapPreset = SPOTS[k].map;
+            startRace(sim::GameSim::ModeSingle);
+            sim::Car &c = simEngine.getCars()[0];
+            c.path = SPOTS[k].path;
+            c.s = SPOTS[k].s;
+            c.d = 0.0f; c.lap = 0; c.hint = int(c.s);
+            simEngine.pointAt(c.s, c.d, c.x, c.z, c.path);
+            c.y = simEngine.heightAt(c.s, c.d, c.path);
+            c.heading = simEngine.headingAt(c.s, c.path);
+            view1.camMode = SPOTS[k].cam;
+        }
+        if (f == SPOT0 + k * 40 + 30) shot(SPOTS[k].name);
+    }
+    // Every jump in a real run-up: your car (driven by the CPU logic) 160 m before the lip,
+    // a picture mid-air and one just after landing
+    struct JumpShot { int map; bool nitro; const char *name; };
+    static const JumpShot JUMPS[] = {
+        {0, false, "jump_sunset"}, {1, false, "jump_canyon"}, {2, false, "jump_alpine"},
+        {3, false, "jump_neon"}, {3, true, "jump_neon_nitro"},
+    };
+    const int JUMP0 = SPOT0 + NSPOTS * 40, NJUMPS = int(sizeof(JUMPS) / sizeof(JUMPS[0]));
+    static int jumpState = 0, landedAt = -1;             // 0 run-up, 3 ramp shot taken, 1 flying shot taken, 2 done
+    for (int k = 0; k < NJUMPS; ++k) {
+        const int f0 = JUMP0 + k * 360;
+        if (f == f0) {
+            keys.clear();
+            selectedMapPreset = JUMPS[k].map;
+            startRace(sim::GameSim::ModeSingle);
+            simEngine.setState(State::Racing);
+            sim::Car &c = simEngine.getCars()[0];
+            c.s = simEngine.wrapS(simEngine.ramps()[0].lip - 160.0f);
+            c.d = 0.0f; c.lap = 0; c.hint = int(c.s);
+            simEngine.pointAt(c.s, c.d, c.x, c.z);
+            c.y = simEngine.heightAt(c.s, c.d);
+            c.heading = simEngine.headingAt(c.s);
+            simEngine.locate(c);
+            c.aiCheckProg = c.progress;
+            c.speed = JUMPS[k].nitro ? sim::NITRO_SPEED : sim::MAX_SPEED;
+            if (JUMPS[k].nitro) { c.nitroTimer = 150; c.nitroCharges = 0; }
+            view1.camMode = 0;
+            autoDrive = true;
+            jumpState = 0;
+            landedAt = -1;
+        }
+        if (f > f0 && f < f0 + 360) {
+            const sim::Car &c = simEngine.getCars()[0];
+            const float toLip = simEngine.aheadOf(c.s, simEngine.ramps()[0].lip);
+            if (jumpState == 0 && toLip < 45.0f && toLip > 0.0f) { shot(QString(JUMPS[k].name) + "_ramp"); jumpState = 3; }
+            if (jumpState == 3 && c.air >= 28) { shot(QString(JUMPS[k].name) + "_air"); jumpState = 1; }
+            if (jumpState == 1 && c.air == 0 && landedAt < 0) landedAt = f;
+            if (jumpState == 1 && landedAt > 0 && f == landedAt + 12) { shot(QString(JUMPS[k].name) + "_landed"); jumpState = 2; }
+        }
+    }
+    if (f == JUMP0 + NJUMPS * 360) QCoreApplication::quit();
 }
 
 void GLWidget::updateGame()
 {
+    clonePoll();                                         // (a clone finished training)
     if (!autoShotDir.isEmpty()) runAutoShot();
+    if (audio) {                                         // the music for what is on screen
+        const bool inRace = (isOnline() || netScreen == NetScreen::Off) && story != StoryScreen::Chapters
+                            && story != StoryScreen::Scene && simEngine.getState() != State::Menu
+                            && !(netScreen != NetScreen::Off && !isOnline());
+        // the race sound from GO until you cross the line (in split screen until both have);
+        // the music on every other screen - the countdown, a pause and the results included
+        bool driving = false;
+        if (inRace && simEngine.getState() == State::Racing) {
+            const auto &cs = simEngine.getCars();
+            for (int i = 0; i < int(cs.size()); ++i)
+                if (isLocalCar(i) && !cs[i].finished) driving = true;
+        }
+        audio->setMusic(driving ? 1 : !inRace ? 0 : simEngine.getState() == State::Finished ? 2 : 0);
+        static int lastSound = -1;                       // (CAR_RACING_AUDIO_TRACE: each change, for tests)
+        if (int(driving) != lastSound && qEnvironmentVariableIsSet("CAR_RACING_AUDIO_TRACE")) {
+            static const char *ST[] = {"menu", "countdown", "racing", "paused", "finished"};
+            std::printf("AUDIO: %s (%s)\n", driving ? "race" : "music", ST[int(simEngine.getState())]);
+            std::fflush(stdout);
+        }
+        lastSound = int(driving);
+    }
 
     float realDt = float(elapsedTimer.nsecsElapsed() * 1e-9);   // not whole ms: they lose ~3% a frame
     elapsedTimer.restart();
@@ -640,6 +1408,25 @@ void GLWidget::updateGame()
         if (nitroBannerTimer[i] > 0.0f) {
             nitroBannerTimer[i] = std::max(0.0f, nitroBannerTimer[i] - realDt);
         }
+    }
+
+    if (story == StoryScreen::Chapters) {
+        storyTime += realDt;
+        if (audio) audio->update(0.04f, false, false);
+        update();
+        return;
+    }
+    if (story == StoryScreen::Scene) {
+        storyUpdate(realDt);
+        updateParticles(realDt);
+        if (audio) audio->update(0.02f, false, false);
+        update();
+        return;
+    }
+    if (isOnline() && netStoryHold) {                    // watched it: waiting for the others (or a skip)
+        if (audio) audio->update(0.02f, false, false);
+        update();
+        return;
     }
 
     if (simEngine.getState() == State::Menu) {
@@ -656,8 +1443,17 @@ void GLWidget::updateGame()
 
     const float FIXED_DT = 1.0f / 60.0f;
     if (isOnline() && !netTest.isEmpty()) { ++statFrames; if (realDt > 0.025f) ++statSlowFrames; }
+    {
+        const int now = simEngine.getTick();
+        popups.erase(std::remove_if(popups.begin(), popups.end(), [now](const DamagePopup &p) { return now - p.born > 80; }),
+                     popups.end());
+    }
+    // your car wrecked against CPUs: the first moments of the crash in slow motion
+    const auto &simCars = simEngine.getCars();
+    const bool slowMo = !isOnline() && simEngine.getGameMode() == sim::GameSim::ModeSingle && !simCars.empty()
+                        && simCars[0].wreck > 0 && simCars[0].wreck < 50 && autoShotDir.isEmpty();
     if (isOnline()) netUpdate(realDt);          // online: the server runs the race (glwidget_online.cpp)
-    else simAccumulator += realDt;
+    else simAccumulator += slowMo ? realDt * 0.35f : realDt;
 
     while (!isOnline() && simAccumulator >= FIXED_DT) {
         simAccumulator -= FIXED_DT;
@@ -669,17 +1465,31 @@ void GLWidget::updateGame()
         inputs[0].left = isDown(Qt::Key_Left);
         inputs[0].right = isDown(Qt::Key_Right);
         inputs[0].nitro = isDown(Qt::Key_Return) || isDown(Qt::Key_Enter) || isDown(Qt::Key_Slash) || isDown(Qt::Key_N);
+        inputs[0].boost = isDown(Qt::Key_L) && simEngine.boostAllowed();   // (no L boost in split screen)
 
         inputs[1].up = isDown(Qt::Key_W);
         inputs[1].down = isDown(Qt::Key_S);
         inputs[1].left = isDown(Qt::Key_A);
         inputs[1].right = isDown(Qt::Key_D);
         inputs[1].nitro = isDown(Qt::Key_Space);
+        if (autoDrive) {                                 // scripted test
+            const sim::Car &me = simEngine.getCars()[0];
+            inputs[0] = simEngine.computeAIInput(simEngine.getCars()[0], 0, false);
+            inputs[0].boost = isDown(Qt::Key_L);
+            if (autoLaneS > 0.0f && me.air == 0 && simEngine.aheadOf(me.s, autoLaneS) > 0.0f) {   // hold the ramp's lane
+                const float e = autoLaneD - me.d + 3.0f * std::sin(simEngine.headingAt(me.s) - me.heading);
+                inputs[0].left = e < -0.25f; inputs[0].right = e > 0.25f;
+            }
+        }
+        if (autoDrive && simEngine.getCars().size() > 1 && simEngine.getGameMode() == sim::GameSim::ModeSplitScreen)
+            inputs[1] = simEngine.computeAIInput(simEngine.getCars()[1], 1, false);
 
+        if (cloneRecording) cloneRec.step(simEngine, 0, inputs[0], cloneBook);   // (what you see and do: your clone learns it)
         simEngine.step(inputs, 2);
         processSimEvents(simEngine.getEvents());
         simEngine.clearEvents();
-        for (int i = 0; i < 2 && i < int(simEngine.getCars().size()); ++i)
+        if (simEngine.getState() == State::Finished && !profileSaved) { profileSaved = true; profileAfterRace(); }
+        for (int i = 0; i < sim::MAX_RACERS && i < int(simEngine.getCars().size()); ++i)
             updateCarFx(i, simEngine.getCars()[i]);
     }
 
@@ -687,6 +1497,9 @@ void GLWidget::updateGame()
     float step = realDt * 60.0f;
 
     auto updateCarView = [&](CarView &v, const sim::Car &c) {
+        if (v.snap) { v.camHeading = c.heading; v.camY = c.y; v.snap = false; }   // a new race: look along the grid
+        // in the air the camera rises slowly, so you see the car soar (it catches up after landing)
+        v.camY += (c.y - v.camY) * std::min(1.0f, (c.air > 0 ? 0.04f : 0.15f) * step);
         v.camHeading += (c.heading - v.camHeading) * (0.10f * step);
         if (v.shake > 0.0f) v.shake = std::max(0.0f, v.shake - 0.05f * step);
         float targetFov = 64.0f + 12.0f * std::clamp(c.speed / sim::MAX_SPEED, 0.0f, 1.5f) + (c.nitroOn ? 10.0f : 0.0f);
@@ -702,7 +1515,9 @@ void GLWidget::updateGame()
 
     if (audio && int(cars.size()) > localCar()) {
         const sim::Car &me = cars[localCar()];
-        audio->update(std::fabs(me.speed) / sim::MAX_SPEED, me.isDrifting, me.nitroOn);
+        float speed = std::fabs(me.speed);                // (split screen: the faster player)
+        if (cars.size() > 1 && !isOnline()) speed = std::max(speed, std::fabs(cars[1].speed));
+        audio->update(speed / sim::MAX_SPEED, me.isDrifting, me.nitroOn);
     }
 
     update();
@@ -728,21 +1543,24 @@ inline void computeMenuMetrics(float W, float H, float dpr,
     btnW = panelW - 2.0f * btnPadX;
 
     float availH = listTop - panelY0 - 12.0f * dpr;
-    btnH = std::clamp(availH / 7.6f, 38.0f * dpr, 46.0f * dpr);
-    btnGap = std::clamp((availH - 7.0f * btnH) / 6.0f, 6.0f * dpr, 10.0f * dpr);
+    const float N = float(NUM_MENU_ITEMS);
+    btnH = std::clamp(availH / (N + 0.9f), 32.0f * dpr, 46.0f * dpr);
+    btnGap = std::clamp((availH - N * btnH) / (N - 1.0f), 5.0f * dpr, 10.0f * dpr);
     ps = std::clamp(H / 420.0f, 1.30f, 1.75f);
 }
 } // namespace
 
 void GLWidget::keyPressEvent(QKeyEvent *event)
 {
+    if (simEngine.getState() == State::Menu && handleAccountKey(event)) return;   // (typing a name or password)
     if (event->isAutoRepeat()) return;
     int k = event->key();
 
     if (netScreen != NetScreen::Off && k != Qt::Key_F12 && handleOnlineKey(event)) return;
+    if ((story != StoryScreen::Off || (isOnline() && netStoryHold)) && k != Qt::Key_F12 && handleStoryKey(event)) return;
 
     // Universal restart: Pressing 'R' restarts race immediately from any gameplay state
-    if (k == Qt::Key_R) {
+    if (k == Qt::Key_R && !(simEngine.getState() == State::Menu && profileOpen)) {   // (MY PROFILE uses R)
         startRace(simEngine.getGameMode());
         return;
     }
@@ -761,8 +1579,34 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
         return;
     }
 
+    if (k == Qt::Key_F3 && simEngine.getState() != State::Menu) { showAiDebug = !showAiDebug; update(); return; }
+    if (k == Qt::Key_F4 && simEngine.getState() != State::Menu) { showCpuMinds = !showCpuMinds; update(); return; }
+    if (simEngine.getState() == State::Menu && profileOpen && k == Qt::Key_R) {   // MY PROFILE: R twice deletes your clone
+        if (cloneResetArmed) { cloneReset(); cloneResetArmed = false; } else cloneResetArmed = true;
+        update();
+        return;
+    }
+    if (simEngine.getState() == State::Menu && boardOpen) {                       // LEADERBOARD: left / right a map
+        if (k == Qt::Key_Left || k == Qt::Key_A) openLeaderboard(boardMap - 1);
+        else if (k == Qt::Key_Right || k == Qt::Key_D) openLeaderboard(boardMap + 1);
+        else boardOpen = false;
+        update();
+        return;
+    }
+    if (simEngine.getState() == State::Menu && profileOpen && k == Qt::Key_S && !accountUser.isEmpty()) {   // MY PROFILE: share races
+        accountSetShare(!accountShare);
+        update();
+        return;
+    }
+    if (simEngine.getState() == State::Menu && profileOpen && k == Qt::Key_L) {   // MY PROFILE: log in or out
+        if (accountUser.isEmpty()) openAccountScreen(false);
+        else { accountLogout(); shownProfile = loadProfile(profileName(0)); }
+        update();
+        return;
+    }
+    if (simEngine.getState() == State::Menu && profileOpen) { profileOpen = false; cloneResetArmed = false; update(); return; }
     if (simEngine.getState() == State::Menu) {
-        const int MENU_COUNT = 7;
+        const int MENU_COUNT = NUM_MENU_ITEMS;
         if (k == Qt::Key_Up || k == Qt::Key_W) {
             menuSelection = (menuSelection + MENU_COUNT - 1) % MENU_COUNT;
             if (audio) audio->playCountdownBeep(false);
@@ -774,20 +1618,26 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
             update();
             return;
         } else if (k == Qt::Key_1) {
-            menuSelection = 0;
+            menuSelection = M_VSCPU;
             startRace(sim::GameSim::ModeSingle);
             return;
         } else if (k == Qt::Key_2) {
-            menuSelection = 1;
+            menuSelection = M_SPLIT;
             startRace(sim::GameSim::ModeSplitScreen);
             return;
-        } else if (k >= Qt::Key_3 && k <= Qt::Key_7) {
-            menuSelection = k - Qt::Key_1;
+        } else if (k >= Qt::Key_3 && k <= Qt::Key_8) {
+            menuSelection = k - Qt::Key_3 + M_ONLINE;
             if (audio) audio->playCountdownBeep(false);
             update();
             return;
         } else if (k == Qt::Key_M) {
             if (audio) audio->toggleMute();
+            update();
+            return;
+        } else if (k == Qt::Key_Plus || k == Qt::Key_Equal || k == Qt::Key_Minus || k == Qt::Key_Underscore) {
+            const int dir = (k == Qt::Key_Minus || k == Qt::Key_Underscore) ? -1 : 1;
+            cpuCount = std::clamp(cpuCount + dir, 1, sim::MAX_RACERS - 1);    // [+]/[-]: CPU racers
+            if (audio) audio->playCountdownBeep(false);
             update();
             return;
         } else if (k == Qt::Key_Left || k == Qt::Key_Right || k == Qt::Key_A || k == Qt::Key_D) {
@@ -796,12 +1646,17 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
             update();
             return;
         } else if (k == Qt::Key_Return || k == Qt::Key_Enter || k == Qt::Key_Space) {
-            if (menuSelection == 0) {
-                startRace(sim::GameSim::ModeSingle);
-            } else if (menuSelection == 1) {
-                startRace(sim::GameSim::ModeSplitScreen);
-            } else if (menuSelection == 2) {
+            if (menuSelection == M_VSCPU) {
+                beginRaceWithStory(sim::GameSim::ModeSingle);
+            } else if (menuSelection == M_SPLIT) {
+                beginRaceWithStory(sim::GameSim::ModeSplitScreen);
+            } else if (menuSelection == M_ONLINE) {
                 openOnline();
+            } else if (menuSelection == M_PROFILE) {
+                shownProfile = loadProfile(profileName(0));
+                profileOpen = true;
+            } else if (menuSelection == M_BOARD) {
+                openLeaderboard(selectedMapPreset);
             } else {
                 cycleMenuOption(menuSelection, 1);
             }
@@ -853,20 +1708,20 @@ void GLWidget::keyReleaseEvent(QKeyEvent *event)
 void GLWidget::focusOutEvent(QFocusEvent *event)
 {
     keys.clear();
-    QOpenGLWidget::focusOutEvent(event);
+    GLBase::focusOutEvent(event);
 }
 
 void GLWidget::mouseMoveEvent(QMouseEvent *event)
 {
     if (simEngine.getState() == State::Menu && activeModal == ModalNone && netScreen == NetScreen::Off) {
-        float dpr = float(devicePixelRatioF());
+        float dpr = pixelRatio();
         float mx = float(event->position().x()) * dpr;
-        float my = float(height() - event->position().y()) * dpr;
+        float my = logicalHeight() * dpr - float(event->position().y()) * dpr;
         float W = float(width()) * dpr, H = float(height()) * dpr;
         float btnX, btnW, btnH, btnGap, listTop, ps;
         computeMenuMetrics(W, H, dpr, btnX, btnW, btnH, btnGap, listTop, ps);
 
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < NUM_MENU_ITEMS; ++i) {
             float by0 = listTop - (i + 1) * btnH - i * btnGap;
             float by1 = by0 + btnH;
             float bx0 = btnX;
@@ -882,13 +1737,24 @@ void GLWidget::mouseMoveEvent(QMouseEvent *event)
             }
         }
     }
-    QOpenGLWidget::mouseMoveEvent(event);
+    GLBase::mouseMoveEvent(event);
 }
 
 void GLWidget::mousePressEvent(QMouseEvent *event)
 {
+#ifdef __EMSCRIPTEN__
+    requestActivate();
+#else
     setFocus();
+#endif
     if (netScreen != NetScreen::Off) return;     // online screens are keyboard-driven
+    if (simEngine.getState() == State::Menu && accountScreen != AccountScreen::Off) {
+        const float d = pixelRatio();
+        accountClick(float(event->position().x()) * d, (logicalHeight() - float(event->position().y())) * d);
+        return;
+    }
+    if (simEngine.getState() == State::Menu && profileOpen) { profileOpen = false; update(); return; }
+    if (simEngine.getState() == State::Menu && boardOpen) { boardOpen = false; update(); return; }
     if (simEngine.getState() == State::Menu) {
         if (activeModal != ModalNone) {
             activeModal = ModalNone;
@@ -897,14 +1763,14 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
             return;
         }
 
-        float dpr = float(devicePixelRatioF());
+        float dpr = pixelRatio();
         float mx = float(event->position().x()) * dpr;
-        float my = float(height() - event->position().y()) * dpr;
+        float my = logicalHeight() * dpr - float(event->position().y()) * dpr;
         float W = float(width()) * dpr, H = float(height()) * dpr;
         float btnX, btnW, btnH, btnGap, listTop, ps;
         computeMenuMetrics(W, H, dpr, btnX, btnW, btnH, btnGap, listTop, ps);
 
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < NUM_MENU_ITEMS; ++i) {
             float by0 = listTop - (i + 1) * btnH - i * btnGap;
             float by1 = by0 + btnH;
             float bx0 = btnX;
@@ -912,12 +1778,17 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
 
             if (mx >= bx0 && mx <= bx1 && my >= by0 && my <= by1) {
                 menuSelection = i;
-                if (i == 0) {
-                    startRace(sim::GameSim::ModeSingle);
-                } else if (i == 1) {
-                    startRace(sim::GameSim::ModeSplitScreen);
-                } else if (i == 2) {
+                if (i == M_VSCPU) {
+                    beginRaceWithStory(sim::GameSim::ModeSingle);
+                } else if (i == M_SPLIT) {
+                    beginRaceWithStory(sim::GameSim::ModeSplitScreen);
+                } else if (i == M_ONLINE) {
                     openOnline();
+                } else if (i == M_PROFILE) {
+                    shownProfile = loadProfile(profileName(0));
+                    profileOpen = true;
+                } else if (i == M_BOARD) {
+                    openLeaderboard(selectedMapPreset);
                 } else {
                     cycleMenuOption(i, 1);
                 }
@@ -929,7 +1800,7 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
     } else if (simEngine.getState() == State::Finished) {
         startRace(simEngine.getGameMode());
     }
-    QOpenGLWidget::mousePressEvent(event);
+    GLBase::mousePressEvent(event);
 }
 
 
@@ -939,6 +1810,7 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
 void GLWidget::initializeGL()
 {
     initializeOpenGLFunctions();
+    sgl::init();                                         // (the OpenGL 1 drawing on OpenGL ES 2 / WebGL)
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
@@ -1160,6 +2032,44 @@ void GLWidget::resizeGL(int w, int h)
 // ===========================================================================
 void GLWidget::paintGL()
 {
+    paintFrame();
+    sgl::endFrame();                                     // (what is still waiting in the last batch)
+    static const bool glStats = qEnvironmentVariableIsSet("CAR_RACING_GLSTATS");   // draws and vertices a frame
+    if (glStats) {
+        static int frames = 0;
+        static long draws = 0, verts = 0, streamed = 0;
+        const sgl::Stats st = sgl::frameStats();
+        draws += st.draws; verts += st.vertices; streamed += st.streamed;
+        if (++frames == 240) {
+            std::printf("GLSTATS: %ld draws, %ld vertices (%ld uploaded) a frame\n", draws / frames, verts / frames, streamed / frames);
+            std::fflush(stdout);
+            frames = 0; draws = verts = streamed = 0;
+        }
+    }
+}
+
+// The pixel ratio, and the window's height in its own (logical) pixels. In the browser both come
+// from the page: after a zoom or a move to another screen Qt's can be stale, and the menus would
+// be drawn too big.
+float GLWidget::pixelRatio() const
+{
+#ifdef __EMSCRIPTEN__
+    return float(emscripten_get_device_pixel_ratio());
+#else
+    return float(devicePixelRatio());
+#endif
+}
+
+float GLWidget::logicalHeight() const
+{
+#ifdef __EMSCRIPTEN__
+    if (frameH > 0) return float(frameH) / pixelRatio();    // (the last frame drawn)
+#endif
+    return float(height());
+}
+
+void GLWidget::paintFrame()
+{
     QElapsedTimer paintClock;                                   // scripted online test: drawing time
     paintClock.start();
     struct PaintStat {
@@ -1171,8 +2081,16 @@ void GLWidget::paintGL()
             w->statPaintMax = std::max(w->statPaintMax, ms);
         }
     } paintStat{this, paintClock};
-    const float dpr = float(devicePixelRatioF());
-    const int W = int(width() * dpr), H = int(height() * dpr);
+    const float dpr = pixelRatio();
+    int W = int(width() * dpr), H = int(height() * dpr);
+#ifdef __EMSCRIPTEN__
+    {   // the browser: draw at the canvas's real size (Qt's window size can be stale, see pixelRatio)
+        int bw = 0, bh = 0;
+        emscripten_webgl_get_drawing_buffer_size(emscripten_webgl_get_current_context(), &bw, &bh);
+        if (bw > 0 && bh > 0) { W = bw; H = bh; }
+    }
+#endif
+    frameW = W; frameH = H;
 
     glViewport(0, 0, W, H);
     glClearColor(0, 0, 0, 1);
@@ -1190,10 +2108,27 @@ void GLWidget::paintGL()
         return;
     }
 
+    if (story == StoryScreen::Chapters) {                     // story mode: the chapter list
+        drawShowcaseScene(W, H);
+        glViewport(0, 0, W, H);
+        drawStoryChapters(W, H, dpr);
+        if (storyRules == 1) drawStoryRules(W, H, dpr, storyPick);
+        return;
+    }
+    if (story == StoryScreen::Scene) {                        // story mode: a scene at the grid
+        renderView(c1, view1, c2, view2, 1, 0, 0, W, H);
+        glViewport(0, 0, W, H);
+        drawStoryOverlay(W, H, dpr);
+        return;
+    }
+
     if (simEngine.getState() == State::Menu) {
         drawShowcaseScene(W, H);
         glViewport(0, 0, W, H);
         drawMainMenu(W, H, dpr);
+        if (profileOpen) drawProfileScreen(W, H, dpr);
+        if (boardOpen) drawLeaderboard(W, H, dpr);
+        if (accountScreen != AccountScreen::Off) drawAccountScreen(W, H, dpr);
         return;
     }
 
@@ -1220,6 +2155,8 @@ void GLWidget::paintGL()
         renderView(c1, view1, c2, view2, 1, 0, 0, W, H);
         glViewport(0, 0, W, H);
         drawMinimap(W, H, dpr);
+        if (story == StoryScreen::Race && simEngine.getState() != State::Finished) drawStoryRaceInfo(W, H, dpr);
+        if (isOnline() && netStoryHold && story == StoryScreen::Off) drawNetStoryWait(W, H, dpr);
     } else {
         const int half = W / 2;
         renderView(c2, view2, c1, view1, 2, 0, 0, half, H);
@@ -1234,6 +2171,8 @@ void GLWidget::paintGL()
         glEnd();
         drawMinimap(W, H, dpr);
     }
+    if (showAiDebug && !hideHud) drawAiDebug(W, H, dpr);
+    if (showCpuMinds && !hideHud) drawCpuMinds(W, H, dpr);
 
     if (simEngine.getState() == State::Paused) {
         glViewport(0, 0, W, H);
@@ -1241,6 +2180,8 @@ void GLWidget::paintGL()
     } else if (simEngine.getState() == State::Finished) {
         glViewport(0, 0, W, H);
         drawFinishOverlay(W, H, dpr);
+        drawRivalLine(W, H, dpr);
+        if (story == StoryScreen::Race) drawStoryRaceInfo(W, H, dpr);   // goal met or not, and how to go on
     }
 }
 
@@ -1504,17 +2445,20 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
 {
     (void)otherView;
     glViewport(vx, vy, vw, vh);
+    ensureTrackGeometry();
 
-    // Per-map sky, fog, sunlight and reflections
+    // Per-map sky, fog, sunlight and reflections; darker inside a tunnel (fading in and out
+    // over about 30 m at the portals)
     const ThemeLook &th = THEMES[themeIndex()];
     nightMode = th.night;
     ensureEnvMap(themeIndex());
-    GLfloat fogCol[4] = {th.fog[0], th.fog[1], th.fog[2], 1.0f};
+    const float lit = 1.0f - (me.path ? 0.0f : tunnelShade(me.s)) * structureLook(simEngine.mapDef().theme).darkness;
+    GLfloat fogCol[4] = {th.fog[0] * lit, th.fog[1] * lit, th.fog[2] * lit, 1.0f};
     glFogfv(GL_FOG_COLOR, fogCol);
     glFogf(GL_FOG_START, th.fogStart);
     glFogf(GL_FOG_END, th.fogEnd);
-    GLfloat amb[4] = {th.ambient[0], th.ambient[1], th.ambient[2], 1.0f};
-    GLfloat dif[4] = {th.diffuse[0], th.diffuse[1], th.diffuse[2], 1.0f};
+    GLfloat amb[4] = {th.ambient[0] * lit, th.ambient[1] * lit, th.ambient[2] * lit, 1.0f};
+    GLfloat dif[4] = {th.diffuse[0] * lit, th.diffuse[1] * lit, th.diffuse[2] * lit, 1.0f};
     glLightfv(GL_LIGHT0, GL_AMBIENT, amb);
     glLightfv(GL_LIGHT0, GL_DIFFUSE, dif);
 
@@ -1524,24 +2468,40 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
     gluPerspective(meView.fov, double(vw) / double(std::max(vh, 1)), 0.5, 800.0);
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
-    if (meView.camMode == 0) {
+    // On hills the cameras look along the slope: the point they look at sits on the road
+    // ahead. The chase camera's height follows the car smoothly and never dips below the
+    // road behind; the hood and bumper cameras also lean with a banked road.
+    if (camOverride) {
+        gluLookAt(camEye[0], camEye[1], camEye[2], camAt[0], camAt[1], camAt[2], 0, 1, 0);
+    } else if (meView.camMode == 0) {
         // Low chase camera that drops back as speed builds up
         float fx = std::sin(meView.camHeading), fz = -std::cos(meView.camHeading);
         float jx = std::sin(simEngine.getTick() * 1.9f) * meView.shake * 0.25f;
         float jy = std::cos(simEngine.getTick() * 2.3f) * meView.shake * 0.20f;
         float d = meView.camDist;
-        float ex = me.x - fx * d + jx, ey = 1.9f + 0.12f * d + jy, ez = me.z - fz * d;
-        gluLookAt(ex, ey, ez, me.x + fx * 6.0f, 1.0f, me.z + fz * 6.0f, 0, 1, 0);
-    } else if (meView.camMode == 1) {
-        float fx = std::sin(me.heading), fz = -std::cos(me.heading);
-        float jx = std::sin(simEngine.getTick() * 2.5f) * meView.shake * 0.15f;
-        float jy = std::cos(simEngine.getTick() * 2.8f) * meView.shake * 0.12f;
-        float ex = me.x + fx * 0.4f + jx, ey = 1.35f + jy, ez = me.z + fz * 0.4f;
-        gluLookAt(ex, ey, ez, me.x + fx * 25.0f, 1.1f, me.z + fz * 25.0f, 0, 1, 0);
+        float ex = me.x - fx * d + jx, ez = me.z - fz * d;
+        float ey = std::max(meView.camY + 1.9f + 0.12f * d, simEngine.heightNear(ex, ez, me.s, me.path) + 1.2f) + jy;
+        float lx = me.x + fx * 6.0f, lz = me.z + fz * 6.0f;
+        float ly = me.air > 0 ? me.y + 1.0f : simEngine.heightNear(lx, lz, me.s, me.path) + 1.0f;
+        EjectedDriver ed;
+        if (me.wreck > 0 && ejectedDriver(me, ed) && me.wreck < sim::GameSim::WRECK_TIME_EJECT - 40) {
+            // your driver flew out: the camera pulls back and up and keeps both in view
+            lx = 0.5f * (me.x + ed.x); lz = 0.5f * (me.z + ed.z); ly = std::max(ly, ed.y);
+            ex -= fx * 5.0f; ez -= fz * 5.0f; ey += 3.0f;
+        }
+        gluLookAt(ex, ey, ez, lx, ly, lz, 0, 1, 0);
     } else {
-        float fx = std::sin(me.heading), fz = -std::cos(me.heading);
-        float ex = me.x + fx * 1.8f, ey = 0.55f, ez = me.z + fz * 1.8f;
-        gluLookAt(ex, ey, ez, me.x + fx * 35.0f, 0.45f, me.z + fz * 35.0f, 0, 1, 0);
+        const bool hood = meView.camMode == 1;
+        const RoadPose pose = poseOn(me.s, me.d, me.heading, me.path);
+        const float lean = pose.roll * PI / 180.0f;
+        float fx = std::sin(me.heading), fz = -std::cos(me.heading), rx = -fz, rz = fx;
+        float jx = hood ? std::sin(simEngine.getTick() * 2.5f) * meView.shake * 0.15f : 0.0f;
+        float jy = hood ? std::cos(simEngine.getTick() * 2.8f) * meView.shake * 0.12f : 0.0f;
+        const float back = hood ? 0.4f : 1.8f, ahead = hood ? 25.0f : 35.0f;
+        float ex = me.x + fx * back + jx, ey = me.y + (hood ? 1.35f : 0.55f) + jy, ez = me.z + fz * back;
+        const float lx = me.x + fx * ahead, lz = me.z + fz * ahead;
+        gluLookAt(ex, ey, ez, lx, simEngine.heightNear(lx, lz, me.s, me.path) + (hood ? 1.1f : 0.45f), lz,
+                  -std::sin(lean) * rx, std::cos(lean), -std::sin(lean) * rz);
     }
 
     GLfloat lp[] = {0.45f, 1.0f, 0.65f, 0.0f};
@@ -1549,72 +2509,166 @@ void GLWidget::renderView(const sim::Car &me, const CarView &meView,
 
     glEnable(GL_DEPTH_TEST);
 
+    // what this view can see (culling of the road, scenery and traffic)
+    const float lookH = camOverride ? std::atan2(camAt[0] - camEye[0], -(camAt[2] - camEye[2]))
+                      : meView.camMode == 0 ? meView.camHeading : me.heading;
+    viewX = camOverride ? camEye[0] : me.x;
+    viewZ = camOverride ? camEye[2] : me.z;
+    viewFx = std::sin(lookH); viewFz = -std::cos(lookH);
+
     glDisable(GL_LIGHTING); glDisable(GL_FOG);
     float camRefX = me.x, camRefZ = me.z;
+    glPushMatrix();
+    glTranslatef(0.0f, meView.camY, 0.0f);               // the backdrop rises with the car
     drawSunMountainsClouds(camRefX, camRefZ);
+    glPopMatrix();
     glEnable(GL_LIGHTING);
     drawTemple(camRefX, camRefZ);
 
     glEnable(GL_FOG);
     drawGround(camRefX, camRefZ);
-    if (simEngine.mapDef().theme == sim::MapTheme::Coast) drawSea(me.z);
-    drawRoad(me.z);
-    drawSkidMarks(me.z);
-    // the gates (the finish one has a whole scene around it) only when they can be seen
-    if (me.z > -60.0f) drawArch(-6.0f, false);
-    const float toFinish = me.z + sim::TRACK_LEN;
-    if (toFinish < VIEW_DIST + 120.0f && toFinish > -250.0f) drawArch(-sim::TRACK_LEN, true);
-    drawProps(me.z);
-    drawObstacles(me.z);
-    drawNitroPickups(me.z);
+    if (simEngine.mapDef().theme == sim::MapTheme::Coast) drawSea();
+    drawWater();
+    drawRoad();
+    drawRamps();
+    drawSkidMarks();
+    // the start/finish gantry (it has a whole scene around it) only when it can be seen
+    // (a sprint: a START gantry at the start line and a FINISH gantry at the finish line)
+    float gateX, gateZ;
+    simEngine.pointAt(simEngine.startLine(), 0.0f, gateX, gateZ);
+    if (inView(gateX, gateZ, 120.0f)) drawArch(simEngine.startLine(), simEngine.sprint() ? "START" : "FINISH");
+    if (simEngine.sprint()) {
+        simEngine.pointAt(simEngine.finishLine(), 0.0f, gateX, gateZ);
+        if (inView(gateX, gateZ, 120.0f)) drawArch(simEngine.finishLine());
+        drawRoadEnds();
+    }
+    drawProps();
+    drawObstacles();
+    drawShortcutGate();
+    drawNitroPickups();
 
     // shadows
     glDisable(GL_LIGHTING); glDepthMask(GL_FALSE);
     for (const sim::Traffic &t : simEngine.getTraffic()) {
-        if (t.parked || t.z > me.z + 25.0f || t.z < me.z - VIEW_DIST) continue;
-        drawShadow(roadCenter(t.z) + t.lane, t.z, roadAngle(t.z), t.truck ? 1.25f : 1.1f, t.truck ? 3.6f : 2.3f);
+        float tx, tz;
+        simEngine.pointAt(t.s, t.lane, tx, tz);
+        if (!inView(tx, tz, 6.0f)) continue;
+        const float ta = simEngine.headingAt(t.s);
+        drawShadow(tx, tz, ta, t.truck ? 1.25f : 1.1f, t.truck ? 3.6f : 2.3f, poseOn(t.s, t.lane, ta));
     }
     const auto &allCars = simEngine.getCars();
     const int meIdx = (&me >= allCars.data() && &me < allCars.data() + allCars.size()) ? int(&me - allCars.data()) : 0;
     for (int i = 0; i < int(allCars.size()); ++i) {
         if (i == meIdx && meView.camMode != 0) continue;     // no own shadow from the hood camera
-        drawShadow(allCars[i].x, allCars[i].z, allCars[i].heading, 1.1f, 2.3f);
+        const sim::Car &c = allCars[i];
+        const float above = std::max(0.0f, c.y - simEngine.heightAt(c.s, c.d, c.path));   // flying: smaller, fainter
+        const float k = 1.0f / (1.0f + 0.08f * above);
+        drawShadow(c.x, c.z, c.heading, 1.1f * k, 2.3f * k, poseOn(c.s, c.d, c.heading, c.path), 1.0f / (1.0f + 0.3f * above));
     }
     glDepthMask(GL_TRUE); glEnable(GL_LIGHTING);
 
     // traffic
     for (const sim::Traffic &t : simEngine.getTraffic()) {
-        if (t.parked || t.z > me.z + 25.0f || t.z < me.z - VIEW_DIST) continue;
-        float tx = roadCenter(t.z) + t.lane, ta = roadAngle(t.z);
+        float tx, tz;
+        simEngine.pointAt(t.s, t.lane, tx, tz);
+        if (!inView(tx, tz, 6.0f)) continue;
+        const float ta = simEngine.headingAt(t.s);
+        const RoadPose pose = poseOn(t.s, t.lane, ta);
         float spin = std::fmod(float(simEngine.getTick()) * t.speed * 136.0f, 360.0f);
-        if (t.truck) drawTruck(tx, t.z, ta, spin, t.r, t.g, t.b);
-        else         drawCar(tx, t.z, ta, 0.0f, 0.0f, 0.0f, spin, t.r, t.g, t.b, false);
+        FigureLook tl;                                   // everyday drivers: no helmet, plain clothes
+        tl.helmetOn = false;
+        tl.suit[0] = 0.25f + 0.3f * t.b; tl.suit[1] = 0.30f + 0.2f * t.r; tl.suit[2] = 0.45f + 0.2f * t.g;
+        if (t.truck) drawTruck(tx, tz, ta, spin, t.r, t.g, t.b, pose);
+        else         drawCar(tx, tz, ta, 0.0f, 0.0f, 0.0f, spin, t.r, t.g, t.b, false, nullptr, 0.0f, pose, -1.0f, &tl);
     }
 
     // Name plate above each car: "1"/"2" in split screen, "CPU" in single player, names online
-    // (your own car online: "YOU/3" = you are 3rd, the same position as in the corner)
+    // (your own car online and against CPUs: "YOU/3" = you are 3rd, as in the corner)
     auto badgeFor = [&](int i) -> QByteArray {
         if (isOnline()) {
             if (i == meIdx) return "YOU/" + QByteArray::number(simEngine.rankOf(i));
-            return (i < racerNames.size()) ? racerNames[i].left(8).toUtf8() : QByteArray::number(i + 1);
+            return carName(i);
         }
-        if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i == 1) return "CPU";
+        if (simEngine.getGameMode() == sim::GameSim::ModeSingle) {
+            if (i == 0) return "YOU/" + QByteArray::number(simEngine.rankOf(0));
+            return carName(i);
+        }
         return QByteArray::number(i + 1);
     };
     for (int i = 0; i < int(allCars.size()); ++i) {
-        if (i == meIdx && meView.camMode != 0) continue;
+        if (i == meIdx && meView.camMode != 0 && allCars[i].wreck == 0) continue;
         const sim::Car &c = allCars[i];
         QByteArray badge = badgeFor(i);
+        if (showCpuMinds && c.aiLevel > 0 && c.aiPersona >= 0) {   // F4: what this CPU is thinking
+            badge = carName(i) + " " + sim::personaDef(c.aiPersona).shortName + " " + sim::moodShort(c.aiMood) + " "
+                  + sim::tacticShort(c.aiTactic) + " " + QByteArray::number(int(std::lround(c.aiSkill * 100.0f)));
+        }
+        if (i == meIdx) badge = "";                      // your own car: no plate (health and place are in the corner)
+        if (c.wreck > 0) { drawWreck(c, i, badge.constData()); continue; }
+        if (c.ghost > 0 && (simEngine.getTick() / 4) % 2 == 0) continue;   // just back: blinking, passes through cars
+        const FigureLook dl = driverLook(i, c);
+        const bool out = std::find(driverOut.begin(), driverOut.end(), i) != driverOut.end();
+        const RoadPose pose = carPose(c);
+        if (c.barrel != 0.0f) {                          // a barrel roll: the whole car turns round its middle
+            glPushMatrix();
+            glTranslatef(c.x, pose.y + 0.7f, c.z);
+            glRotatef(c.barrel * 180.0f / PI, std::sin(c.heading), 0.0f, -std::cos(c.heading));
+            glTranslatef(-c.x, -pose.y - 0.7f, -c.z);
+        }
         drawCar(c.x, c.z, c.heading, c.roll, c.pitch, c.steerVis, c.wheelSpin, c.r, c.g, c.b, c.nitroOn,
-                badge.constData(), (i < sim::MAX_RACERS) ? carFx[i].brakeGlow : 0.0f);
+                hideHud ? nullptr : badge.constData(), (i < sim::MAX_RACERS) ? carFx[i].brakeGlow : 0.0f, pose,
+                c.health, out ? nullptr : &dl);
+        if (c.barrel != 0.0f) glPopMatrix();
     }
+    for (const Actor &a : actors) {                      // story scenes: the characters standing at the grid
+        if (!inView(a.x, a.z, 3.0f)) continue;
+        glPushMatrix();
+        glTranslatef(a.x, a.y, a.z);
+        glRotatef(-a.heading * 180.0f / PI, 0, 1, 0);
+        drawBlockFigure(a.look, a.pose);
+        glPopMatrix();
+    }
+    // drivers thrown out of their wrecks
+    for (int i = 0; i < int(allCars.size()); ++i) {
+        EjectedDriver ed;
+        if (!ejectedDriver(allCars[i], ed) || !inView(ed.x, ed.z, 3.0f)) continue;
+        const FigureLook look = [&] { FigureLook l = driverLook(i, allCars[i]); l.face = ed.face; return l; }();
+        glPushMatrix();
+        glTranslatef(ed.x, ed.y, ed.z);
+        glRotatef(-ed.heading * 180.0f / PI, 0, 1, 0);
+        glTranslatef(0.0f, 0.35f, 0.0f);                 // tumble round the middle of the figure
+        glRotatef(-ed.rotX, 1, 0, 0);
+        glRotatef(ed.rotZ, 0, 0, 1);
+        glTranslatef(0.0f, -0.35f, 0.0f);
+        drawBlockFigure(look, ed.pose);
+        glPopMatrix();
+    }
+    // damage numbers rising from the cars that were hit (red: it was that car's fault)
+    glDisable(GL_LIGHTING);
+    for (const DamagePopup &p : popups) {
+        const int age = simEngine.getTick() - p.born;
+        if (age < 0 || age > 70 || p.car >= int(allCars.size())) continue;
+        const sim::Car &c = allCars[size_t(p.car)];
+        if (!inView(c.x, c.z, 4.0f)) continue;
+        glPushMatrix();
+        glTranslatef(c.x, c.y + 3.05f + float(age) * 0.018f, c.z);
+        glRotatef(-lookH * 180.0f / PI, 0, 1, 0);
+        const float a = std::clamp(float(70 - age) / 25.0f, 0.0f, 1.0f);
+        char buf[16];
+        snprintf(buf, sizeof buf, "-%d", p.amount);
+        if (p.fault) glColor4f(1.0f, 0.28f, 0.22f, a);
+        else         glColor4f(1.0f, 0.86f, 0.30f, a);
+        drawText3D(buf, 0.0f, 0.0f, 0.0f, 0.075f);
+        glPopMatrix();
+    }
+    glEnable(GL_LIGHTING);
 
     drawParticles();
 
     glDisable(GL_FOG); glDisable(GL_LIGHTING);
 
     begin2D(vw, vh);
-    drawHUD(me, other, playerNum, vw, vh);
+    if (!hideHud) drawHUD(me, other, playerNum, vw, vh);
 }
 
 
@@ -1768,13 +2822,17 @@ void GLWidget::drawSunMountainsClouds(float ex, float ez)
 
 void GLWidget::drawTemple(float ex, float ez)
 {
-    Q_UNUSED(ex);
-    float tz = -TRACK_LEN - TEMPLE_DIST;
-    if (tz < ez - VIEW_DIST - 120.0f || tz > ez + 40.0f) return;
-    float tx = roadCenter(-TRACK_LEN);
+    float tx, tz, rot;
+    simEngine.landmark(tx, tz, rot);
+    const float dx = tx - ex, dz = tz - ez, reach = VIEW_DIST + 120.0f;
+    if (dx * dx + dz * dz > reach * reach) return;
 
+    float base = groundAt(tx, tz);                       // the lowest ground under it
+    for (float ox : {-45.0f, 45.0f})
+        for (float oz : {-45.0f, 45.0f}) base = std::min(base, groundAt(tx + ox, tz + oz));
     glPushMatrix();
-    glTranslatef(tx, 0.0f, tz);
+    glTranslatef(tx, base - 0.3f, tz);
+    glRotatef(rot, 0, 1, 0);                             // the steps face the road
 
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, texStone);
@@ -1836,6 +2894,309 @@ void GLWidget::drawTemple(float ex, float ez)
 // ===========================================================================
 //  GROUND, ROAD, ARCHES
 // ===========================================================================
+void GLWidget::ensureTrackGeometry()
+{
+    if (stretchKey != trackKey()) findStretches();
+    if (roadKey != trackKey()) buildRoad();
+    if (groundKey != trackKey()) buildGround();
+}
+
+void GLWidget::findStretches()
+{
+    stretchKey = trackKey();
+    stretches.clear();
+    if (simEngine.hasShortcut()) {
+        float x, z, s, d;
+        simEngine.pointAt(std::min(40.0f, simEngine.shortcutEnd()), 0.0f, x, z, 1);
+        simEngine.project(x, z, simEngine.shortcutFrom() + 40.0f, s, d, 0, false);
+        forkSide = d >= 0.0f ? 1.0f : -1.0f;
+        simEngine.pointAt(std::max(0.0f, simEngine.shortcutEnd() - 40.0f), 0.0f, x, z, 1);
+        simEngine.project(x, z, simEngine.shortcutTo() - 40.0f, s, d, 0, false);
+        mergeSide = d >= 0.0f ? 1.0f : -1.0f;
+    }
+    const auto &S = simEngine.circuit().slices();
+    const int n = int(S.size());
+    auto kindAt = [&](int i) {
+        const uint16_t f = S[size_t(i)].flags;
+        if (f & sim::TF_TUNNEL) return 1;
+        if (f & sim::TF_BRIDGE) return 2;
+        if ((f & sim::TF_OVERPASS) && simEngine.heightAt(float(i), 0.0f) > 1.0f) return 3;   // its raised part
+        return 0;
+    };
+    for (int i = 0; i < n;) {
+        const int k = kindAt(i);
+        if (!k) { ++i; continue; }
+        Stretch st;
+        st.a = i;
+        st.kind = k;
+        while (i < n && kindAt(i) == k) ++i;
+        st.b = i;
+        if (k == 1) {
+            // the mountain side of a tunnel is where the other roads around are higher
+            const int mid = (st.a + st.b) / 2;
+            const sim::Slice &m = S[size_t(mid)];
+            float sum[2] = {0.0f, 0.0f}, w[2] = {0.0f, 0.0f};
+            for (int j = 0; j < n; j += 4) {
+                if (std::min(std::abs(j - mid), n - std::abs(j - mid)) < 250) continue;
+                const float dx = S[size_t(j)].x - m.x, dz = m.z - S[size_t(j)].z, d2 = dx * dx + dz * dz;
+                if (d2 > 300.0f * 300.0f) continue;
+                const int right = dx * m.tz + dz * m.tx > 0.0f ? 1 : 0;
+                sum[right] += S[size_t(j)].y / (d2 + 400.0f);
+                w[right] += 1.0f / (d2 + 400.0f);
+            }
+            const float hr = w[1] > 0.0f ? sum[1] / w[1] : -1e9f, hl = w[0] > 0.0f ? sum[0] / w[0] : -1e9f;
+            st.side = hr >= hl ? 1.0f : -1.0f;
+        }
+        stretches.push_back(st);
+    }
+}
+
+float GLWidget::tunnelShade(float s) const
+{
+    float shade = 0.0f;
+    for (const Stretch &st : stretches) {
+        if (st.kind != 1) continue;
+        const float inside = std::min(s - float(st.a), float(st.b) - s);   // metres past the nearer portal
+        shade = std::max(shade, std::clamp((inside + 10.0f) / 30.0f, 0.0f, 1.0f));
+    }
+    return shade;
+}
+
+// A flat water plane under a bridge over a river or the harbour: it shows wherever the
+// ground dips below it (the valley under the bridge)
+void GLWidget::drawWater()
+{
+    const StructureLook &lk = structureLook(simEngine.mapDef().theme);
+    if (!lk.water) return;
+    for (const Stretch &st : stretches) {
+        if (st.kind != 2) continue;
+        const float mid = 0.5f * float(st.a + st.b);
+        float cx, cz;
+        simEngine.pointAt(mid, 0.0f, cx, cz);
+        if (!inView(cx, cz, 250.0f)) continue;
+        const float y = lk.water == 1 ? simEngine.heightAt(mid, 0.0f) - 5.0f : 0.0f;
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_LIGHTING);
+        glBegin(GL_QUADS);
+        const float R = 240.0f, step = 40.0f;           // small squares, so the fog shades them
+        for (float x = cx - R; x < cx + R; x += step)
+            for (float z = cz - R; z < cz + R; z += step) {
+                glColor4f(0.16f, 0.40f, 0.52f, 0.92f);
+                glVertex3f(x, y, z); glVertex3f(x + step, y, z);
+                glVertex3f(x + step, y, z + step); glVertex3f(x, y, z + step);
+            }
+        glEnd();
+        glEnable(GL_LIGHTING);
+    }
+}
+
+// The ground is an 8 m grid around the whole circuit. Up to 12 m past the guard rails it
+// lies just under the road's surface (banking included); further out it blends into the
+// height of the roads around, so slopes, cuttings and embankments form between parts of
+// the circuit at different heights, and then into gentle hills of our own noise. Coastal
+// Highway's ground drops to a beach and under the sea; around the temple it is level.
+void GLWidget::buildGround()
+{
+    for (const GroundChunk &c : groundChunks) glDeleteLists(c.list, 1);
+    groundChunks.clear();
+    groundKey = trackKey();
+
+    const auto &S = simEngine.circuit().slices();
+    const int n = int(S.size());
+    const float CELL = 8.0f, REACH = 160.0f, BIN = 64.0f, MARGIN = 400.0f;
+    const float rail = railOffset(), band = rail + 12.0f;
+    const StructureLook &look = structureLook(simEngine.mapDef().theme);
+    float x0 = 1e9f, x1 = -1e9f, z0 = 1e9f, z1 = -1e9f, mean = 0.0f;
+    for (const sim::Slice &sl : S) {
+        x0 = std::min(x0, sl.x); x1 = std::max(x1, sl.x);
+        z0 = std::min(z0, -sl.z); z1 = std::max(z1, -sl.z);
+        mean += sl.y;
+    }
+    mean /= float(n);
+    groundX0 = x0 - MARGIN; groundZ0 = z0 - MARGIN;
+    groundW = int((x1 - x0 + 2.0f * MARGIN) / CELL) + 2;
+    groundD = int((z1 - z0 + 2.0f * MARGIN) / CELL) + 2;
+
+    // every 4th slice, sorted into 64 m squares
+    const int bw = int(float(groundW) * CELL / BIN) + 1, bd = int(float(groundD) * CELL / BIN) + 1;
+    std::vector<std::vector<int>> bins(size_t(bw * bd));
+    std::vector<char> raised(size_t(n), 0);              // the raised highway stands on pillars
+    for (const Stretch &st : stretches)
+        if (st.kind == 3)
+            for (int k = st.a; k < st.b; ++k) raised[size_t(k)] = 1;
+    const auto &CS = simEngine.circuit().shortcut();      // (its slice k is stored as -1 - k)
+    for (int k = 0; k < int(CS.size()); k += 4) {
+        const int bx = int((CS[size_t(k)].x - groundX0) / BIN), bz = int((-CS[size_t(k)].z - groundZ0) / BIN);
+        bins[size_t(bz * bw + bx)].push_back(-1 - k);
+    }
+    for (int k = 0; k < n; k += 4) {
+        if (raised[size_t(k)]) continue;
+        const int bx = int((S[size_t(k)].x - groundX0) / BIN), bz = int((-S[size_t(k)].z - groundZ0) / BIN);
+        bins[size_t(bz * bw + bx)].push_back(k);
+    }
+
+    const sim::MapTheme theme = simEngine.mapDef().theme;
+    const float amp = theme == sim::MapTheme::Snow ? 22.0f : theme == sim::MapTheme::Countryside ? 9.0f
+                    : theme == sim::MapTheme::Coast ? 7.0f : theme == sim::MapTheme::Desert ? 6.0f : 0.0f;
+    const float seaX = simEngine.seaLineX();
+    auto smooth = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3.0f - 2.0f * t); };
+
+    groundH.assign(size_t(groundW * groundD), mean);
+    std::vector<float> nearDist(groundH.size(), 1e9f);
+    for (int j = 0; j < groundD; ++j)
+        for (int i = 0; i < groundW; ++i) {
+            const float x = groundX0 + float(i) * CELL, z = groundZ0 + float(j) * CELL;
+            // the nearest road, and the roads' heights around blended by distance
+            float wsum = 1.0f / (4.0f * REACH * REACH), hsum = mean * wsum, best = 1e18f, cutBest = 1e18f, mainBest = 1e18f;
+            int nearest = -1, nearestMain = -1, nearestOnCut = -1;
+            bool nearestCut = false;
+            const int bx = int((x - groundX0) / BIN), bz = int((z - groundZ0) / BIN), rings = int(REACH / BIN) + 1;
+            for (int dz = -rings; dz <= rings; ++dz)
+                for (int dx = -rings; dx <= rings; ++dx) {
+                    const int cx = bx + dx, cz = bz + dz;
+                    if (cx < 0 || cz < 0 || cx >= bw || cz >= bd) continue;
+                    for (int e : bins[size_t(cz * bw + cx)]) {
+                        const bool onCut = e < 0;
+                        const int k = onCut ? -1 - e : e;
+                        const sim::Slice &sl = onCut ? CS[size_t(k)] : S[size_t(k)];
+                        const float ex = sl.x - x, ez = -sl.z - z, d2 = ex * ex + ez * ez;
+                        if (d2 < best) { best = d2; nearest = k; nearestCut = onCut; }
+                        if (onCut && d2 < cutBest) { cutBest = d2; nearestOnCut = k; }
+                        if (!onCut && d2 < mainBest) { mainBest = d2; nearestMain = k; }
+                        if (d2 < REACH * REACH) {
+                            const float f = 1.0f - std::sqrt(d2) / REACH, w = f * f / (d2 + 400.0f);
+                            wsum += w;
+                            hsum += w * sl.y;
+                        }
+                    }
+                }
+            const float dist = std::sqrt(best);
+            const float hills = amp * (2.0f * fbm(x / 2048.0f, z / 2048.0f, 8, 3, 911) - 1.0f);
+            const float around = hsum / wsum + hills * smooth((dist - band) / 120.0f);
+            float h = around;
+            if (nearest >= 0 && dist < band + 40.0f) {
+                // (where the shortcut leaves or joins, both roads are near: under the lower one)
+                const float near2 = (band + 40.0f) * (band + 40.0f);
+                float road = 1e9f;
+                if (nearestMain >= 0 && mainBest < near2) {
+                    road = simEngine.heightNear(x, z, float(nearestMain));
+                    if (simEngine.nearRamp(float(nearestMain), 48.0f, 30.0f)) road -= 0.6f;   // ramps bend too sharply for the grid
+                }
+                if (nearestOnCut >= 0 && cutBest < near2) road = std::min(road, simEngine.heightNear(x, z, float(nearestOnCut), 1));
+                road -= 0.15f;
+                h = road + (around - road) * smooth((dist - band) / 40.0f);
+            }
+            if (x > seaX - 90.0f) {                      // beach, then under the sea
+                const float beach = x < seaX - 8.0f ? 0.2f : std::max(-2.5f, 0.2f - (x - seaX + 8.0f) * 0.4f);
+                h += (beach - h) * smooth((x - seaX + 90.0f) / 40.0f) * smooth((dist - band) / 10.0f);
+            }
+            if (nearest >= 0 && !nearestCut && cutBest > (band + 10.0f) * (band + 10.0f)) {
+                // a hill over a tunnel and a valley under a bridge (never next to the shortcut). The hill starts past the band
+                // that follows the road (so the grid never slopes up across the road); the tunnel
+                // has its own walls and roof, and its portal face hides the gap
+                const sim::Slice &sl = S[size_t(nearest)];
+                const float side = (x - sl.x) * sl.tz + (z + sl.z) * sl.tx;   // metres right of that slice
+                const float road = simEngine.heightAt(float(nearest), 0.0f);
+                for (const Stretch &st : stretches) {
+                    const float out = std::max({float(st.a - nearest), float(nearest - st.b), 0.0f});
+                    if (st.kind == 1 && out < 30.0f && std::fabs(side) > band
+                        && (!look.oneSided || side * st.side > 0.0f)) {
+                        const float across = 1.0f - smooth((std::fabs(side) - band - 8.0f) / 70.0f);
+                        h = std::max(h, road + look.hill * across * (1.0f - smooth(out / 30.0f)));
+                    } else if (st.kind == 2 && out == 0.0f) {
+                        const float fromEnd = float(std::min(nearest - st.a, st.b - nearest));
+                        h = std::min(h, road - look.depth * smooth((fromEnd - 8.0f) / 25.0f)
+                                        + std::max(0.0f, std::fabs(side) - 200.0f) * 0.3f);
+                    }
+                }
+            }
+            groundH[size_t(j * groundW + i)] = h;
+            nearDist[size_t(j * groundW + i)] = dist;
+        }
+
+    // a level square round the temple
+    float lx, lz, lrot;
+    simEngine.landmark(lx, lz, lrot);
+    const int li = std::clamp(int((lx - groundX0) / CELL + 0.5f), 0, groundW - 1);
+    const int lj = std::clamp(int((lz - groundZ0) / CELL + 0.5f), 0, groundD - 1);
+    const float level = groundH[size_t(lj * groundW + li)];
+    for (int j = 0; j < groundD; ++j)
+        for (int i = 0; i < groundW; ++i) {
+            const float dx = groundX0 + float(i) * CELL - lx, dz = groundZ0 + float(j) * CELL - lz;
+            const float t = smooth((std::sqrt(dx * dx + dz * dz) - 70.0f) / 40.0f);
+            float &h = groundH[size_t(j * groundW + i)];
+            if (nearDist[size_t(j * groundW + i)] > band) h = level + (h - level) * t;
+        }
+    groundMin = *std::min_element(groundH.begin(), groundH.end());
+
+    // 64 m display lists; each row of cells is a strip (cells split from (i, j+1) to (i+1, j),
+    // which groundAt() follows)
+    auto H = [&](int i, int j) {
+        return groundH[size_t(std::clamp(j, 0, groundD - 1) * groundW + std::clamp(i, 0, groundW - 1))];
+    };
+    const float oldTs = g_ts;
+    g_ts = 0.08f;
+    const int CH = 8;
+    for (int cj = 0; cj + 1 < groundD; cj += CH)
+        for (int ci = 0; ci + 1 < groundW; ci += CH) {
+            GroundChunk gc;
+            gc.list = glGenLists(1);
+            gc.x = groundX0 + (float(ci) + 0.5f * CH) * CELL;
+            gc.z = groundZ0 + (float(cj) + 0.5f * CH) * CELL;
+            glNewList(gc.list, GL_COMPILE);
+            for (int j = cj; j < std::min(cj + CH, groundD - 1); ++j) {
+                glBegin(GL_TRIANGLE_STRIP);
+                for (int i = ci; i <= std::min(ci + CH, groundW - 1); ++i)
+                    for (int k : {j, j + 1}) {
+                        const float nx = (H(i - 1, k) - H(i + 1, k)) / (2.0f * CELL);
+                        const float nz = (H(i, k - 1) - H(i, k + 1)) / (2.0f * CELL);
+                        const float len = std::sqrt(nx * nx + 1.0f + nz * nz);
+                        glNormal3f(nx / len, 1.0f / len, nz / len);
+                        const float x = groundX0 + float(i) * CELL, z = groundZ0 + float(k) * CELL;
+                        tv(x, H(i, k), z, x, z);
+                    }
+                glEnd();
+            }
+            glEndList();
+            groundChunks.push_back(gc);
+        }
+    g_ts = oldTs;
+
+    // check: the ground must never cover the road
+    int covered = 0;
+    for (int k = 0; k < n; k += 2)
+        for (float d : {-roadHalf(), -0.5f * roadHalf(), 0.0f, 0.5f * roadHalf(), roadHalf()}) {
+            float x, z;
+            simEngine.pointAt(float(k), d, x, z);
+            if (groundAt(x, z) > simEngine.heightAt(float(k), d) - 0.02f && ++covered <= 6)
+                qDebug() << "[Ground] covers the road at s" << k << "d" << d << "by" << groundAt(x, z) - simEngine.heightAt(float(k), d);
+        }
+    for (int k = 0; k + 1 < int(CS.size()); k += 2)          // and the shortcut
+        for (float d : {-1.0f, 0.0f, 1.0f}) {
+            const float dd = d * simEngine.roadHalfAt(float(k), 1);
+            float x, z;
+            simEngine.pointAt(float(k), dd, x, z, 1);
+            if (groundAt(x, z) > simEngine.heightAt(float(k), dd, 1) - 0.04f && ++covered <= 6)
+                qDebug() << "[Ground] covers the shortcut at s" << k << "d" << dd;
+        }
+    qDebug() << "[Ground]" << simEngine.mapDef().name << groundW << "x" << groundD << "points,"
+             << groundChunks.size() << "pieces, road covered at" << covered << "of" << (n / 2 + n % 2) * 5 << "checks";
+}
+
+float GLWidget::groundAt(float x, float z) const
+{
+    if (groundH.empty()) return 0.0f;
+    const float CELL = 8.0f;
+    const float u = std::clamp((x - groundX0) / CELL, 0.0f, float(groundW - 1) - 0.001f);
+    const float v = std::clamp((z - groundZ0) / CELL, 0.0f, float(groundD - 1) - 0.001f);
+    const int i = int(u), j = int(v);
+    const float fx = u - float(i), fz = v - float(j);
+    auto H = [&](int a, int b) { return groundH[size_t(b * groundW + a)]; };
+    if (fx + fz <= 1.0f)                                // the triangle (i, j), (i+1, j), (i, j+1)
+        return H(i, j) + (H(i + 1, j) - H(i, j)) * fx + (H(i, j + 1) - H(i, j)) * fz;
+    return H(i + 1, j + 1) + (H(i, j + 1) - H(i + 1, j + 1)) * (1.0f - fx) + (H(i + 1, j) - H(i + 1, j + 1)) * (1.0f - fz);
+}
+
 void GLWidget::drawGround(float ex, float ez)
 {
     const ThemeLook &th = THEMES[themeIndex()];
@@ -1851,351 +3212,765 @@ void GLWidget::drawGround(float ex, float ez)
     g_ts = 0.08f;
     glColor3fv(th.groundTint);
 
-    const float rad = VIEW_DIST + 30.0f;
+    // a flat skirt below the lowest ground, in case the view reaches past the height map
+    const float rad = VIEW_DIST + 30.0f, fy = groundMin - 3.0f;
     const int N = 36;
     glBegin(GL_TRIANGLE_FAN);
     glNormal3f(0, 1, 0);
-    tv(ex, -0.05f, ez, ex, ez);
+    tv(ex, fy, ez, ex, ez);
     for (int i = 0; i <= N; ++i) {
         float a = i * 2.0f * PI / N;
         float gx = ex + std::sin(a) * rad, gz = ez - std::cos(a) * rad;
-        tv(gx, -0.05f, gz, gx, gz);
+        tv(gx, fy, gz, gx, gz);
     }
     glEnd();
+    for (const GroundChunk &c : groundChunks)
+        if (inView(c.x, c.z, 46.0f)) glCallList(c.list);
     g_ts = 0.25f;
 }
 
-void GLWidget::drawRoad(float camZ)
+// A racer's pose: standing on the road, or flying (nose along the flight path, wings level)
+RoadPose GLWidget::carPose(const sim::Car &c) const
 {
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, texAsphalt);
-    g_ts = 0.125f;   // one asphalt tile every 8 m
-    glColor3f(1, 1, 1);
-
-    const float seg = 2.0f;
-    float startZ = std::min(40.0f, std::ceil((camZ + 30.0f) / seg) * seg);   // incl. the grid behind the line
-    float endZ   = std::max(-TRACK_LEN - 30.0f, camZ - VIEW_DIST);
-
-    // 1. Asphalt Road Surface
-    glBegin(GL_QUAD_STRIP);
-    glNormal3f(0, 1, 0);
-    for (float z = startZ; z >= endZ; z -= seg) {
-        float c = roadCenter(z);
-        tv(c - roadHalf(), 0.0f, z, -roadHalf(), z);
-        tv(c + roadHalf(), 0.0f, z,  roadHalf(), z);
+    RoadPose p = poseOn(c.s, c.d, c.heading, c.path);
+    p.y = c.y;
+    if (c.air > 0) {
+        p.pitch = std::atan2(c.vy, std::max(0.05f, std::fabs(c.speed))) * 180.0f / PI;
+        p.roll = 0.0f;
     }
-    glEnd();
+    return p;
+}
 
-    glDisable(GL_TEXTURE_2D);
-
-    // 2. Red & White Curbs (Kerbs) - locked to fixed world coordinates
-    for (float side : {-1.0f, 1.0f}) {
-        glBegin(GL_QUAD_STRIP);
-        glNormal3f(0, 1, 0);
-        for (float z = startZ; z >= endZ; z -= seg) {
-            float c = roadCenter(z), x0 = c + side * roadHalf(), x1 = x0 + side * 0.7f;
-            int k = int(std::floor((-z + 0.001f) / 4.0f));
-            glColor3fv((k % 2 == 0) ? THEMES[themeIndex()].kerbA : THEMES[themeIndex()].kerbB);
-            glVertex3f(x0, 0.02f, z); glVertex3f(x1, 0.02f, z);
-        }
-        glEnd();
-    }
-
-    // 3. Continuous Outer Boundary Lines (Solid White)
-    glColor3f(0.95f, 0.95f, 0.95f);
-    for (float side : {-1.0f, 1.0f}) {
-        glBegin(GL_QUAD_STRIP);
-        glNormal3f(0, 1, 0);
-        for (float z = startZ; z >= endZ; z -= seg) {
-            float c = roadCenter(z);
-            float x = c + side * (roadHalf() - 0.40f);
-            glVertex3f(x - 0.12f, 0.025f, z);
-            glVertex3f(x + 0.12f, 0.025f, z);
-        }
-        glEnd();
-    }
-
-    // 4. Center Dashed Lane Divider Lines (Strictly Fixed in World Space)
-    const float dashPeriod = 8.0f;
-    const float dashLen = 4.0f;
-    float dashStartZ = std::min(40.0f, std::ceil((camZ + 30.0f) / dashPeriod) * dashPeriod);
-    float dashEndZ   = std::max(-TRACK_LEN, camZ - VIEW_DIST);
-
-    glColor3f(0.96f, 0.94f, 0.88f);
-    for (int l = 1; l < simEngine.laneCount(); ++l) {
-        float off = simEngine.laneX(l) - 0.5f * sim::LANE_WIDTH;
-        for (float z = dashStartZ; z >= dashEndZ; z -= dashPeriod) {
-            float zNear = z;
-            float zFar  = z - dashLen;
-            if (zFar < -TRACK_LEN) zFar = -TRACK_LEN;
-            float cNear = roadCenter(zNear);
-            float cFar  = roadCenter(zFar);
-            glBegin(GL_QUADS);
-            glNormal3f(0, 1, 0);
-            glVertex3f(cNear + off - 0.14f, 0.03f, zNear);
-            glVertex3f(cNear + off + 0.14f, 0.03f, zNear);
-            glVertex3f(cFar  + off + 0.14f, 0.03f, zFar);
-            glVertex3f(cFar  + off - 0.14f, 0.03f, zFar);
-            glEnd();
+// Jump ramps: yellow and black bands up the ramp, a steel lip, and JUMP boards on both
+// sides 80 m before it; a SHORTCUT board 80 m before the fork
+void GLWidget::drawRamps()
+{
+    if (simEngine.hasShortcut()) {
+        const float s = simEngine.wrapS(simEngine.shortcutFrom() - 80.0f);
+        float bx, bz;
+        simEngine.pointAt(s, 0.0f, bx, bz);
+        if (inView(bx, bz, 40.0f)) {
+            glPushMatrix();
+            placeOnRoad(s, forkSide * (railOffset() + 2.0f));
+            glColor3f(0.30f, 0.32f, 0.35f);
+            boxAt(0, 1.3f, 0, 0.09f, 1.3f, 0.09f);
+            glColor3f(0.20f, 0.45f, 0.25f);
+            boxAt(0, 3.0f, 0, 2.3f, 0.65f, 0.06f);
+            glDisable(GL_LIGHTING);
+            glColor3f(0.95f, 0.95f, 0.90f);
+            drawText3D(forkSide > 0 ? "SHORTCUT >" : "< SHORTCUT", 0, 2.70f, 0.07f, 0.075f);
+            glEnable(GL_LIGHTING);
+            glPopMatrix();
         }
     }
-
-    // 5. Guard Rails and Posts (Posts strictly locked to fixed 12m intervals)
-    const float postPeriod = 12.0f;
-    float postStartZ = std::min(40.0f, std::ceil((camZ + 30.0f) / postPeriod) * postPeriod);
-    for (float side : {-1.0f, 1.0f}) {
-        glColor3f(0.70f, 0.72f, 0.76f);
-        for (float z = postStartZ; z >= endZ; z -= postPeriod) {
-            float c = roadCenter(z);
-            boxAt(c + side * railOffset(), 0.55f, z, 0.10f, 0.55f, 0.10f);
-        }
-        glColor3f(0.82f, 0.84f, 0.88f);
-        for (float ry : {0.50f, 0.95f}) {
-            glBegin(GL_QUAD_STRIP);
-            for (float z = startZ; z >= endZ; z -= seg) {
-                float c = roadCenter(z), x = c + side * railOffset();
-                glNormal3f(-side, 0, 0);
-                glVertex3f(x, ry - 0.12f, z);
-                glVertex3f(x, ry + 0.12f, z);
+    // Side ramps: a pink kicker in one lane with white chevrons pointing up it (a twisted one
+    // purple and orange, one side higher; a dangerous one near the finish with red edges),
+    // its sides and the drop at its lip shaded darker
+    for (const sim::GameSim::SideRamp &r : simEngine.sideRamps()) {
+        if (!simEngine.present(r.fromLap)) continue;
+        float lx, lz;
+        simEngine.pointAt(r.s, r.d, lx, lz);
+        if (!inView(lx, lz, 40.0f)) continue;
+        auto P = [&](float s, float d, float up, float &x, float &y, float &z) {
+            simEngine.pointAt(s, d, x, z);
+            y = simEngine.heightAt(s, d) + (up > 0.0f ? simEngine.sideLift(s, d) : 0.0f) + 0.03f;
+        };
+        auto V = [&](float s, float d, float up) { float x, y, z; P(s, d, up, x, y, z); glVertex3f(x, y, z); };
+        const bool twist = r.twist != 0.0f, late = r.danger > 1.0f;
+        const float d0 = r.d - r.half + 0.02f, d1 = r.d + r.half - 0.02f;
+        glDisable(GL_TEXTURE_2D);
+        glDisable(GL_LIGHTING);
+        glBegin(GL_QUADS);
+        const int N = 8;
+        for (int k = 0; k < N; ++k) {                    // the top, in stripes up the slope
+            const float s0 = r.s - r.run + r.run * float(k) / N, s1 = r.s - r.run + r.run * float(k + 1) / N - 0.01f;
+            const float shade = 0.80f + 0.20f * float(k) / N;
+            if (twist) { if (k % 2) glColor3f(0.55f * shade, 0.20f * shade, 0.85f * shade); else glColor3f(1.0f * shade, 0.55f * shade, 0.15f * shade); }
+            else       { if (k % 2) glColor3f(0.95f * shade, 0.25f * shade, 0.65f * shade); else glColor3f(1.0f * shade, 0.45f * shade, 0.80f * shade); }
+            for (int j = 0; j < 2; ++j) {
+                const float a = j ? r.d : d0, b = j ? d1 : r.d;
+                V(s0, a, 1); V(s0, b, 1); V(s1, b, 1); V(s1, a, 1);
             }
+        }
+        for (int j = 0; j < 2; ++j) {                    // its sides: from the road up to the top
+            const float d = j ? d1 : d0;
+            glColor3f(late ? 0.75f : 0.55f, late ? 0.12f : 0.15f, late ? 0.15f : 0.40f);
+            for (int k = 0; k < N; ++k) {
+                const float s0 = r.s - r.run + r.run * float(k) / N, s1 = r.s - r.run + r.run * float(k + 1) / N;
+                V(s0, d, 0); V(s1, d, 0); V(s1, d, 1); V(s0, d, 1);
+            }
+        }
+        glColor3f(0.35f, 0.10f, 0.28f);                  // the drop at the lip
+        for (int j = 0; j < 4; ++j) {
+            const float a = d0 + (d1 - d0) * float(j) / 4.0f, b = d0 + (d1 - d0) * float(j + 1) / 4.0f;
+            V(r.s - 0.02f, a, 1); V(r.s - 0.02f, b, 1); V(r.s - 0.02f, b, 0); V(r.s - 0.02f, a, 0);
+        }
+        glEnd();
+        glBegin(GL_TRIANGLES);                           // white chevrons pointing up the ramp
+        glColor3f(1.0f, 1.0f, 1.0f);
+        for (int k = 1; k <= 3; ++k) {
+            const float sc = r.s - r.run + r.run * float(k) / 4.0f;
+            float ax, ay, az, bx, by, bz, cx, cy, cz;
+            P(sc + 1.4f, r.d, 1, ax, ay, az); P(sc, r.d - 0.9f, 1, bx, by, bz); P(sc, r.d + 0.9f, 1, cx, cy, cz);
+            glVertex3f(ax, ay + 0.02f, az); glVertex3f(bx, by + 0.02f, bz); glVertex3f(cx, cy + 0.02f, cz);
+        }
+        glEnd();
+        if (late) {                                      // red edges: a dangerous ramp
+            glLineWidth(3.0f);
+            glBegin(GL_LINES);
+            glColor3f(1.0f, 0.15f, 0.10f);
+            for (float d : {d0, d1}) { V(r.s - r.run, d, 1); V(r.s, d, 1); }
+            V(r.s, d0, 1); V(r.s, d1, 1);
             glEnd();
+            glLineWidth(1.0f);
+        }
+        glEnable(GL_LIGHTING);
+    }
+    for (const sim::GameSim::Ramp &r : simEngine.ramps()) {
+        float lx, lz;
+        simEngine.pointAt(r.lip, 0.0f, lx, lz);
+        if (!inView(lx, lz, 120.0f)) continue;
+        const float half = roadHalf();
+        auto V = [&](float s, float d, float y) {        // y: above the road's surface
+            float x, z;
+            simEngine.pointAt(s, d, x, z);
+            glVertex3f(x, simEngine.heightAt(s, d) + y, z);
+        };
+        glDisable(GL_TEXTURE_2D);
+        glNormal3f(0, 1, 0);
+        glBegin(GL_QUADS);
+        for (float k = -r.run; k < -0.6f; k += 2.0f) {
+            if (int((k + r.run) / 2.0f) % 2) glColor3f(0.10f, 0.10f, 0.10f);
+            else                              glColor3f(1.00f, 0.80f, 0.10f);
+            const float s0 = r.lip + k, s1 = std::min(r.lip - 0.6f, s0 + 2.0f);
+            V(s0, -half, 0.04f); V(s0, half, 0.04f); V(s1, half, 0.04f); V(s1, -half, 0.04f);
+        }
+        glColor3f(0.72f, 0.74f, 0.78f);                  // the steel lip
+        V(r.lip - 0.6f, -half, 0.06f); V(r.lip - 0.6f, half, 0.06f); V(r.lip, half, 0.06f); V(r.lip, -half, 0.06f);
+        glEnd();
+        for (float side : {-1.0f, 1.0f}) {
+            glPushMatrix();
+            placeOnRoad(r.lip - 80.0f, side * (railOffset() + 2.0f));
+            glColor3f(0.30f, 0.32f, 0.35f);
+            boxAt(0, 1.3f, 0, 0.09f, 1.3f, 0.09f);
+            glColor3f(1.0f, 0.80f, 0.10f);
+            boxAt(0, 3.0f, 0, 1.7f, 0.65f, 0.06f);
+            glDisable(GL_LIGHTING);
+            glColor3f(0.08f, 0.08f, 0.08f);
+            drawText3D("JUMP", 0, 2.62f, 0.07f, 0.11f);
+            glEnable(GL_LIGHTING);
+            glPopMatrix();
         }
     }
 }
 
-void GLWidget::drawArch(float z, bool finish)
+RoadPose GLWidget::poseOn(float s, float d, float heading, int path) const
 {
-    float c = roadCenter(z);
-    glPushMatrix();
-    glTranslatef(c, 0, z);
+    RoadPose p;
+    p.y = simEngine.heightAt(s, d, path);
+    const auto &R = path ? simEngine.circuit().shortcut() : simEngine.circuit().slices();
+    const sim::Slice &sl = R[size_t(std::clamp(int(path ? s : simEngine.wrapS(s)), 0, int(R.size()) - 1))];
+    const float g = simEngine.gradeAt(s, path), b = simEngine.bankAt(s, path);   // rise per metre along, drop per metre to the right
+    const float sh = std::sin(heading), ch = std::cos(heading);
+    const float fwdAlong = sh * sl.tx + ch * sl.tz, fwdRight = sh * sl.tz - ch * sl.tx;      // car's forward on the road
+    const float rightAlong = ch * sl.tx - sh * sl.tz, rightRight = ch * sl.tz + sh * sl.tx;  // car's right on the road
+    p.pitch = std::atan(g * fwdAlong - b * fwdRight) * 180.0f / PI;
+    p.roll = std::atan(g * rightAlong - b * rightRight) * 180.0f / PI;
+    return p;
+}
 
-    if (!finish) {
-        // Simple start line arch
-        glColor3f(0.20f, 0.22f, 0.26f);
-        boxAt(-roadHalf() - 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
-        boxAt( roadHalf() + 1.0f, 3.5f, 0, 0.5f, 3.5f, 0.5f);
-        boxAt(0, 7.2f, 0, roadHalf() + 1.5f, 0.4f, 0.5f);
-        glColor3f(0.12f, 0.14f, 0.18f);
-        boxAt(0, 6.2f, 0, 6.0f, 0.9f, 0.08f);
-        glDisable(GL_LIGHTING);
-        glColor3f(0.2f, 1.0f, 0.4f);
-        drawText3D("START", 0, 5.7f, 0.12f, 0.14f);
-        glEnable(GL_LIGHTING);
-    } else {
-        // ===================================================================
-        // GRAND ARCADE FINISH ARCH GANTRY & SCENIC FINISH ZONE
-        // ===================================================================
-        float archW = roadHalf() + 2.5f;
+bool GLWidget::inView(float x, float z, float radius) const
+{
+    const float dx = x - viewX, dz = z - viewZ, reach = VIEW_DIST + radius;
+    return dx * dx + dz * dz < reach * reach && dx * viewFx + dz * viewFz > -30.0f - radius;
+}
 
-        // 1. Heavy dark metallic vertical pillars with industrial lattice trusses
-        glColor3f(0.13f, 0.15f, 0.18f);
-        // Base pedestals
-        boxAt(-archW, 0.6f, 0, 1.25f, 0.6f, 1.25f);
-        boxAt( archW, 0.6f, 0, 1.25f, 0.6f, 1.25f);
-        // Vertical column uprights
-        boxAt(-archW - 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
-        boxAt(-archW + 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
-        boxAt( archW - 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
-        boxAt( archW + 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
+void GLWidget::placeOnRoad(float s, float d) const
+{
+    float x, z;
+    simEngine.pointAt(s, d, x, z);
+    // on the road and its verge: the road's height; further out: the ground's
+    const float y = std::fabs(d) <= railOffset() + 1.0f ? simEngine.heightAt(s, d) : groundAt(x, z);
+    glTranslatef(x, y, z);
+    glRotatef(-simEngine.headingAt(s) * 180.0f / PI, 0, 1, 0);   // local -Z = along the road, +X = right
+}
 
-        // Diagonal truss cross-bars between column posts
-        glColor3f(0.20f, 0.23f, 0.28f);
-        for (float py = 1.5f; py < 8.0f; py += 1.6f) {
-            for (float side : {-1.0f, 1.0f}) {
-                float px = side * archW;
-                boxAt(px, py, 0, 0.60f, 0.10f, 0.25f);
+// The whole circuit is recorded once per map and road width, in display lists of about
+// 50 m each: the asphalt (textured), then kerbs, lines, guard rails and posts.
+void GLWidget::buildRoad()
+{
+    for (const RoadChunk &c : roadChunks) glDeleteLists(c.surface, 2);
+    roadChunks.clear();
+    roadKey = trackKey();
+
+    const auto &S = simEngine.circuit().slices();
+    const int n = int(S.size());
+    const float half = roadHalf(), rail = railOffset();
+    const ThemeLook &th = THEMES[themeIndex()];
+
+    // Where another part of the circuit passes close by (Neon City's street under the raised
+    // highway): no pillars there
+    std::vector<char> cross(size_t(n), 0);
+    const float near2 = (rail + 4.0f) * (rail + 4.0f), coarse2 = (rail + 8.0f) * (rail + 8.0f);
+    auto dist2 = [&](int i, int j) {
+        const float dx = S[size_t(i)].x - S[size_t(j)].x, dz = S[size_t(i)].z - S[size_t(j)].z;
+        return dx * dx + dz * dz;
+    };
+    for (int i = 0; i < n; ++i)
+        for (int j0 = 0; j0 < n; j0 += 4) {               // every 4th slice first, then its neighbours
+            if (dist2(i, j0) > coarse2) continue;
+            for (int j = std::max(0, j0 - 3); j <= std::min(n - 1, j0 + 3); ++j) {
+                const int di = std::min(std::abs(i - j), n - std::abs(i - j));
+                if (di >= 120 && dist2(i, j) < near2) cross[size_t(i)] = 1;
             }
         }
-
-        // 2. Angled truss shoulders
-        for (float side : {-1.0f, 1.0f}) {
-            glPushMatrix();
-            glTranslatef(side * (archW - 1.2f), 7.6f, 0);
-            glRotatef(side * -35.0f, 0, 0, 1);
-            glColor3f(0.15f, 0.17f, 0.21f);
-            boxAt(0, 0, 0, 0.70f, 1.6f, 0.55f);
-            glPopMatrix();
-        }
-
-        // 3. Spanning horizontal crossbeam double girder
-        glColor3f(0.12f, 0.14f, 0.17f);
-        boxAt(0, 8.40f, 0, archW + 0.8f, 0.32f, 0.55f); // Lower girder
-        boxAt(0, 9.45f, 0, archW + 0.8f, 0.22f, 0.55f); // Upper girder
-        // Lattice connector struts between girders
-        glColor3f(0.22f, 0.26f, 0.32f);
-        for (float gx = -archW; gx <= archW; gx += 2.0f) {
-            boxAt(gx, 8.92f, 0, 0.10f, 0.35f, 0.40f);
-        }
-
-        // 4. Stadium Floodlight Units atop the gantry crossbeam
-        const float floodX[] = {-6.2f, -3.1f, 0.0f, 3.1f, 6.2f};
-        for (float fx : floodX) {
-            // Swivel mounting bracket
-            glColor3f(0.22f, 0.24f, 0.28f);
-            boxAt(fx, 9.80f, 0.0f, 0.09f, 0.15f, 0.09f);
-            // Floodlight dark metal casing
-            glColor3f(0.12f, 0.13f, 0.16f);
-            boxAt(fx, 10.25f, 0.0f, 0.46f, 0.34f, 0.22f);
-            // Glowing warm stadium lamp face facing +Z
-            glDisable(GL_LIGHTING);
-            glColor3f(1.0f, 0.96f, 0.78f);
-            boxAt(fx, 10.25f, 0.23f, 0.40f, 0.28f, 0.02f);
-            glEnable(GL_LIGHTING);
-        }
-
-        // 5. Large Illuminated FINISH Signboard Box
-        glColor3f(0.08f, 0.09f, 0.12f);
-        boxAt(0, 7.35f, 0.22f, 7.0f, 1.45f, 0.26f);
-
-        // Pulsing electric cyan neon border framing
-        glDisable(GL_LIGHTING);
-        float pulse = 0.85f + 0.15f * std::sin(float(simEngine.getTick()) * 0.25f);
-        glColor3f(0.15f, 0.90f * pulse, 1.0f * pulse); // Electric Cyan neon
-        boxAt(0, 8.75f, 0.49f, 6.95f, 0.06f, 0.02f);  // Top rim
-        boxAt(0, 5.95f, 0.49f, 6.95f, 0.06f, 0.02f);  // Bottom rim
-        boxAt(-6.95f, 7.35f, 0.49f, 0.06f, 1.40f, 0.02f); // Left rim
-        boxAt( 6.95f, 7.35f, 0.49f, 0.06f, 1.40f, 0.02f); // Right rim
-
-        // Flanking Checkered Flag Panels on Left & Right sides of the sign
-        for (float side : {-1.0f, 1.0f}) {
-            float startChkX = (side < 0) ? -6.7f : 4.1f;
-            float chkCellW = 0.65f, chkCellH = 0.55f;
-            for (int cr = 0; cr < 4; ++cr) {
-                for (int cc = 0; cc < 4; ++cc) {
-                    if ((cr + cc) % 2 == 0) glColor3f(0.98f, 0.98f, 0.98f);
-                    else                   glColor3f(0.04f, 0.04f, 0.04f);
-                    float cx0 = startChkX + cc * chkCellW;
-                    float cy0 = 6.25f + cr * chkCellH;
-                    glBegin(GL_QUADS);
-                    glVertex3f(cx0, cy0, 0.49f);
-                    glVertex3f(cx0 + chkCellW, cy0, 0.49f);
-                    glVertex3f(cx0 + chkCellW, cy0 + chkCellH, 0.49f);
-                    glVertex3f(cx0, cy0 + chkCellH, 0.49f);
-                    glEnd();
+    auto at = [&](int i) { return size_t(i % n); };
+    std::vector<int> stretchOf(size_t(n), -1);           // which tunnel / bridge a slice is in
+    for (size_t k = 0; k < stretches.size(); ++k)
+        for (int i = stretches[k].a; i < stretches[k].b; ++i) stretchOf[at(i)] = int(k);
+    auto kind = [&](int i) { return stretchOf[at(i)] < 0 ? 0 : stretches[size_t(stretchOf[at(i)])].kind; };
+    // where the shortcut leaves or joins, no main-road rail stands across it (per side)
+    const bool cut = simEngine.hasShortcut();
+    const float cutRail = cut ? simEngine.roadHalfAt(1.0f, 1) + 4.0f : 0.0f;
+    std::vector<char> railGap[2] = {std::vector<char>(size_t(n), 0), std::vector<char>(size_t(n), 0)};
+    if (cut)
+        for (int e = 0; e < 2; ++e) {
+            const float join = e == 0 ? simEngine.shortcutFrom() : simEngine.shortcutTo();
+            for (int k = -160; k <= 160; ++k) {
+                const float s = simEngine.wrapS(join + float(k));
+                for (int side = 0; side < 2; ++side) {
+                    float x, z, os, od;
+                    simEngine.pointAt(s, (side ? 1.0f : -1.0f) * rail, x, z);
+                    simEngine.project(x, z, e == 0 ? 0.0f : simEngine.shortcutEnd(), os, od, 1, false);
+                    if (std::fabs(od) < cutRail + 1.0f && os > 0.5f && os < simEngine.shortcutEnd() - 0.5f)
+                        railGap[side][at(int(s))] = 1;
                 }
             }
         }
+    const StructureLook &lk = structureLook(simEngine.mapDef().theme);
+    auto P = [&](float s, float d, float y) {                 // y: above the road's surface
+        float x, z;
+        simEngine.pointAt(s, d, x, z);
+        glVertex3f(x, simEngine.heightAt(s, d) + y, z);
+    };
 
-        // Top Header Badge: "GRAND PRIX"
-        glColor3f(0.10f, 0.11f, 0.14f);
-        boxAt(0, 8.88f, 0.26f, 1.9f, 0.22f, 0.06f);
-        glColor3f(1.0f, 0.88f, 0.25f);
-        drawText3D("GRAND PRIX", 0, 8.78f, 0.35f, 0.038f);
+    const float oldTs = g_ts;
+    g_ts = 0.125f;                                       // one asphalt tile every 8 m
+    const int CH = 50;
+    const int nEnd = simEngine.sprint() ? n - 1 : n;     // a sprint is an open road: no slice after the last
+    for (int c0 = 0; c0 < nEnd; c0 += CH) {
+        const int c1 = std::min(c0 + CH, nEnd);          // slices c0..c1 (on a circuit slice n is slice 0 again)
+        RoadChunk rc;
+        rc.surface = glGenLists(2);
+        rc.marks = rc.surface + 1;
+        simEngine.pointAt(0.5f * float(c0 + c1), 0.0f, rc.x, rc.z);
 
-        // Bright bold glowing golden-yellow "FINISH" block letters
-        glColor3f(1.0f, 0.94f, 0.18f); // Golden yellow neon
-        drawText3D("FINISH", 0, 6.65f, 0.51f, 0.20f);
-
-        // 6. Dual Lower Digital Sub-Panels (Hanging Banners)
-        // Left hanging panel: "WINNER!"
-        glColor3f(0.20f, 0.22f, 0.26f);
-        boxAt(-4.3f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f); // Hanger bracket
-        boxAt(-2.3f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f);
-        glColor3f(0.08f, 0.09f, 0.12f);
-        boxAt(-3.3f, 5.15f, 0.22f, 2.2f, 0.38f, 0.12f);
-        // Glowing amber border
-        glColor3f(1.0f * pulse, 0.85f * pulse, 0.15f);
-        boxAt(-3.3f, 5.50f, 0.35f, 2.15f, 0.04f, 0.02f);
-        boxAt(-3.3f, 4.80f, 0.35f, 2.15f, 0.04f, 0.02f);
-        boxAt(-5.45f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
-        boxAt(-1.15f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
-        glColor3f(1.0f, 0.88f, 0.15f);
-        drawText3D("WINNER!", -3.3f, 5.02f, 0.36f, 0.068f);
-
-        // Right hanging panel: "CONGRATULATIONS!"
-        glColor3f(0.20f, 0.22f, 0.26f);
-        boxAt( 2.0f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f); // Hanger bracket
-        boxAt( 4.6f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f);
-        glColor3f(0.08f, 0.09f, 0.12f);
-        boxAt( 3.3f, 5.15f, 0.22f, 2.7f, 0.38f, 0.12f);
-        // Glowing cyan border
-        glColor3f(0.20f, 0.90f * pulse, 1.0f * pulse);
-        boxAt( 3.3f, 5.50f, 0.35f, 2.65f, 0.04f, 0.02f);
-        boxAt( 3.3f, 4.80f, 0.35f, 2.65f, 0.04f, 0.02f);
-        boxAt( 0.65f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
-        boxAt( 5.95f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
-        glColor3f(0.95f, 0.98f, 1.0f);
-        drawText3D("CONGRATULATIONS!", 3.3f, 5.06f, 0.36f, 0.036f);
-
-        // Dark electrical conduits connecting to side pillars
-        glColor3f(0.12f, 0.12f, 0.14f);
-        boxAt(-6.2f, 5.15f, 0.18f, 1.0f, 0.05f, 0.05f);
-        boxAt( 6.8f, 5.15f, 0.18f, 0.9f, 0.05f, 0.05f);
-
-        glEnable(GL_LIGHTING);
-
-        // 7. Multi-row high-contrast checkered finish line on the asphalt
-        const int n = 20;
-        float sq = (roadHalf() * 2.0f) / n;
-        for (int i = 0; i < n; ++i) {
-            for (int row = 0; row < 4; ++row) {
-                if ((i + row) % 2) glColor3f(0.03f, 0.03f, 0.03f);
-                else               glColor3f(0.98f, 0.98f, 0.98f);
-                float x0 = -roadHalf() + i * sq, z0 = -row * sq * 0.9f;
-                glBegin(GL_QUADS);
-                glVertex3f(x0, 0.04f, z0);
-                glVertex3f(x0 + sq, 0.04f, z0);
-                glVertex3f(x0 + sq, 0.04f, z0 - sq * 0.9f);
-                glVertex3f(x0, 0.04f, z0 - sq * 0.9f);
-                glEnd();
+        // 1. Asphalt
+        glNewList(rc.surface, GL_COMPILE);
+        glBegin(GL_QUAD_STRIP);
+        for (int i = c0; i <= c1; ++i) {
+            const sim::Slice &sl = S[at(i)];
+            const float g = sl.grade, b = simEngine.bankAt(float(i));
+            glNormal3f(-g * sl.tx + b * sl.tz, 1.0f, g * sl.tz + b * sl.tx);   // tilted with slope and banking
+            for (float d : {-half, half}) {
+                float x, z;
+                simEngine.pointAt(float(i), d, x, z);
+                tv(x, simEngine.heightAt(float(i), d), z, d, float(i));
             }
         }
+        glEnd();
+        glEndList();
 
-        // Dark tire rubber skid trails leading up to the checkered line
-        glColor4f(0.02f, 0.02f, 0.02f, 0.65f);
-        for (int l = 0; l < simEngine.laneCount(); ++l) {
-            const float lx = simEngine.laneX(l);
-            for (float s : {-0.8f, 0.8f}) {
-                glBegin(GL_QUADS);
-                glVertex3f(lx + s - 0.22f, 0.045f, 24.0f);
-                glVertex3f(lx + s + 0.22f, 0.045f, 24.0f);
-                glVertex3f(lx + s + 0.22f, 0.045f, -6.0f);
-                glVertex3f(lx + s - 0.22f, 0.045f, -6.0f);
-                glEnd();
+        glNewList(rc.marks, GL_COMPILE);
+        glNormal3f(0, 1, 0);
+        // 2. Red & white kerbs, 4 m each
+        glBegin(GL_QUADS);
+        for (float side : {-1.0f, 1.0f})
+            for (int i = c0; i < c1; ++i) {
+                glColor3fv(((i / 4) % 2 == 0) ? th.kerbA : th.kerbB);
+                P(i, side * half, 0.02f); P(i, side * (half + 0.7f), 0.02f);
+                P(i + 1, side * (half + 0.7f), 0.02f); P(i + 1, side * half, 0.02f);
+            }
+        // 3. Solid white edge lines
+        glColor3f(0.95f, 0.95f, 0.95f);
+        for (float side : {-1.0f, 1.0f})
+            for (int i = c0; i < c1; ++i) {
+                const float d = side * (half - 0.40f);
+                P(i, d - 0.12f, 0.025f); P(i, d + 0.12f, 0.025f); P(i + 1, d + 0.12f, 0.025f); P(i + 1, d - 0.12f, 0.025f);
+            }
+        // 4. Dashed lane lines: 4 m line, 4 m gap
+        glColor3f(0.96f, 0.94f, 0.88f);
+        for (int l = 1; l < simEngine.laneCount(); ++l) {
+            const float off = simEngine.laneX(l) - 0.5f * sim::LANE_WIDTH;
+            for (int i = (c0 + 7) / 8 * 8; i < c1; i += 8) {
+                P(i, off - 0.14f, 0.03f); P(i, off + 0.14f, 0.03f);
+                P(i + 4, off + 0.14f, 0.03f); P(i + 4, off - 0.14f, 0.03f);
             }
         }
-
-        // Red & white racing rumble curbs (curbing) flanking finish straight
+        glEnd();
+        // 5. Guard rails, posts every 12 m
         for (float side : {-1.0f, 1.0f}) {
-            for (float rz = 45.0f; rz >= -45.0f; rz -= 3.0f) {
-                int curbStep = int(std::floor((rz + 100.0f) / 3.0f));
-                if (curbStep % 2 == 0) glColor3f(0.92f, 0.16f, 0.16f);
-                else                   glColor3f(0.98f, 0.98f, 0.98f);
-                float rx0 = side * roadHalf();
-                float rx1 = side * (roadHalf() + 0.95f);
+            glColor3f(0.70f, 0.72f, 0.76f);
+            for (int i = (c0 + 11) / 12 * 12; i < c1; i += 12) {
+                if (kind(i) || railGap[side > 0][at(i)]) continue;   // tunnel walls and bridge parapets instead
+                float x, z;
+                simEngine.pointAt(float(i), side * rail, x, z);
+                boxAt(x, simEngine.heightAt(float(i), side * rail) + 0.55f, z, 0.10f, 0.55f, 0.10f);
+            }
+            glColor3f(0.82f, 0.84f, 0.88f);
+            for (float ry : {0.50f, 0.95f}) {
+                bool open = false;
+                for (int i = c0; i <= c1; ++i) {
+                    if (kind(i) || railGap[side > 0][at(i)]) {
+                        if (open) { glEnd(); open = false; }
+                        continue;
+                    }
+                    if (!open) { glBegin(GL_QUAD_STRIP); open = true; }
+                    const sim::Slice &sl = S[at(i)];
+                    glNormal3f(-side * sl.tz, 0, -side * sl.tx);  // facing the road
+                    float x, z;
+                    simEngine.pointAt(float(i), side * rail, x, z);
+                    const float h = simEngine.heightAt(float(i), side * rail);
+                    glVertex3f(x, h + ry - 0.12f, z);
+                    glVertex3f(x, h + ry + 0.12f, z);
+                }
+                if (open) glEnd();
+            }
+        }
+
+        // 6. Tunnels: walls on the rail lines (an avalanche gallery has columns on its valley
+        //    side), a ceiling with lights, and a portal face at both ends
+        auto strip = [&](int k, const std::function<void(int)> &put) {    // a quad strip over slices of kind k
+            bool open = false;
+            for (int i = c0; i <= c1; ++i) {
+                if (kind(i) != k) {
+                    if (open) { glEnd(); open = false; }
+                    continue;
+                }
+                if (!open) { glBegin(GL_QUAD_STRIP); open = true; }
+                put(i);
+            }
+            if (open) glEnd();
+        };
+        auto rightOf = [&](int i, float side) {          // the normal facing out of the road on that side
+            const sim::Slice &sl = S[at(i)];
+            glNormal3f(side * sl.tz, 0.0f, side * sl.tx);
+        };
+        glColor3fv(lk.wall);
+        for (float side : {-1.0f, 1.0f}) {
+            bool openSide = false;                       // the valley side of a gallery
+            for (const Stretch &st : stretches)
+                if (st.kind == 1 && lk.oneSided && side * st.side < 0.0f) openSide = true;
+            if (openSide) {
+                for (int i = (c0 + 7) / 8 * 8; i < c1; i += 8) {
+                    if (kind(i) != 1) continue;
+                    float x, z;
+                    simEngine.pointAt(float(i), side * rail, x, z);
+                    boxAt(x, simEngine.heightAt(float(i), side * rail) + 0.5f * lk.tunnelH, z, 0.35f, 0.5f * lk.tunnelH, 0.35f);
+                }
+                continue;
+            }
+            strip(1, [&](int i) { rightOf(i, -side); P(i, side * rail, 0.0f); P(i, side * rail, lk.tunnelH); });
+        }
+        strip(1, [&](int i) { glNormal3f(0, -1, 0); P(i, -rail, lk.tunnelH); P(i, rail, lk.tunnelH); });
+        glDisable(GL_LIGHTING);
+        glColor3f(1.0f, 0.90f, 0.62f);
+        glBegin(GL_QUADS);
+        for (int i = (c0 + 14) / 15 * 15; i < c1; i += 15) {
+            if (kind(i) != 1) continue;
+            P(i, -0.7f, lk.tunnelH - 0.05f); P(i, 0.7f, lk.tunnelH - 0.05f);
+            P(i + 2, 0.7f, lk.tunnelH - 0.05f); P(i + 2, -0.7f, lk.tunnelH - 0.05f);
+        }
+        glEnd();
+        glEnable(GL_LIGHTING);
+        for (const Stretch &st : stretches) {
+            if (st.kind != 1) continue;
+            for (int end : {st.a, st.b}) {
+                if (end < c0 || end >= c1) continue;
+                const float s = float(end), facing = end == st.a ? -1.0f : 1.0f;
+                const sim::Slice &sl = S[at(end)];
+                const float W = rail + 16.0f, top = std::max(lk.tunnelH + 0.8f, lk.hill + 1.0f);
+                glColor3fv(lk.wall);
+                glNormal3f(facing * sl.tx, 0.0f, -facing * sl.tz);
                 glBegin(GL_QUADS);
-                glVertex3f(rx0, 0.035f, rz);
-                glVertex3f(rx1, 0.035f, rz);
-                glVertex3f(rx1, 0.035f, rz - 3.0f);
-                glVertex3f(rx0, 0.035f, rz - 3.0f);
+                P(s, -W, -0.6f); P(s, -rail, -0.6f); P(s, -rail, top); P(s, -W, top);
+                P(s, rail, -0.6f); P(s, W, -0.6f); P(s, W, top); P(s, rail, top);
+                P(s, -rail, lk.tunnelH); P(s, rail, lk.tunnelH); P(s, rail, top); P(s, -rail, top);
                 glEnd();
             }
         }
 
-        // 8. Roadside Sponsor Billboards
-        for (float sbz : { 28.0f, 62.0f, 96.0f }) {
-            for (float side : { -1.0f, 1.0f }) {
-                float bx = side * (railOffset() + 3.2f);
+        // 7. Bridges and the raised highway: a deck from rail to rail, parapets instead of
+        //    guard rails, and pillars every 28 m (never on a road underneath)
+        for (int k : {2, 3}) {
+            glColor3fv(lk.deck);
+            for (float side : {-1.0f, 1.0f})                 // the deck beside the asphalt
+                strip(k, [&](int i) { glNormal3f(0, 1, 0); P(i, side * half, -0.01f); P(i, side * (rail + 0.4f), -0.01f); });
+            strip(k, [&](int i) { glNormal3f(0, -1, 0); P(i, -(rail + 0.4f), -1.5f); P(i, rail + 0.4f, -1.5f); });
+            glColor3fv(k == 3 ? lk.deck : lk.parapet);
+            for (float side : {-1.0f, 1.0f}) {
+                strip(k, [&](int i) { rightOf(i, -side); P(i, side * rail, 0.0f); P(i, side * rail, 1.1f); });
+                strip(k, [&](int i) { glNormal3f(0, 1, 0); P(i, side * rail, 1.1f); P(i, side * (rail + 0.4f), 1.1f); });
+                strip(k, [&](int i) { rightOf(i, side); P(i, side * (rail + 0.4f), -1.5f); P(i, side * (rail + 0.4f), 1.1f); });
+            }
+        }
+        glColor3fv(lk.deck);
+        for (int i = (c0 + 27) / 28 * 28; i < c1; i += 28) {
+            if (!kind(i) || kind(i) == 1 || cross[at(i)]) continue;
+            const Stretch &st = stretches[size_t(stretchOf[at(i)])];
+            if (i < st.a + 10 || i > st.b - 10) continue;
+            float x, z;
+            simEngine.pointAt(float(i), 0.0f, x, z);
+            glPushMatrix();
+            glTranslatef(x, simEngine.heightAt(float(i), 0.0f) - 1.5f - 30.0f, z);
+            glRotatef(-simEngine.headingAt(float(i)) * 180.0f / PI, 0, 1, 0);
+            box(2.2f, 30.0f, 1.3f);
+            glPopMatrix();
+        }
+        glEndList();
+        roadChunks.push_back(rc);
+    }
+
+    // 8. The shortcut: a dirt road at half width, 2 cm under the main road where the two
+    //    overlap, with guard rails except where it runs inside the main road's
+    if (cut) {
+        const auto &CS = simEngine.circuit().shortcut();
+        const int m = int(CS.size());
+        std::vector<char> inMain[2] = {std::vector<char>(size_t(m), 0), std::vector<char>(size_t(m), 0)};
+        for (int i = 0; i < m; ++i)
+            for (int side = 0; side < 2; ++side) {
+                float x, z, ms, md;
+                simEngine.pointAt(float(i), (side ? 1.0f : -1.0f) * cutRail, x, z, 1);
+                simEngine.project(x, z, i < m / 2 ? simEngine.shortcutFrom() + float(i) : simEngine.shortcutTo() - float(m - i), ms, md, 0, false);
+                inMain[side][size_t(i)] = std::fabs(md) < rail + 1.0f;
+            }
+        for (int c0 = 0; c0 < m - 1; c0 += CH) {
+            const int c1 = std::min(c0 + CH, m - 1);
+            RoadChunk rc;
+            rc.surface = glGenLists(2);
+            rc.marks = rc.surface + 1;
+            rc.dirt = true;
+            simEngine.pointAt(0.5f * float(c0 + c1), 0.0f, rc.x, rc.z, 1);
+            glNewList(rc.surface, GL_COMPILE);
+            glBegin(GL_QUAD_STRIP);
+            glNormal3f(0, 1, 0);
+            for (int i = c0; i <= c1; ++i) {
+                const float h = simEngine.roadHalfAt(float(i), 1);
+                for (float d : {-h, h}) {
+                    float x, z;
+                    simEngine.pointAt(float(i), d, x, z, 1);
+                    tv(x, simEngine.heightAt(float(i), d, 1) - 0.02f, z, d, float(i));
+                }
+            }
+            glEnd();
+            glEndList();
+            glNewList(rc.marks, GL_COMPILE);
+            for (float side : {-1.0f, 1.0f}) {
+                const int sd = side > 0;
+                glColor3f(0.55f, 0.42f, 0.30f);          // wooden posts every 6 m
+                for (int i = (c0 + 5) / 6 * 6; i < c1; i += 6) {
+                    if (inMain[sd][size_t(i)]) continue;
+                    float x, z;
+                    simEngine.pointAt(float(i), side * cutRail, x, z, 1);
+                    boxAt(x, simEngine.heightAt(float(i), side * cutRail, 1) + 0.5f, z, 0.09f, 0.5f, 0.09f);
+                }
+                glColor3f(0.62f, 0.50f, 0.36f);
+                bool open = false;
+                for (int i = c0; i <= c1; ++i) {
+                    if (inMain[sd][size_t(i)]) {
+                        if (open) { glEnd(); open = false; }
+                        continue;
+                    }
+                    if (!open) { glBegin(GL_QUAD_STRIP); open = true; }
+                    const sim::Slice &sl = CS[size_t(i)];
+                    glNormal3f(-side * sl.tz, 0, -side * sl.tx);
+                    float x, z;
+                    simEngine.pointAt(float(i), side * cutRail, x, z, 1);
+                    const float y = simEngine.heightAt(float(i), side * cutRail, 1);
+                    glVertex3f(x, y + 0.65f, z);
+                    glVertex3f(x, y + 0.85f, z);
+                }
+                if (open) glEnd();
+            }
+            glEndList();
+            roadChunks.push_back(rc);
+        }
+    }
+    g_ts = oldTs;
+}
+
+void GLWidget::drawRoad()
+{
+    ensureTrackGeometry();
+    std::vector<const RoadChunk *> seen;
+    for (const RoadChunk &c : roadChunks)
+        if (inView(c.x, c.z, 45.0f)) seen.push_back(&c);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, texAsphalt);
+    glColor3f(1, 1, 1);
+    for (const RoadChunk *c : seen) if (!c->dirt) glCallList(c->surface);
+    glBindTexture(GL_TEXTURE_2D, texSand);              // the shortcut: packed dirt
+    glColor3f(0.78f, 0.62f, 0.45f);
+    for (const RoadChunk *c : seen) if (c->dirt) glCallList(c->surface);
+    glDisable(GL_TEXTURE_2D);
+    for (const RoadChunk *c : seen) glCallList(c->marks);
+}
+
+// A sprint's road ends: a row of red and white barriers across the road and its verges
+void GLWidget::drawRoadEnds()
+{
+    const float len = simEngine.lapLength();
+    for (float s : {2.0f, len - 4.0f}) {
+        float x, z;
+        simEngine.pointAt(s, 0.0f, x, z);
+        if (!inView(x, z, 40.0f)) continue;
+        glPushMatrix();
+        placeOnRoad(s, 0.0f);
+        const float w = railOffset() + 3.0f;
+        int k = 0;
+        for (float d = -w; d <= w + 0.01f; d += 2.0f, ++k) {
+            if (k % 2) glColor3f(0.95f, 0.95f, 0.95f); else glColor3f(0.90f, 0.12f, 0.10f);
+            boxAt(d, 0.6f, 0.0f, 1.0f, 0.6f, 0.4f);
+        }
+        glPopMatrix();
+    }
+}
+
+void GLWidget::drawArch(float s0, const char *word)
+{
+    // ===================================================================
+    // GRAND ARCADE START/FINISH GANTRY & SCENIC FINISH ZONE
+    // ===================================================================
+    glPushMatrix();
+    placeOnRoad(s0, 0.0f);
+    float archW = roadHalf() + 2.5f;
+
+    // 1. Heavy dark metallic vertical pillars with industrial lattice trusses
+    glColor3f(0.13f, 0.15f, 0.18f);
+    // Base pedestals
+    boxAt(-archW, 0.6f, 0, 1.25f, 0.6f, 1.25f);
+    boxAt( archW, 0.6f, 0, 1.25f, 0.6f, 1.25f);
+    // Vertical column uprights
+    boxAt(-archW - 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
+    boxAt(-archW + 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
+    boxAt( archW - 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
+    boxAt( archW + 0.55f, 4.2f, 0, 0.28f, 4.2f, 0.35f);
+
+    // Diagonal truss cross-bars between column posts
+    glColor3f(0.20f, 0.23f, 0.28f);
+    for (float py = 1.5f; py < 8.0f; py += 1.6f) {
+        for (float side : {-1.0f, 1.0f}) {
+            float px = side * archW;
+            boxAt(px, py, 0, 0.60f, 0.10f, 0.25f);
+        }
+    }
+
+    // 2. Angled truss shoulders
+    for (float side : {-1.0f, 1.0f}) {
+        glPushMatrix();
+        glTranslatef(side * (archW - 1.2f), 7.6f, 0);
+        glRotatef(side * -35.0f, 0, 0, 1);
+        glColor3f(0.15f, 0.17f, 0.21f);
+        boxAt(0, 0, 0, 0.70f, 1.6f, 0.55f);
+        glPopMatrix();
+    }
+
+    // 3. Spanning horizontal crossbeam double girder
+    glColor3f(0.12f, 0.14f, 0.17f);
+    boxAt(0, 8.40f, 0, archW + 0.8f, 0.32f, 0.55f); // Lower girder
+    boxAt(0, 9.45f, 0, archW + 0.8f, 0.22f, 0.55f); // Upper girder
+    // Lattice connector struts between girders
+    glColor3f(0.22f, 0.26f, 0.32f);
+    for (float gx = -archW; gx <= archW; gx += 2.0f) {
+        boxAt(gx, 8.92f, 0, 0.10f, 0.35f, 0.40f);
+    }
+
+    // 4. Stadium Floodlight Units atop the gantry crossbeam
+    const float floodX[] = {-6.2f, -3.1f, 0.0f, 3.1f, 6.2f};
+    for (float fx : floodX) {
+        // Swivel mounting bracket
+        glColor3f(0.22f, 0.24f, 0.28f);
+        boxAt(fx, 9.80f, 0.0f, 0.09f, 0.15f, 0.09f);
+        // Floodlight dark metal casing
+        glColor3f(0.12f, 0.13f, 0.16f);
+        boxAt(fx, 10.25f, 0.0f, 0.46f, 0.34f, 0.22f);
+        // Glowing warm stadium lamp face facing +Z
+        glDisable(GL_LIGHTING);
+        glColor3f(1.0f, 0.96f, 0.78f);
+        boxAt(fx, 10.25f, 0.23f, 0.40f, 0.28f, 0.02f);
+        glEnable(GL_LIGHTING);
+    }
+
+    // 5. Large Illuminated FINISH Signboard Box
+    glColor3f(0.08f, 0.09f, 0.12f);
+    boxAt(0, 7.35f, 0.22f, 7.0f, 1.45f, 0.26f);
+
+    // Pulsing electric cyan neon border framing
+    glDisable(GL_LIGHTING);
+    float pulse = 0.85f + 0.15f * std::sin(float(simEngine.getTick()) * 0.25f);
+    glColor3f(0.15f, 0.90f * pulse, 1.0f * pulse); // Electric Cyan neon
+    boxAt(0, 8.75f, 0.49f, 6.95f, 0.06f, 0.02f);  // Top rim
+    boxAt(0, 5.95f, 0.49f, 6.95f, 0.06f, 0.02f);  // Bottom rim
+    boxAt(-6.95f, 7.35f, 0.49f, 0.06f, 1.40f, 0.02f); // Left rim
+    boxAt( 6.95f, 7.35f, 0.49f, 0.06f, 1.40f, 0.02f); // Right rim
+
+    // Flanking Checkered Flag Panels on Left & Right sides of the sign
+    for (float side : {-1.0f, 1.0f}) {
+        float startChkX = (side < 0) ? -6.7f : 4.1f;
+        float chkCellW = 0.65f, chkCellH = 0.55f;
+        for (int cr = 0; cr < 4; ++cr) {
+            for (int cc = 0; cc < 4; ++cc) {
+                if ((cr + cc) % 2 == 0) glColor3f(0.98f, 0.98f, 0.98f);
+                else                   glColor3f(0.04f, 0.04f, 0.04f);
+                float cx0 = startChkX + cc * chkCellW;
+                float cy0 = 6.25f + cr * chkCellH;
+                glBegin(GL_QUADS);
+                glVertex3f(cx0, cy0, 0.49f);
+                glVertex3f(cx0 + chkCellW, cy0, 0.49f);
+                glVertex3f(cx0 + chkCellW, cy0 + chkCellH, 0.49f);
+                glVertex3f(cx0, cy0 + chkCellH, 0.49f);
+                glEnd();
+            }
+        }
+    }
+
+    // Top Header Badge: "GRAND PRIX"
+    glColor3f(0.10f, 0.11f, 0.14f);
+    boxAt(0, 8.88f, 0.26f, 1.9f, 0.22f, 0.06f);
+    glColor3f(1.0f, 0.88f, 0.25f);
+    drawText3D("GRAND PRIX", 0, 8.78f, 0.35f, 0.038f);
+
+    // Bright bold glowing golden-yellow "FINISH" block letters
+    glColor3f(1.0f, 0.94f, 0.18f); // Golden yellow neon
+    drawText3D(word, 0, 6.65f, 0.51f, 0.20f);
+
+    // 6. Dual Lower Digital Sub-Panels (Hanging Banners)
+    // Left hanging panel: "WINNER!"
+    glColor3f(0.20f, 0.22f, 0.26f);
+    boxAt(-4.3f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f); // Hanger bracket
+    boxAt(-2.3f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f);
+    glColor3f(0.08f, 0.09f, 0.12f);
+    boxAt(-3.3f, 5.15f, 0.22f, 2.2f, 0.38f, 0.12f);
+    // Glowing amber border
+    glColor3f(1.0f * pulse, 0.85f * pulse, 0.15f);
+    boxAt(-3.3f, 5.50f, 0.35f, 2.15f, 0.04f, 0.02f);
+    boxAt(-3.3f, 4.80f, 0.35f, 2.15f, 0.04f, 0.02f);
+    boxAt(-5.45f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
+    boxAt(-1.15f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
+    glColor3f(1.0f, 0.88f, 0.15f);
+    const bool start = std::strcmp(word, "START") == 0;   // a sprint's start gantry wishes luck instead
+    drawText3D(start ? "GO GO GO" : "WINNER!", -3.3f, 5.02f, 0.36f, start ? 0.052f : 0.068f);
+
+    // Right hanging panel: "CONGRATULATIONS!"
+    glColor3f(0.20f, 0.22f, 0.26f);
+    boxAt( 2.0f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f); // Hanger bracket
+    boxAt( 4.6f, 5.70f, 0.22f, 0.05f, 0.25f, 0.05f);
+    glColor3f(0.08f, 0.09f, 0.12f);
+    boxAt( 3.3f, 5.15f, 0.22f, 2.7f, 0.38f, 0.12f);
+    // Glowing cyan border
+    glColor3f(0.20f, 0.90f * pulse, 1.0f * pulse);
+    boxAt( 3.3f, 5.50f, 0.35f, 2.65f, 0.04f, 0.02f);
+    boxAt( 3.3f, 4.80f, 0.35f, 2.65f, 0.04f, 0.02f);
+    boxAt( 0.65f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
+    boxAt( 5.95f, 5.15f, 0.35f, 0.04f, 0.35f, 0.02f);
+    glColor3f(0.95f, 0.98f, 1.0f);
+    drawText3D(start ? "GOOD LUCK!" : "CONGRATULATIONS!", 3.3f, 5.06f, 0.36f, start ? 0.050f : 0.036f);
+
+    // Dark electrical conduits connecting to side pillars
+    glColor3f(0.12f, 0.12f, 0.14f);
+    boxAt(-6.2f, 5.15f, 0.18f, 1.0f, 0.05f, 0.05f);
+    boxAt( 6.8f, 5.15f, 0.18f, 0.9f, 0.05f, 0.05f);
+
+    glEnable(GL_LIGHTING);
+
+    // 7. Multi-row high-contrast checkered finish line on the asphalt
+    const int n = 20;
+    float sq = (roadHalf() * 2.0f) / n;
+    for (int i = 0; i < n; ++i) {
+        for (int row = 0; row < 4; ++row) {
+            if ((i + row) % 2) glColor3f(0.03f, 0.03f, 0.03f);
+            else               glColor3f(0.98f, 0.98f, 0.98f);
+            float x0 = -roadHalf() + i * sq, z0 = -row * sq * 0.9f;
+            glBegin(GL_QUADS);
+            glVertex3f(x0, 0.04f, z0);
+            glVertex3f(x0 + sq, 0.04f, z0);
+            glVertex3f(x0 + sq, 0.04f, z0 - sq * 0.9f);
+            glVertex3f(x0, 0.04f, z0 - sq * 0.9f);
+            glEnd();
+        }
+    }
+    glPopMatrix();
+
+    // The rest follows the road's bends: each piece stands at its own place, lz metres
+    // before the line (negative: after it) and lx metres right of the centre line. A piece
+    // that would stand on another part of the circuit is left out.
+    auto at = [&](float lz, float lx, const std::function<void()> &draw) {
+        float x, z;
+        simEngine.pointAt(s0 - lz, lx, x, z);
+        if (simEngine.roadDistance(x, z, std::fabs(lx)) < std::fabs(lx) - 3.0f) return;
+        glPushMatrix();
+        placeOnRoad(s0 - lz, lx);
+        draw();
+        glPopMatrix();
+    };
+    auto rv = [&](float lz, float lx, float y) {               // y: above the road's surface
+        float x, z;
+        simEngine.pointAt(s0 - lz, lx, x, z);
+        glVertex3f(x, simEngine.heightAt(s0 - lz, lx) + y, z);
+    };
+
+    // Dark tire rubber skid trails leading up to the checkered line
+    glColor4f(0.02f, 0.02f, 0.02f, 0.65f);
+    for (int l = 0; l < simEngine.laneCount(); ++l) {
+        for (float sd : {-0.8f, 0.8f}) {
+            const float lx = simEngine.laneX(l) + sd;
+            glBegin(GL_QUAD_STRIP);
+            for (float lz = 24.0f; lz >= -6.0f; lz -= 3.0f) {
+                rv(lz, lx - 0.22f, 0.045f);
+                rv(lz, lx + 0.22f, 0.045f);
+            }
+            glEnd();
+        }
+    }
+
+    // Red & white racing rumble curbs (curbing) flanking finish straight
+    glBegin(GL_QUADS);
+    for (float side : {-1.0f, 1.0f}) {
+        for (float rz = 45.0f; rz >= -45.0f; rz -= 3.0f) {
+            int curbStep = int(std::floor((rz + 100.0f) / 3.0f));
+            if (curbStep % 2 == 0) glColor3f(0.92f, 0.16f, 0.16f);
+            else                   glColor3f(0.98f, 0.98f, 0.98f);
+            float rx0 = side * roadHalf();
+            float rx1 = side * (roadHalf() + 0.95f);
+            rv(rz, rx0, 0.035f); rv(rz, rx1, 0.035f); rv(rz - 3.0f, rx1, 0.035f); rv(rz - 3.0f, rx0, 0.035f);
+        }
+    }
+    glEnd();
+
+    // 8. Roadside Sponsor Billboards
+    for (float sbz : { 28.0f, 62.0f, 96.0f }) {
+        for (float side : { -1.0f, 1.0f }) {
+            at(sbz, side * (railOffset() + 3.2f), [&]() {
                 glColor3f(0.25f, 0.25f, 0.28f);
-                boxAt(bx, 1.5f, sbz, 0.15f, 1.5f, 0.15f);
+                boxAt(0, 1.5f, 0, 0.15f, 1.5f, 0.15f);
                 if (int(sbz) % 2 == 0) glColor3f(0.10f, 0.25f, 0.70f); // Blue
                 else                   glColor3f(0.85f, 0.15f, 0.15f); // Red
-                boxAt(bx, 3.2f, sbz, 0.12f, 1.0f, 4.5f);
+                boxAt(0, 3.2f, 0, 0.12f, 1.0f, 4.5f);
                 glDisable(GL_LIGHTING);
                 glColor3f(1.0f, 0.9f, 0.2f);
-                glPushMatrix();
-                glTranslatef(bx - side * 0.15f, 3.0f, sbz);
+                glTranslatef(-side * 0.15f, 3.0f, 0);
                 glRotatef(side > 0 ? -90.0f : 90.0f, 0, 1, 0);
                 drawText3D(int(sbz) % 2 == 0 ? "ARCADE RACING" : "TURBO SPEED", 0, 0, 0, 0.14f);
-                glPopMatrix();
                 glEnable(GL_LIGHTING);
-            }
+            });
         }
+    }
 
-        // 9. LUSH SCENIC NATURAL LANDSCAPE (Spectators removed, replaced with coastal & mountain scenery)
-        // (only on the green maps; desert, snow and city keep their own scenery to the end)
-        const sim::MapTheme finTheme = simEngine.mapDef().theme;
-        if (finTheme == sim::MapTheme::Countryside || finTheme == sim::MapTheme::Coast) {
+    // 9. LUSH SCENIC NATURAL LANDSCAPE (Spectators removed, replaced with coastal & mountain scenery)
+    // (only on the green maps; desert, snow and city keep their own scenery to the end)
+    const sim::MapTheme finTheme = simEngine.mapDef().theme;
+    if (finTheme == sim::MapTheme::Countryside || finTheme == sim::MapTheme::Coast) {
         // A. Tropical Palm Trees along both sides of track
         const struct PalmPos { float x, z, scale, rot; } palms[] = {
             { -roadHalf() - 4.5f,  20.0f, 1.05f,   35.0f },
@@ -2213,77 +3988,95 @@ void GLWidget::drawArch(float z, bool finish)
             {  roadHalf() + 9.0f, -85.0f, 1.25f,  -20.0f }
         };
         for (const auto &p : palms) {
-            glPushMatrix();
-            glTranslatef(p.x, 0.0f, p.z);
-            glRotatef(p.rot, 0, 1, 0);
-            glScalef(p.scale, p.scale, p.scale);
-            drawPalmTree();
-            glPopMatrix();
+            at(p.z, p.x, [&]() {
+                glRotatef(p.rot, 0, 1, 0);
+                glScalef(p.scale, p.scale, p.scale);
+                drawPalmTree();
+            });
         }
 
         // B. Rolling Lush Green Scenery Hills on both flanks
         for (float hz : { 80.0f, 40.0f, 0.0f, -40.0f, -80.0f }) {
             // Left flank rolling hills
-            glColor3f(0.16f, 0.54f, 0.20f);
-            boxAt(-roadHalf() - 18.0f, 3.5f, hz, 10.0f, 3.5f, 18.0f);
-            glColor3f(0.14f, 0.48f, 0.18f);
-            boxAt(-roadHalf() - 24.0f, 6.0f, hz + 5.0f, 8.0f, 6.0f, 14.0f);
-
+            at(hz, -roadHalf() - 18.0f, [&]() { glColor3f(0.16f, 0.54f, 0.20f); boxAt(0, 3.5f, 0, 10.0f, 3.5f, 18.0f); });
+            at(hz + 5.0f, -roadHalf() - 24.0f, [&]() { glColor3f(0.14f, 0.48f, 0.18f); boxAt(0, 6.0f, 0, 8.0f, 6.0f, 14.0f); });
             // Right flank rolling coastal mounds
-            glColor3f(0.18f, 0.56f, 0.22f);
-            boxAt( roadHalf() + 17.0f, 3.0f, hz, 9.0f, 3.0f, 18.0f);
+            at(hz, roadHalf() + 17.0f, [&]() { glColor3f(0.18f, 0.56f, 0.22f); boxAt(0, 3.0f, 0, 9.0f, 3.0f, 18.0f); });
         }
 
         // C. Coastal Rocky Cliff Formations overlooking the sea (Right side)
-        glColor3f(0.42f, 0.40f, 0.38f);
         for (float rz : { 30.0f, -10.0f, -50.0f, -90.0f }) {
-            boxAt(roadHalf() + 26.0f, 4.5f, rz, 7.0f, 4.5f, 16.0f);
-            glColor3f(0.36f, 0.34f, 0.32f);
-            boxAt(roadHalf() + 29.0f, 8.0f, rz - 6.0f, 6.0f, 8.0f, 12.0f);
+            at(rz, roadHalf() + 26.0f, [&]() { glColor3f(0.42f, 0.40f, 0.38f); boxAt(0, 4.5f, 0, 7.0f, 4.5f, 16.0f); });
+            at(rz - 6.0f, roadHalf() + 29.0f, [&]() { glColor3f(0.36f, 0.34f, 0.32f); boxAt(0, 8.0f, 0, 6.0f, 8.0f, 12.0f); });
         }
 
         // D. Scenic Lighthouse on the coastal cliff in the distance past the finish line
-        glPushMatrix();
-        glTranslatef(roadHalf() + 32.0f, 0.0f, -95.0f);
-        drawLighthouse();
-        glPopMatrix();
-        }
+        at(-95.0f, roadHalf() + 32.0f, [&]() { drawLighthouse(); });
+    }
 
-        // E. Red & White Chevron Direction Signs on the bend past the finish line
-        for (float cz : { -32.0f, -62.0f, -92.0f }) {
-            float cx = roadHalf() + 2.2f;
+    // E. Red & White Chevron Direction Signs past the finish line
+    for (float cz : { -32.0f, -62.0f, -92.0f }) {
+        at(cz, roadHalf() + 2.2f, [&]() {
             // Sign post
             glColor3f(0.30f, 0.32f, 0.35f);
-            boxAt(cx, 1.3f, cz, 0.08f, 1.3f, 0.08f);
+            boxAt(0, 1.3f, 0, 0.08f, 1.3f, 0.08f);
             // Red board
             glColor3f(0.85f, 0.15f, 0.15f);
-            boxAt(cx, 2.2f, cz, 0.06f, 0.55f, 1.4f);
+            boxAt(0, 2.2f, 0, 0.06f, 0.55f, 1.4f);
             // White chevron arrows ">>>"
             glDisable(GL_LIGHTING);
             glColor3f(0.98f, 0.98f, 0.98f);
-            glPushMatrix();
-            glTranslatef(cx - 0.08f, 2.05f, cz);
+            glTranslatef(-0.08f, 2.05f, 0);
             glRotatef(-90.0f, 0, 1, 0);
             drawText3D(">>>", 0, 0, 0, 0.06f);
-            glPopMatrix();
             glEnable(GL_LIGHTING);
-        }
+        });
     }
-    glPopMatrix();
 }
 
 // ===========================================================================
 //  SCENERY PROPS
 // ===========================================================================
-void GLWidget::drawProps(float camZ)
+void GLWidget::drawProps()
 {
-    for (const sim::Prop &p : simEngine.getProps()) {
-        if (p.z > camZ + 30.0f || p.z < camZ - VIEW_DIST) continue;
+    const auto &props = simEngine.getProps();
+    if (propBaseKey != groundKey || propBase.size() != props.size()) {
+        // the lowest and highest ground under each prop (corners of its footprint)
+        propBase.assign(props.size(), PropBase());
+        for (size_t i = 0; i < props.size(); ++i) {
+            const sim::Prop &p = props[i];
+            const float r = p.type == sim::Prop::House || p.type == sim::Prop::Building ? 6.0f * std::max(1.0f, p.type == sim::Prop::House ? p.scale : 1.0f)
+                          : p.type == sim::Prop::Rock ? (p.scale > 3.0f ? 4.2f : 1.4f) * p.scale
+                          : p.type == sim::Prop::Lighthouse ? 3.0f : 0.0f;
+            float lo = groundAt(p.x, p.z), hi = lo;
+            if (r > 0.0f)
+                for (float ox : {-r, r})
+                    for (float oz : {-r, r}) {
+                        const float h = groundAt(p.x + ox, p.z + oz);
+                        lo = std::min(lo, h);
+                        hi = std::max(hi, h);
+                    }
+            propBase[i] = {lo, hi};
+        }
+        propBaseKey = groundKey;
+    }
+    for (size_t pi = 0; pi < props.size(); ++pi) {
+        const sim::Prop &p = props[pi];
+        if (!inView(p.x, p.z, p.type == sim::Prop::Rock ? 6.0f * p.scale : 12.0f)) continue;
+        const bool built = p.type == sim::Prop::House || p.type == sim::Prop::Building;
+        const PropBase &pb = propBase[pi];
         glPushMatrix();
-        glTranslatef(p.x, 0.0f, p.z);
+        glTranslatef(p.x, built ? pb.top : pb.base - 0.15f, p.z);   // houses on their highest corner
         glRotatef(p.rot, 0, 1, 0);
+        if (built && pb.top - pb.base > 0.05f) {          // a stone foundation down to the lowest
+            const float hx = p.type == sim::Prop::House ? 5.6f * p.scale : 6.2f;
+            const float hz = p.type == sim::Prop::House ? 4.1f * p.scale : 5.2f;
+            const float depth = pb.top - pb.base + 0.4f;
+            glColor3f(0.52f, 0.50f, 0.47f);
+            boxAt(0, 0.05f - depth * 0.5f, 0, hx, depth * 0.5f, hz);
+        }
         if (p.type == sim::Prop::Building) {           // scale = height only, footprint stays
-            drawBuilding(p.scale, p.palette, int(-p.z));
+            drawBuilding(p.scale, p.palette, int(std::fabs(p.x) + std::fabs(p.z)));
             glPopMatrix();
             continue;
         }
@@ -2469,27 +4262,28 @@ void GLWidget::drawBuilding(float heightScale, int palette, int seed)
     glEnable(GL_LIGHTING);
 }
 
-void GLWidget::drawSea(float camZ)
+void GLWidget::drawSea()
 {
-    // Beach, surf and ocean to the right of the coastal road (follows the road's bends)
+    // Beach, surf and ocean east of the coastal circuit: the shore runs north-south
+    const float sx = simEngine.seaLineX();
+    if (viewX + VIEW_DIST < sx - 50.0f) return;          // too far inland to see it
     const float seg = 8.0f;
-    float startZ = std::ceil((camZ + 40.0f) / seg) * seg, endZ = camZ - VIEW_DIST - 20.0f;
+    const float startZ = std::floor((viewZ - VIEW_DIST - 20.0f) / seg) * seg, endZ = viewZ + VIEW_DIST + 20.0f;
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_LIGHTING);
     struct Band { float x0, x1; float c0[4], c1[4]; float y; };
     const float wave = 0.6f * std::sin(simEngine.getTick() * 0.03f);
     const Band bands[4] = {
-        {railOffset() + 1.0f,  railOffset() + 15.0f, {0.86f, 0.78f, 0.58f, 1.0f}, {0.80f, 0.72f, 0.52f, 1.0f}, -0.02f},
-        {railOffset() + 15.0f + wave, railOffset() + 16.2f + wave, {0.95f, 0.97f, 1.0f, 0.9f}, {0.75f, 0.92f, 0.95f, 0.9f}, 0.01f},
-        {railOffset() + 16.0f, railOffset() + 45.0f, {0.24f, 0.66f, 0.72f, 1.0f}, {0.08f, 0.36f, 0.55f, 1.0f}, 0.0f},
-        {railOffset() + 45.0f, railOffset() + 700.0f, {0.08f, 0.36f, 0.55f, 1.0f}, {0.04f, 0.22f, 0.42f, 1.0f}, 0.0f},
+        {sx - 50.0f, sx - 8.0f, {0.86f, 0.78f, 0.58f, 1.0f}, {0.80f, 0.72f, 0.52f, 1.0f}, 0.32f},
+        {sx - 8.0f + wave, sx - 6.8f + wave, {0.95f, 0.97f, 1.0f, 0.9f}, {0.75f, 0.92f, 0.95f, 0.9f}, 0.34f},
+        {sx - 7.0f, sx + 22.0f, {0.24f, 0.66f, 0.72f, 1.0f}, {0.08f, 0.36f, 0.55f, 1.0f}, 0.0f},
+        {sx + 22.0f, sx + 700.0f, {0.08f, 0.36f, 0.55f, 1.0f}, {0.04f, 0.22f, 0.42f, 1.0f}, 0.0f},
     };
     for (const Band &b : bands) {
         glBegin(GL_QUAD_STRIP);
-        for (float z = startZ; z >= endZ; z -= seg) {
-            float c = roadCenter(z);
-            glColor4fv(b.c0); glVertex3f(c + b.x0, b.y, z);
-            glColor4fv(b.c1); glVertex3f(c + b.x1, b.y, z);
+        for (float z = startZ; z <= endZ; z += seg) {
+            glColor4fv(b.c0); glVertex3f(b.x0, b.y, z);
+            glColor4fv(b.c1); glVertex3f(b.x1, b.y, z);
         }
         glEnd();
     }
@@ -2691,13 +4485,17 @@ void GLWidget::drawTorch(int palette, float phase)
 // ===========================================================================
 //  OBSTACLES
 // ===========================================================================
-void GLWidget::drawObstacles(float camZ)
+void GLWidget::drawObstacles()
 {
     for (const sim::Obstacle &o : simEngine.getObstacles()) {
-        if (o.z > camZ + 30.0f || o.z < camZ - VIEW_DIST) continue;
+        if (!inView(o.x, o.z, 3.0f) || !simEngine.present(o.fromLap)) continue;
         glPushMatrix();
-        glTranslatef(o.x, o.y, o.z);
+        // o.y is the height above the road; a knocked-over one may lie away from its place
+        const float base = o.knocked ? simEngine.heightNear(o.x, o.z, o.s) : simEngine.heightAt(o.s, o.d);
+        glTranslatef(o.x, base + o.y, o.z);
         glRotatef(o.rot, 0, 1, 0);
+        if (o.block() && !o.knocked)                      // lies across a banked road
+            glRotatef(-std::asin(simEngine.bankAt(o.s)) * 180.0f / PI, 0, 0, 1);
 
         if (o.type == sim::Obstacle::Cone) {
             glColor3f(0.98f, 0.42f, 0.05f);
@@ -2717,6 +4515,29 @@ void GLWidget::drawObstacles(float camZ)
             glPopMatrix();
             glColor3f(0.95f, 0.95f, 0.95f);
             for (float by : {0.4f, 0.9f}) boxAt(0, by, 0, 0.62f, 0.06f, 0.62f);
+        } else if (o.type == sim::Obstacle::Tyres) {      // three black tyres, a white band on the middle one
+            glPushMatrix();
+            glRotatef(-90, 1, 0, 0);
+            for (int k = 0; k < 3; ++k) {
+                glColor3f(0.08f, 0.08f, 0.09f);
+                glPushMatrix(); glTranslatef(0, 0, 0.42f * k);
+                gluCylinder(quad, 0.65, 0.65, 0.40, 14, 1);
+                glPushMatrix(); glTranslatef(0, 0, 0.40f); gluDisk(quad, 0.28, 0.65, 14, 1); glPopMatrix();
+                glPopMatrix();
+            }
+            glPopMatrix();
+            glColor3f(0.95f, 0.95f, 0.95f);
+            boxAt(0, 0.63f, 0, 0.67f, 0.05f, 0.67f);
+        } else if (o.type == sim::Obstacle::Concrete) {   // a grey road block, red and white on top
+            glColor3f(0.62f, 0.62f, 0.60f);
+            boxAt(0, 0.55f, 0, o.hx, 0.55f, o.hz);
+            glColor3f(0.45f, 0.45f, 0.44f);
+            boxAt(0, 0.06f, 0, o.hx + 0.12f, 0.06f, o.hz + 0.12f);
+            for (float bx = -o.hx + 0.35f; bx < o.hx; bx += 0.7f) {
+                const int k = int((bx + o.hx) / 0.7f);
+                if (k % 2) glColor3f(0.90f, 0.12f, 0.10f); else glColor3f(0.96f, 0.96f, 0.96f);
+                boxAt(bx, 1.12f, 0, 0.35f, 0.04f, o.hz + 0.01f);
+            }
         } else {
             glColor3f(0.95f, 0.50f, 0.08f);
             boxAt(0, 0.5f, 0, o.hx, 0.5f, o.hz);
@@ -2733,6 +4554,41 @@ void GLWidget::drawObstacles(float camZ)
         }
         glPopMatrix();
     }
+}
+
+// While the shortcut is closed to your car (you are in the top 3) a red and white barrier
+// stands across its mouth, a few metres in
+void GLWidget::drawShortcutGate()
+{
+    const auto &cars = simEngine.getCars();
+    const int me = localCar();
+    if (!simEngine.hasShortcut() || me < 0 || me >= int(cars.size()) || !cars[size_t(me)].cutClosed || cars[size_t(me)].path != 0) return;
+    const float at = simEngine.shortcutGateS();          // where it has left the main road
+    float gx, gz;
+    simEngine.pointAt(at, 0.0f, gx, gz, 1);
+    if (!inView(gx, gz, 12.0f)) return;
+    const float half = simEngine.roadHalfAt(at, 1) + 0.5f;
+    glPushMatrix();
+    glTranslatef(gx, simEngine.heightAt(at, 0.0f, 1), gz);
+    glRotatef(-simEngine.headingAt(at, 1) * 180.0f / PI, 0, 1, 0);   // local -Z = along the road, +X = across it
+    for (float side : {-half, half}) {                   // posts
+        glColor3f(0.85f, 0.85f, 0.88f);
+        boxAt(side, 0.8f, 0, 0.15f, 0.8f, 0.15f);
+    }
+    const int bars = int(half * 2.0f / 1.2f) + 1;
+    for (int k = 0; k < bars; ++k) {                     // the board, striped
+        const float x0 = -half + float(k) * (2.0f * half / float(bars));
+        if (k % 2) glColor3f(0.95f, 0.95f, 0.95f); else glColor3f(0.90f, 0.12f, 0.10f);
+        boxAt(x0 + half / float(bars), 1.15f, 0, half / float(bars), 0.32f, 0.08f);
+    }
+    glColor3f(0.90f, 0.12f, 0.10f);                      // a sign: a red disc with a white bar
+    glPushMatrix();
+    glTranslatef(0, 2.3f, 0.1f);
+    gluDisk(quad, 0, 0.7, 20, 1);
+    glColor3f(0.97f, 0.97f, 0.97f);
+    boxAt(0, 0, 0.02f, 0.45f, 0.12f, 0.01f);
+    glPopMatrix();
+    glPopMatrix();
 }
 
 void GLWidget::drawNitroCanister()
@@ -2782,16 +4638,16 @@ void GLWidget::drawNitroCanister()
     glEnable(GL_LIGHTING);
 }
 
-void GLWidget::drawNitroPickups(float camZ)
+void GLWidget::drawNitroPickups()
 {
     float tickF = float(simEngine.getTick());
     for (const sim::NitroPickup &p : simEngine.getNitroPickups()) {
         if (!p.active) continue;
-        if (p.z > camZ + 30.0f || p.z < camZ - VIEW_DIST) continue;
+        if (!inView(p.x, p.z, 2.0f)) continue;
 
         glPushMatrix();
         float hoverY = 0.55f + 0.12f * std::sin(tickF * 0.08f + p.z * 0.1f);
-        glTranslatef(p.x, hoverY, p.z);
+        glTranslatef(p.x, simEngine.heightAt(p.s, p.d) + hoverY, p.z);
         glRotatef(tickF * 2.8f, 0, 1, 0);
         drawNitroCanister();
         glPopMatrix();
@@ -2881,7 +4737,7 @@ void GLWidget::drawCachedModel(int key, const std::function<void()> &draw)
 }
 
 // Soft contact shadow: dark rounded core that fades out towards the edges.
-void GLWidget::drawShadow(float x, float z, float heading, float hw, float hl)
+void GLWidget::drawShadow(float x, float z, float heading, float hw, float hl, const RoadPose &pose, float fade)
 {
     const int N = 28;
     auto pt = [&](int i, float k) {
@@ -2891,16 +4747,18 @@ void GLWidget::drawShadow(float x, float z, float heading, float hw, float hl)
         glVertex3f(px, 0, pz);
     };
     glPushMatrix();
-    glTranslatef(x, 0.045f, z);
+    glTranslatef(x, pose.y + 0.045f, z);
     glRotatef(-heading * 180.0f / PI, 0, 1, 0);
+    glRotatef(pose.pitch, 1, 0, 0);
+    glRotatef(pose.roll, 0, 0, 1);
     glBegin(GL_TRIANGLE_FAN);
-    glColor4f(0, 0, 0, 0.55f);
+    glColor4f(0, 0, 0, 0.55f * fade);
     glVertex3f(0, 0, 0);
     for (int i = 0; i <= N; ++i) pt(i, 0.80f);
     glEnd();
     glBegin(GL_QUAD_STRIP);
     for (int i = 0; i <= N; ++i) {
-        glColor4f(0, 0, 0, 0.55f); pt(i, 0.80f);
+        glColor4f(0, 0, 0, 0.55f * fade); pt(i, 0.80f);
         glColor4f(0, 0, 0, 0.0f);  pt(i, 1.25f);
     }
     glEnd();
@@ -2909,12 +4767,15 @@ void GLWidget::drawShadow(float x, float z, float heading, float hw, float hl)
 
 void GLWidget::drawCar(float x, float z, float heading, float roll, float pitch,
                        float steer, float spin, float r, float g, float b, bool nitro,
-                       const char *badge, float brake)
+                       const char *badge, float brake, const RoadPose &pose, float health,
+                       const FigureLook *driver)
 {
     using namespace carmodel;
     glPushMatrix();
-    glTranslatef(x, 0, z);
+    glTranslatef(x, pose.y, z);
     glRotatef(-heading * 180.0f / PI, 0, 1, 0);
+    glRotatef(pose.pitch, 1, 0, 0);                      // standing on the slope and banking
+    glRotatef(pose.roll, 0, 0, 1);
 
     // Wheels stay planted on the road; only the body rolls and pitches on its springs.
     float stDeg = steer * (180.0f / PI);
@@ -2940,11 +4801,42 @@ void GLWidget::drawCar(float x, float z, float heading, float roll, float pitch,
     if (badge) drawWing();                 // racers get a rear wing, road traffic doesn't
     reflectionPass(carBodyList, texEnv, 0.22f);
 
+    // the driver, sitting on the left behind the wheel and looking where the car steers.
+    // A dark cabin first, then the glass (not hiding what is behind it), then the driver -
+    // so the figure shows clearly through the tinted glass - then the glass's reflection.
+    if (driver) {
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, noSpec);
+        glColor3f(0.09f, 0.09f, 0.11f);                  // the cabin: tub, seats, dashboard
+        boxAt(0.0f, 0.66f, 0.15f, 0.68f, 0.26f, 0.92f);
+        boxAt(-0.34f, 0.85f, 0.62f, 0.21f, 0.30f, 0.07f);
+        boxAt( 0.34f, 0.85f, 0.62f, 0.21f, 0.30f, 0.07f);
+        boxAt(0.0f, 0.86f, -0.62f, 0.66f, 0.07f, 0.16f);
+    }
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, glassSpec);
     glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 90.0f);
-    glColor3f(0.05f, 0.06f, 0.08f);
+    if (driver) glDepthMask(GL_FALSE);
+    glColor4f(0.05f, 0.06f, 0.08f, driver ? 0.45f : 1.0f);
     glCallList(carGlassList);
-    reflectionPass(carGlassList, texEnv, 0.38f);
+    if (driver) {
+        glDepthMask(GL_TRUE);
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, paintSpec);
+        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 30.0f);
+        glPushMatrix();
+        glTranslatef(-0.34f, 0.20f, 0.18f);              // a toy figure: big head, filling the window
+        glScalef(1.25f, 1.25f, 1.25f);
+        FigurePose sit;
+        sit.hip = 82.0f;
+        sit.armL = sit.armR = 58.0f;
+        sit.headTurn = -steer * 35.0f;
+        drawBlockFigure(*driver, sit);
+        glPopMatrix();
+        glColor3f(0.08f, 0.08f, 0.09f);                  // steering wheel
+        boxAt(-0.34f, 0.86f, -0.20f, 0.12f, 0.018f, 0.018f);
+        boxAt(-0.34f, 0.74f, -0.20f, 0.12f, 0.018f, 0.018f);
+        boxAt(-0.45f, 0.80f, -0.20f, 0.018f, 0.06f, 0.018f);
+        boxAt(-0.23f, 0.80f, -0.20f, 0.018f, 0.06f, 0.018f);
+    }
+    reflectionPass(carGlassList, texEnv, driver ? 0.20f : 0.38f);
 
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, noSpec);
     glCallList(carTrimList);
@@ -2982,52 +4874,358 @@ void GLWidget::drawCar(float x, float z, float heading, float roll, float pitch,
     }
     endGlow();
 
-    // Overhead floating vehicle badge (e.g. [ 1 ], [ CPU ], [ 2 ])
+    // Overhead floating vehicle badge (e.g. [ 1 ], [ CPU ], [ 2 ]) and the car's health
     if (badge && *badge) {
-        float bLen = float(std::strlen(badge));
-        float hw = std::max(0.35f, bLen * 0.16f + 0.12f);
-        float hh = 0.24f;
-        float by = 2.25f;
-
-        // Dark background plate
-        glColor4f(0.05f, 0.07f, 0.12f, 0.92f);
-        boxAt(0, by, 0, hw, hh, 0.04f);
-
-        // Glowing border (Orange for CPU, Cyan for Player)
-        bool isCpu = (std::strcmp(badge, "CPU") == 0);
-        if (isCpu) glColor3f(1.0f, 0.45f, 0.20f);
-        else       glColor3f(0.20f, 0.90f, 1.0f);
-        float th = 0.02f;
-        boxAt(0, by + hh, 0.045f, hw, th, 0.005f);
-        boxAt(0, by - hh, 0.045f, hw, th, 0.005f);
-        boxAt(-hw, by, 0.045f, th, hh, 0.005f);
-        boxAt( hw, by, 0.045f, th, hh, 0.005f);
-
-        // Double-sided text
-        glColor3f(1.0f, 1.0f, 1.0f);
-        drawText3D(badge, 0, by - 0.10f, 0.055f, 0.038f);
-        glPushMatrix();
-        glRotatef(180.0f, 0, 1, 0);
-        drawText3D(badge, 0, by - 0.10f, 0.055f, 0.038f);
-        glPopMatrix();
-
-        // Small indicator triangle beneath the badge pointing down towards roof
-        glBegin(GL_TRIANGLES);
-        glVertex3f(-0.08f, by - hh, 0.045f);
-        glVertex3f( 0.08f, by - hh, 0.045f);
-        glVertex3f( 0.00f, by - hh - 0.12f, 0.045f);
-        glEnd();
+        glRotatef(-pose.roll, 0, 0, 1);                  // the plate stays upright on slopes and banking
+        glRotatef(-pose.pitch, 1, 0, 0);
+        drawPlate(badge, health);
     }
     glEnable(GL_LIGHTING);
 
     glPopMatrix();
 }
 
-void GLWidget::drawTruck(float x, float z, float heading, float spin, float r, float g, float b)
+// Name plate over a car (current matrix: the car's place, facing along it, upright) with the
+// car's health above it: ten blocks, green / yellow / red, blinking when nearly wrecked.
+void GLWidget::drawPlate(const char *badge, float health)
+{
+    float bLen = float(std::strlen(badge));
+    float hw = std::max(0.35f, bLen * 0.16f + 0.12f);
+    float letter = 0.038f;
+    const float MAX_HW = 1.40f;                       // long names: smaller letters, same plate
+    if (hw > MAX_HW) { letter *= (MAX_HW - 0.12f) / (bLen * 0.16f); hw = MAX_HW; }
+    float hh = 0.24f;
+    float by = 2.25f;
+
+    // Dark background plate
+    glColor4f(0.05f, 0.07f, 0.12f, 0.92f);
+    boxAt(0, by, 0, hw, hh, 0.04f);
+
+    // Glowing border (Orange for CPU, Cyan for Player)
+    bool isCpu = (std::strncmp(badge, "CPU", 3) == 0);
+    if (isCpu) glColor3f(1.0f, 0.45f, 0.20f);
+    else       glColor3f(0.20f, 0.90f, 1.0f);
+    float th = 0.02f;
+    boxAt(0, by + hh, 0.045f, hw, th, 0.005f);
+    boxAt(0, by - hh, 0.045f, hw, th, 0.005f);
+    boxAt(-hw, by, 0.045f, th, hh, 0.005f);
+    boxAt( hw, by, 0.045f, th, hh, 0.005f);
+
+    // Double-sided text
+    glColor3f(1.0f, 1.0f, 1.0f);
+    const float ly = by - 0.10f * letter / 0.038f;
+    drawText3D(badge, 0, ly, 0.055f, letter);
+    glPushMatrix();
+    glRotatef(180.0f, 0, 1, 0);
+    drawText3D(badge, 0, ly, 0.055f, letter);
+    glPopMatrix();
+
+    // Small indicator triangle beneath the badge pointing down towards roof
+    glBegin(GL_TRIANGLES);
+    glVertex3f(-0.08f, by - hh, 0.045f);
+    glVertex3f( 0.08f, by - hh, 0.045f);
+    glVertex3f( 0.00f, by - hh - 0.12f, 0.045f);
+    glEnd();
+
+    if (health >= 0.0f) {
+        const float hy = by + hh + 0.13f, bh = 0.055f, w = hw;
+        glColor4f(0.05f, 0.07f, 0.12f, 0.92f);
+        boxAt(0, hy, 0, w + 0.03f, bh + 0.03f, 0.03f);
+        const float k = std::clamp(health / 100.0f, 0.0f, 1.0f);
+        const bool blink = health < 25.0f && (simEngine.getTick() / 8) % 2 == 0;
+        if (health > 60.0f)      glColor3f(0.30f, 0.95f, 0.40f);
+        else if (health > 30.0f) glColor3f(1.00f, 0.80f, 0.20f);
+        else                     glColor3f(blink ? 1.0f : 0.75f, blink ? 0.45f : 0.12f, 0.10f);
+        for (int i = 0; i < 10; ++i) {                   // ten blocks of 10
+            const float f = std::clamp(k * 10.0f - float(i), 0.0f, 1.0f);
+            if (f <= 0.0f) break;
+            const float x0 = -w + (2.0f * w) * float(i) / 10.0f + 0.012f;
+            const float x1 = x0 + ((2.0f * w) / 10.0f - 0.024f) * f;
+            boxAt(0.5f * (x0 + x1), hy, 0.0f, 0.5f * (x1 - x0), bh, 0.035f);
+        }
+    }
+}
+
+// ===========================================================================
+//  BLOCK-FIGURE DRIVERS AND WRECKS
+// ===========================================================================
+namespace {
+// a box narrower at the bottom than at the top (the figure's chest): y0..y1, depth +/- hd
+void taperBox(float bw, float tw, float hd, float y0, float y1)
+{
+    const V3 c{0.0f, 0.5f * (y0 + y1), 0.0f};
+    const V3 b0{-bw, y0, -hd}, b1{bw, y0, -hd}, b2{bw, y0, hd}, b3{-bw, y0, hd};
+    const V3 t0{-tw, y1, -hd}, t1{tw, y1, -hd}, t2{tw, y1, hd}, t3{-tw, y1, hd};
+    glBegin(GL_QUADS);
+    quadN(b0, b1, t1, t0, c); quadN(b1, b2, t2, t1, c); quadN(b2, b3, t3, t2, c); quadN(b3, b0, t0, t3, c);
+    quadN(t0, t1, t2, t3, c); quadN(b3, b2, b1, b0, c);
+    glEnd();
+}
+} // namespace
+
+// The figure stands on its hip joint (origin), faces -Z like the cars, about 1.2 m tall:
+// legs below the hip, then belt, chest, arms on the shoulders, neck and a square head.
+void GLWidget::drawBlockFigure(const FigureLook &L, const FigurePose &P)
+{
+    auto col = [](const float *c, float k = 1.0f) { glColor3f(c[0] * k, c[1] * k, c[2] * k); };
+    for (int side : {-1, 1}) {                            // legs, hinged at the hip
+        glPushMatrix();
+        glTranslatef(float(side) * 0.075f, 0.0f, 0.0f);
+        glRotatef(P.hip + float(side) * P.legSwing, 1, 0, 0);
+        col(L.suit, 0.78f);
+        boxAt(0.0f, -0.20f, 0.0f, 0.064f, 0.20f, 0.080f);
+        glColor3f(0.12f, 0.12f, 0.14f);                   // boots
+        boxAt(0.0f, -0.42f, -0.025f, 0.066f, 0.030f, 0.105f);
+        glPopMatrix();
+    }
+    glColor3f(0.15f, 0.15f, 0.17f);                       // belt
+    boxAt(0.0f, 0.045f, 0.0f, 0.150f, 0.045f, 0.088f);
+    col(L.suit);
+    taperBox(0.142f, 0.195f, 0.090f, 0.09f, 0.46f);       // chest
+    col(L.trim);
+    boxAt(0.0f, 0.28f, -0.092f, 0.030f, 0.17f, 0.004f);   // stripe down the front
+    for (int side : {-1, 1}) {                            // arms: + = forward, 180 = up
+        glPushMatrix();
+        glTranslatef(float(side) * 0.215f, 0.425f, 0.0f);
+        glRotatef(side < 0 ? P.armL : P.armR, 1, 0, 0);
+        glRotatef(float(side) * 7.0f, 0, 0, 1);
+        col(L.suit);
+        boxAt(0.0f, -0.14f, 0.0f, 0.050f, 0.15f, 0.056f);
+        col(L.skin);                                      // the C-shaped hand
+        boxAt(0.0f, -0.325f, -0.028f, 0.040f, 0.036f, 0.016f);
+        boxAt(0.0f, -0.325f, 0.030f, 0.040f, 0.036f, 0.014f);
+        boxAt(0.0f, -0.352f, 0.0f, 0.040f, 0.010f, 0.044f);
+        glPopMatrix();
+    }
+    glPushMatrix();
+    glRotatef(P.headTurn, 0, 1, 0);
+    col(L.skin);
+    boxAt(0.0f, 0.485f, 0.0f, 0.052f, 0.025f, 0.052f);    // neck
+    boxAt(0.0f, 0.615f, 0.0f, 0.118f, 0.108f, 0.108f);    // head
+    glColor3f(0.08f, 0.07f, 0.06f);                       // face: pixel eyes and mouth
+    const float fz = -0.110f;
+    boxAt(-0.042f, 0.640f, fz, 0.013f, 0.019f, 0.003f);
+    boxAt( 0.042f, 0.640f, fz, 0.013f, 0.019f, 0.003f);
+    switch (L.face) {
+    case 1:                                               // grin
+        boxAt(0.0f, 0.578f, fz, 0.048f, 0.013f, 0.003f);
+        glColor3f(0.98f, 0.98f, 0.95f);
+        boxAt(0.0f, 0.582f, fz - 0.001f, 0.040f, 0.005f, 0.003f);
+        break;
+    case 2:                                               // frown, with angry brows
+        boxAt(0.0f, 0.575f, fz, 0.030f, 0.007f, 0.003f);
+        boxAt(-0.036f, 0.566f, fz, 0.008f, 0.008f, 0.003f);
+        boxAt( 0.036f, 0.566f, fz, 0.008f, 0.008f, 0.003f);
+        boxAt(-0.045f, 0.672f, fz, 0.022f, 0.006f, 0.003f);
+        boxAt( 0.045f, 0.672f, fz, 0.022f, 0.006f, 0.003f);
+        break;
+    case 3:                                               // surprised: "O"
+        boxAt(0.0f, 0.572f, fz, 0.018f, 0.022f, 0.003f);
+        break;
+    default:                                              // smile
+        boxAt(0.0f, 0.572f, fz, 0.030f, 0.007f, 0.003f);
+        boxAt(-0.036f, 0.582f, fz, 0.008f, 0.008f, 0.003f);
+        boxAt( 0.036f, 0.582f, fz, 0.008f, 0.008f, 0.003f);
+        break;
+    }
+    if (L.helmetOn) {                                     // open-face helmet, visor flipped up
+        col(L.helmet);
+        boxAt(0.0f, 0.745f, 0.008f, 0.133f, 0.030f, 0.125f);
+        boxAt(0.0f, 0.625f, 0.098f, 0.133f, 0.095f, 0.028f);
+        boxAt(-0.123f, 0.630f, 0.0f, 0.012f, 0.095f, 0.115f);
+        boxAt( 0.123f, 0.630f, 0.0f, 0.012f, 0.095f, 0.115f);
+        col(L.trim);
+        boxAt(0.0f, 0.777f, 0.008f, 0.026f, 0.004f, 0.120f);
+        glColor3f(0.10f, 0.12f, 0.18f);
+        boxAt(0.0f, 0.737f, -0.128f, 0.112f, 0.014f, 0.018f);
+    } else {                                              // hair
+        col(L.hair);
+        boxAt(0.0f, 0.738f, 0.010f, 0.124f, 0.030f, 0.116f);
+        boxAt(0.0f, 0.660f, 0.095f, 0.124f, 0.060f, 0.020f);
+    }
+    glPopMatrix();
+}
+
+// Each racer's driver: overalls in the car's colour, a helmet that stands out from it;
+// skin tones vary from car to car
+FigureLook GLWidget::driverLook(int carIdx, const sim::Car &c) const
+{
+    static const float SKIN[4][3] = {{1.00f, 0.80f, 0.25f}, {0.93f, 0.72f, 0.55f}, {0.62f, 0.42f, 0.28f},
+                                     {0.98f, 0.86f, 0.72f}};
+    FigureLook L;
+    L.suit[0] = c.r; L.suit[1] = c.g; L.suit[2] = c.b;
+    const float bright = 0.30f * c.r + 0.59f * c.g + 0.11f * c.b;
+    const float hel = bright > 0.55f ? 0.12f : 0.95f;
+    L.helmet[0] = L.helmet[1] = L.helmet[2] = hel;
+    L.trim[0] = L.trim[1] = L.trim[2] = 1.0f - hel * 0.8f;
+    if (c.rosterId >= 0) {                               // a named driver's own helmet
+        const sim::RosterDriver &R = sim::rosterDriver(c.rosterId);
+        L.helmet[0] = R.helmet[0]; L.helmet[1] = R.helmet[1]; L.helmet[2] = R.helmet[2];
+    }
+    if (isLocalCar(carIdx)) { L.helmet[0] = 1.0f; L.helmet[1] = 0.78f; L.helmet[2] = 0.15f; }   // players: gold helmet
+    const float *sk = SKIN[(carIdx * 7 + 1) % 4];
+    L.skin[0] = sk[0]; L.skin[1] = sk[1]; L.skin[2] = sk[2];
+    return L;
+}
+
+bool GLWidget::isLocalCar(int i) const
+{
+    if (isOnline()) return i == mySlot;
+    if (simEngine.getGameMode() == sim::GameSim::ModeSplitScreen) return i == 0 || i == 1;
+    return i == 0;
+}
+
+QByteArray GLWidget::carName(int i) const
+{
+    if (i >= 0 && i < int(nameOverride.size()) && !nameOverride[size_t(i)].isEmpty()) return nameOverride[size_t(i)];
+    if (isOnline()) return i >= 0 && i < racerNames.size() ? racerNames[i].toUtf8() : "CAR" + QByteArray::number(i + 1);
+    if (simEngine.getGameMode() == sim::GameSim::ModeSingle)
+        return i == 0 ? QByteArray("YOU") : simEngine.getCars().size() > 2 ? "CPU" + QByteArray::number(i) : QByteArray("CPU");
+    return "P" + QByteArray::number(i + 1);
+}
+
+void GLWidget::pushMsg(std::deque<HudMsg> &q, const QByteArray &text, float r, float g, float b, int ticks)
+{
+    HudMsg m;
+    m.text = text; m.r = r; m.g = g; m.b = b;
+    m.until = simEngine.getTick() + ticks;
+    q.push_back(m);
+    while (q.size() > 4) q.pop_front();
+}
+
+// The road (inside the guard rails) or the ground (beyond them) under a point
+float GLWidget::floorUnder(float x, float z, const sim::Car &ref) const
+{
+    float s, d;
+    simEngine.project(x, z, ref.s, s, d, ref.path, false);
+    if (std::fabs(d) <= railOffset() + 1.0f) return simEngine.heightAt(s, d, ref.path);
+    return groundAt(x, z);
+}
+
+// A thrown-out driver, worked out from where and how fast the wreck began (the same on
+// every computer, so online players see the same flight): out through the windscreen 4 ticks
+// after the crash, tumbling through the air, one bounce, a slide; lies still, gets up, runs
+// back to the car (which has stopped by then) and hops in just before it is back in the race.
+bool GLWidget::ejectedDriver(const sim::Car &c, EjectedDriver &o) const
+{
+    const int T0 = 4, W = sim::GameSim::WRECK_TIME_EJECT;
+    const int t = c.wreck;
+    if (!c.ejected || t < T0 || t >= W) return false;
+    const float sp = std::sqrt(c.wreckVx * c.wreckVx + c.wreckVz * c.wreckVz);
+    const float fx = sp > 0.01f ? c.wreckVx / sp : std::sin(c.heading), fz = sp > 0.01f ? c.wreckVz / sp : -std::cos(c.heading);
+    const float rx = -fz, rz = fx;                        // the car's right
+    const float side = c.wreckSpin >= 0.0f ? 1.0f : -1.0f;
+    float x = c.wreckX + fx * 0.4f, z = c.wreckZ + fz * 0.4f;
+    float y = floorUnder(x, z, c) + 1.0f;
+    float vx = c.wreckVx * 0.36f + rx * 0.05f * side, vz = c.wreckVz * 0.36f + rz * 0.05f * side, vy = 0.17f;
+    int bounces = 0, landed = -1, k = 0;
+    const int steps = t - T0;
+    for (; k < steps; ++k) {
+        if (bounces < 2) {
+            x += vx; z += vz; y += vy; vy -= sim::GRAVITY;
+            const float fl = floorUnder(x, z, c);
+            if (y <= fl) {
+                y = fl;
+                if (++bounces == 1) { vy = -vy * 0.35f; vx *= 0.5f; vz *= 0.5f; }
+                else { vy = 0.0f; landed = k; }
+            }
+        } else {                                          // sliding to a stop
+            x += vx; z += vz; vx *= 0.85f; vz *= 0.85f;
+            y = floorUnder(x, z, c);
+        }
+    }
+    o.face = 3;
+    o.heading = std::atan2(fx, -fz);
+    o.pose = FigurePose();
+    if (bounces < 2) {                                    // flying and tumbling
+        o.x = x; o.y = y; o.z = z;
+        o.rotX = 13.0f * float(steps);
+        o.rotZ = 5.0f * float(steps) * side;
+        o.pose.armL = o.pose.armR = 165.0f + 10.0f * std::sin(float(steps) * 0.5f);
+        o.pose.legSwing = 30.0f * std::sin(float(steps) * 0.4f);
+        return true;
+    }
+    // on the ground: lie still, get up, run back to the car's door, hop in
+    const int free = landed + T0;                         // the tick the slide began
+    const int lieEnd = std::min(free + 30, W - 70), upEnd = lieEnd + 14, runEnd = W - 16;
+    const float doorX = c.x - std::cos(c.heading) * 1.6f, doorZ = c.z - std::sin(c.heading) * 1.6f;
+    o.rotZ = 0.0f;
+    if (t < lieEnd) {
+        o.x = x; o.y = y + 0.10f; o.z = z;
+        o.rotX = 90.0f;                                   // face down
+        o.pose.armL = o.pose.armR = 150.0f;
+        o.face = 3;
+    } else if (t < upEnd) {
+        const float u = float(t - lieEnd) / float(upEnd - lieEnd);
+        o.x = x; o.y = y + 0.10f + 0.50f * u; o.z = z;
+        o.rotX = 90.0f * (1.0f - u);
+        o.pose.armL = o.pose.armR = 150.0f * (1.0f - u);
+        o.face = 0;
+    } else if (t < runEnd) {                              // run to the car
+        const float u = float(t - upEnd) / float(std::max(1, runEnd - upEnd));
+        const float e = u * u * (3.0f - 2.0f * u);
+        o.x = x + (doorX - x) * e; o.z = z + (doorZ - z) * e;
+        o.y = floorUnder(o.x, o.z, c) + 0.62f + 0.06f * std::fabs(std::sin(float(t) * 0.55f));
+        o.heading = std::atan2(doorX - x, -(doorZ - z));
+        o.rotX = 8.0f;                                    // leaning into the run
+        o.pose.legSwing = 45.0f * std::sin(float(t) * 0.55f);
+        o.pose.armL = 50.0f * std::sin(float(t) * 0.55f);
+        o.pose.armR = -o.pose.armL;
+        o.face = 1;
+    } else {                                              // hop in
+        const float u = float(t - runEnd) / float(W - runEnd);
+        o.x = doorX + (c.x - doorX) * u; o.z = doorZ + (c.z - doorZ) * u;
+        o.y = floorUnder(c.x, c.z, c) + 0.62f + 1.1f * std::sin(u * PI);
+        o.heading = c.heading;
+        o.rotX = 0.0f;
+        o.pose.hip = 80.0f * u;
+        o.pose.armL = o.pose.armR = 170.0f;
+        o.face = 1;
+    }
+    return true;
+}
+
+// A wreck: tumbles 1-2 rolls with a couple of hops while it slides, then sits smoking on the
+// verge until it is back in the race. The driver stays in, or flies out (ejectedDriver).
+void GLWidget::drawWreck(const sim::Car &c, int idx, const char *badge)
+{
+    const int t = c.wreck;
+    const float u = std::min(1.0f, float(t) / 60.0f);
+    const float ease = 1.0f - (1.0f - u) * (1.0f - u);
+    const float rollDeg = c.wreckSpin * 360.0f * ease;
+    const float hop = t < 60 ? 1.5f * std::fabs(std::sin(float(t) * PI / 28.0f)) * (1.0f - u) : 0.0f;
+    const RoadPose pose = carPose(c);
+    glPushMatrix();
+    glTranslatef(c.x, pose.y + hop + 0.75f, c.z);
+    glRotatef(-c.heading * 180.0f / PI, 0, 1, 0);
+    glRotatef(rollDeg, 0, 0, 1);
+    glRotatef(12.0f * std::sin(float(t) * 0.21f) * (1.0f - u), 1, 0, 0);
+    glTranslatef(0.0f, -0.75f, 0.0f);
+    const FigureLook dl = driverLook(idx, c);
+    const bool driverIn = !c.ejected || t < 4;
+    RoadPose flat;
+    drawCar(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, c.wheelSpin, c.r * 0.72f, c.g * 0.72f, c.b * 0.72f, false,
+            nullptr, 0.0f, flat, -1.0f, driverIn ? &dl : nullptr);
+    glPopMatrix();
+    if (badge && *badge) {                                // the plate stays over the wreck, upright
+        glPushMatrix();
+        glTranslatef(c.x, pose.y + hop, c.z);
+        glRotatef(-c.heading * 180.0f / PI, 0, 1, 0);
+        glDisable(GL_LIGHTING);
+        drawPlate(badge, 0.0f);
+        glEnable(GL_LIGHTING);
+        glPopMatrix();
+    }
+}
+
+void GLWidget::drawTruck(float x, float z, float heading, float spin, float r, float g, float b,
+                        const RoadPose &pose)
 {
     glPushMatrix();
-    glTranslatef(x, 0, z);
+    glTranslatef(x, pose.y, z);
     glRotatef(-heading * 180.0f / PI, 0, 1, 0);
+    glRotatef(pose.pitch, 1, 0, 0);
+    glRotatef(pose.roll, 0, 0, 1);
 
     for (float wz : {-2.1f, 0.9f, 2.2f}) {
         drawWheel(-1.25f, 0.48f, wz, 0.0f, spin, -1.0f, 0.48f);
@@ -3063,6 +5261,12 @@ float GLWidget::textWidth(const char *s, float ps) const
 {
     int n = int(std::strlen(s));
     return (n > 0) ? float(n) * 6.0f * ps - ps : 0.0f;
+}
+
+float GLWidget::fitSize(const char *s, float ps, float maxWidth) const
+{
+    const float w = textWidth(s, ps);
+    return (w > maxWidth && w > 0.0f) ? ps * maxWidth / w : ps;
 }
 
 void GLWidget::drawText(const char *s, float x, float y, float ps, float r, float g, float b)
@@ -3102,20 +5306,21 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
     // 1. TOP-LEFT: COMPACT RACE STATUS BADGE (P1/P2, Position, Lap, Distance)
     // =======================================================================
     (void)other;
-    static const char *ORD[8] = {"1ST", "2ND", "3RD", "4TH", "5TH", "6TH", "7TH", "8TH"};
+    static const char *ORD[sim::MAX_RACERS] = {"1ST", "2ND", "3RD", "4TH", "5TH", "6TH"};
     const auto &hudCars = simEngine.getCars();
     const int myIdx = (&me >= hudCars.data() && &me < hudCars.data() + hudCars.size()) ? int(&me - hudCars.data()) : 0;
-    const char *posStr = ORD[std::clamp(simEngine.rankOf(myIdx), 1, 8) - 1];
+    const char *posStr = ORD[std::clamp(simEngine.rankOf(myIdx), 1, sim::MAX_RACERS) - 1];
     char pTagBuf[8];
     snprintf(pTagBuf, sizeof pTagBuf, "P%d", playerNum);
     const char *pTag = pTagBuf;
 
-    float prog = std::clamp((0.0f - me.z) / sim::TRACK_LEN, 0.0f, 1.0f);
-    int lapNum = std::min(3, 1 + int(prog * 2.99f));
-    int remDist = int(std::max(0.0f, sim::TRACK_LEN + me.z));
+    const int laps = simEngine.getLaps();
+    int lapNum = std::clamp(me.lap + 1, 1, laps);
+    int remDist = int(std::max(0.0f, simEngine.raceDistance() - me.progress));
 
     char statusBuf[64];
-    snprintf(statusBuf, sizeof statusBuf, "%s %s  •  LAP %d/3  •  %dM", pTag, posStr, lapNum, remDist);
+    if (simEngine.sprint()) snprintf(statusBuf, sizeof statusBuf, "%s %s  •  SPRINT  •  %dM", pTag, posStr, remDist);
+    else                    snprintf(statusBuf, sizeof statusBuf, "%s %s  •  LAP %d/%d  •  %dM", pTag, posStr, lapNum, laps, remDist);
 
     float statPs = ps * 1.15f;
     float statW = textWidth(statusBuf, statPs) + ps * 6.0f;
@@ -3137,6 +5342,114 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
 
     // Text rendering
     drawText(statusBuf, statX + ps * 3.0f, statY + ps * 2.5f, statPs, 1.0f, 1.0f, 1.0f);
+
+    // Your place and health along the top, in the open space right of the race badge (your
+    // car has no name plate): POSITION 3RD / 6, then ten blocks of health (green / yellow /
+    // red, blinking when nearly gone)
+    {
+        const float rowH = 7.0f * ps + ps * 4.0f, rowW = std::max(statW, 150.0f * ps / 1.6f);   // the lines at the top left
+        const float hps = std::min(statPs, ps * 1.15f);
+        const float topX0 = statX + statW + 10.0f * ps;
+        const float topX1 = std::max(topX0 + 170.0f * hps, vw * 0.72f);   // (clear of the map on the right)
+        const float boxH = statH, by0 = statY;            // as tall as the badge, beside it
+        char posBuf[24];
+        snprintf(posBuf, sizeof posBuf, "POSITION %s / %d", posStr, int(hudCars.size()));
+        const float posW = textWidth("POSITION 6TH / 6", hps) + hps * 8.0f;
+        glColor4f(0.04f, 0.06f, 0.10f, 0.75f);
+        rect(topX0, by0, topX0 + posW, by0 + boxH);
+        const bool lead = simEngine.rankOf(myIdx) == 1;
+        drawText(posBuf, topX0 + hps * 3.0f, by0 + (boxH - 7.0f * hps) * 0.5f, hps, 1.0f, lead ? 0.85f : 1.0f, lead ? 0.25f : 1.0f);
+        const float hx0 = topX0 + posW + 6.0f * ps, hy0 = by0, hy1 = by0 + boxH, hpW = topX1 - hx0;
+        const float ps = hps;                            // (the health line in the top bar's size)
+        glColor4f(0.04f, 0.06f, 0.10f, 0.75f);
+        rect(hx0, hy0, hx0 + hpW, hy1);
+        const float hp = me.wreck > 0 ? 0.0f : me.health;
+        const bool blink = hp < 25.0f && (simEngine.getTick() / 8) % 2 == 0;
+        drawText("HP", hx0 + ps * 3.0f, hy0 + (boxH - 7.0f * ps) * 0.5f, ps, 0.80f, 0.86f, 0.95f);
+        char hpBuf[16];
+        if (me.wreck > 0) snprintf(hpBuf, sizeof hpBuf, "WRECKED");
+        else              snprintf(hpBuf, sizeof hpBuf, "%d", int(std::ceil(hp)));
+        const float numW = textWidth("WRECKED", ps);
+        drawText(hpBuf, hx0 + hpW - ps * 3.0f - textWidth(hpBuf, ps), hy0 + (boxH - 7.0f * ps) * 0.5f, ps,
+                 me.wreck > 0 ? 1.0f : 0.95f, me.wreck > 0 ? 0.35f : 0.95f, me.wreck > 0 ? 0.30f : 0.95f);
+        const float bx0 = hx0 + ps * 3.0f + textWidth("HP ", ps), bx1 = hx0 + hpW - ps * 5.0f - numW;
+        const float segW = (bx1 - bx0) / 10.0f;
+        for (int i = 0; i < 10; ++i) {
+            const float f = std::clamp(hp / 10.0f - float(i), 0.0f, 1.0f);
+            glColor4f(0.15f, 0.18f, 0.24f, 0.9f);
+            rect(bx0 + i * segW + ps * 0.5f, hy0 + ps * 2.0f, bx0 + (i + 1) * segW - ps * 0.5f, hy1 - ps * 2.0f);
+            if (f <= 0.0f) continue;
+            if (hp > 60.0f)      glColor4f(0.30f, 0.95f, 0.40f, 1.0f);
+            else if (hp > 30.0f) glColor4f(1.00f, 0.80f, 0.20f, 1.0f);
+            else                 glColor4f(blink ? 1.0f : 0.80f, blink ? 0.45f : 0.15f, 0.10f, 1.0f);
+            rect(bx0 + i * segW + ps * 0.5f, hy0 + ps * 2.0f, bx0 + i * segW + ps * 0.5f + (segW - ps) * f, hy1 - ps * 2.0f);
+        }
+        // at the top left, under the lap time: the L boost (not in split screen) - how long it
+        // has been held and what it costs now (green, yellow after 3 s, red and blinking from
+        // 10 s); then, after a wreck, the distance in which another one would eliminate you
+        {
+        const float ps = hps / 0.85f, hpH = rowH, hpW = rowW, hx0 = statX;
+        float ly1 = statY - 7.0f * ps * 0.85f - ps * 6.0f;
+        if (simEngine.boostAllowed() && me.wreck == 0) {
+            const float ly0 = ly1 - hpH;
+            glColor4f(0.04f, 0.06f, 0.10f, 0.65f);
+            rect(hx0, ly0, hx0 + hpW, ly1);
+            char lBuf[40];
+            const int stage = sim::GameSim::boostStage(me);
+            float lr = 0.35f, lg = 0.90f, lb = 1.0f;
+            if (me.boosting) {
+                if (stage == 2) snprintf(lBuf, sizeof lBuf, "OVERHEAT! -%d HP/S", int(sim::GameSim::BOOST_RATE[2]));
+                else snprintf(lBuf, sizeof lBuf, "BOOST %.1fS -%g HP/S", me.boostHold / 60.0f, double(sim::GameSim::BOOST_RATE[stage]));
+                const bool on = (simEngine.getTick() / 6) % 2 == 0;
+                if (stage == 0)      { lr = 0.40f; lg = 1.0f; lb = 0.55f; }
+                else if (stage == 1) { lr = 1.0f; lg = 0.85f; lb = 0.25f; }
+                else                 { lr = 1.0f; lg = on ? 0.30f : 0.10f; lb = on ? 0.25f : 0.10f; }
+                const float f = std::min(1.0f, me.boostHold / float(sim::GameSim::BOOST_HIGH));   // a heat bar under the text
+                glColor4f(lr, lg, lb, 0.35f);
+                rect(hx0, ly0, hx0 + hpW * f, ly0 + ps * 1.5f);
+            } else if (me.boostHold > 0) {
+                snprintf(lBuf, sizeof lBuf, "HOLD L: BOOST (COOLING)"); lr = lg = lb = 0.60f;
+            } else {
+                snprintf(lBuf, sizeof lBuf, "HOLD L: BOOST");
+            }
+            drawText(lBuf, hx0 + ps * 3.0f, ly0 + ps * 2.0f, ps, lr, lg, lb);
+            ly1 = ly0 - ps * 2.0f;
+        }
+        // the shortcut ahead: closed while you are in the top 3 (GameSim::SHORTCUT_CLOSED_TOP)
+        if (me.wreck == 0 && simEngine.toShortcut(me) < 300.0f && simEngine.toShortcut(me) > -40.0f) {
+            const float ly0 = ly1 - hpH;
+            glColor4f(0.04f, 0.06f, 0.10f, 0.65f);
+            rect(hx0, ly0, hx0 + hpW, ly1);
+            char sBuf[48];
+            if (me.cutClosed) snprintf(sBuf, sizeof sBuf, "SHORTCUT CLOSED: TOP %d", sim::GameSim::SHORTCUT_CLOSED_TOP);
+            else snprintf(sBuf, sizeof sBuf, "SHORTCUT OPEN");
+            drawText(sBuf, hx0 + ps * 3.0f, ly0 + ps * 2.0f, ps, me.cutClosed ? 1.0f : 0.40f, me.cutClosed ? 0.40f : 1.0f,
+                     me.cutClosed ? 0.30f : 0.55f);
+            ly1 = ly0 - ps * 2.0f;
+        }
+        }
+    }
+
+    // this lap's time and the best lap, under the badge
+    if (simEngine.getState() != State::Countdown) {
+        auto mmss = [](float t, char *buf, size_t n) {
+            const int m = int(t) / 60;
+            snprintf(buf, n, "%d:%04.1f", m, t - float(m) * 60.0f);
+        };
+        char nowBuf[16], bestBuf[16], lapLine[48];
+        const bool timing = me.lap >= 0 && me.lapStart >= 0.0f && !me.finished;
+        if (timing) mmss(simEngine.getRaceTimer() - me.lapStart, nowBuf, sizeof nowBuf);
+        else        snprintf(nowBuf, sizeof nowBuf, "-:--.-");
+        if (me.bestLap > 0.0f) mmss(me.bestLap, bestBuf, sizeof bestBuf);
+        else                   snprintf(bestBuf, sizeof bestBuf, "-:--.-");
+        snprintf(lapLine, sizeof lapLine, "LAP TIME %s   BEST %s", nowBuf, bestBuf);
+        if (simEngine.sprint()) {                        // a sprint: the race time so far
+            mmss(me.finished ? me.finishTime : simEngine.getRaceTimer(), nowBuf, sizeof nowBuf);
+            snprintf(lapLine, sizeof lapLine, "RACE TIME %s", nowBuf);
+        }
+        const float lps = ps * 0.85f;
+        drawText(lapLine, statX + ps * 3.0f, statY - 7.0f * lps - ps * 3.0f, lps, 0.80f, 0.90f, 1.0f);
+    }
 
     // =======================================================================
     // 2. BOTTOM-LEFT: RETRO-FUTURISTIC ARCADE SPEEDOMETER & NITRO GAUGE
@@ -3534,11 +5847,71 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
         drawText("BOOST", tx, ty, txtPs, 1.0f, 0.90f * pulse, 0.30f * pulse);
     }
 
+    // Crashes: what happened to your car (a few lines, newest at the bottom), WRECKED with
+    // the time until you are back, and everyone's wrecks on the right
+    if (myIdx < sim::MAX_RACERS) {
+        std::deque<HudMsg> &q = carMsgs[myIdx];
+        while (!q.empty() && q.front().until < simEngine.getTick()) q.pop_front();
+        float my = vh * 0.20f;
+        const float mps = ps * 1.25f;
+        for (auto it = q.rbegin(); it != q.rend(); ++it, my += 9.0f * mps) {
+            const char *t = it->text.constData();
+            drawText(t, (vw - textWidth(t, mps)) * 0.5f, my, mps, it->r, it->g, it->b);
+        }
+    }
+    drawTauntBubble(vw, vh, ps);
+    if (me.wreck > 0) {
+        const float s1 = ps * 4.0f, s2 = ps * 1.8f;          // (above the car and its name plate)
+        drawText("WRECKED!", (vw - textWidth("WRECKED!", s1)) * 0.5f, vh * 0.76f, s1, 1.0f, 0.30f, 0.25f);
+        if (me.ejected) {
+            const char *t = "YOUR DRIVER FLEW OUT!";
+            drawText(t, (vw - textWidth(t, s2)) * 0.5f, vh * 0.71f, s2, 1.0f, 0.85f, 0.35f);
+        }
+        char back[48];
+        snprintf(back, sizeof back, "BACK IN %d", (simEngine.wreckTime(me) - me.wreck + 59) / 60);
+        drawText(back, (vw - textWidth(back, s2)) * 0.5f, vh * (me.ejected ? 0.665f : 0.71f), s2, 0.95f, 0.95f, 0.95f);
+    }
+    {
+        while (!feed.empty() && feed.front().until < simEngine.getTick()) feed.pop_front();
+        float fy = vh * 0.56f;
+        const float fps = ps * 1.0f;
+        for (auto it = feed.rbegin(); it != feed.rend(); ++it, fy -= 9.0f * fps + ps * 3.0f) {
+            const char *t = it->text.constData();
+            const float tw = textWidth(t, fps);
+            glColor4f(0.04f, 0.06f, 0.10f, 0.60f);
+            rect(vw - m - tw - ps * 6.0f, fy - ps * 2.0f, vw - m, fy + 7.0f * fps + ps * 2.0f);
+            drawText(t, vw - m - tw - ps * 3.0f, fy, fps, it->r, it->g, it->b);
+        }
+    }
+
     // Warnings / messages (Centered)
-    bool offroad = std::fabs(me.x - roadCenter(me.z)) > roadHalf();
+    bool offroad = std::fabs(me.d) > simEngine.roadHalfAt(me.s);
     if (offroad && simEngine.getState() == State::Racing && (simEngine.getTick() / 15) % 2) {
         float s = ps * 1.6f;
         drawText("OFF ROAD", (vw - textWidth("OFF ROAD", s)) * 0.5f, vh * 0.30f, s, 1.0f, 0.55f, 0.1f);
+    }
+    // a new lap: "LAP 2/3" or "FINAL LAP" for the first 120 m after the line
+    if (simEngine.getState() == State::Racing && !me.finished && me.lap >= 1 && me.lap < laps && me.s < 120.0f) {
+        char lapBuf[24];
+        if (me.lap + 1 == laps) {
+            snprintf(lapBuf, sizeof lapBuf, "FINAL LAP");
+            const char *w = "MORE OBSTACLES AND RAMPS AHEAD!";
+            drawText(w, (vw - textWidth(w, ps * 1.4f)) * 0.5f, vh * 0.62f, ps * 1.4f, 1.0f, 0.55f, 0.30f);
+        }
+        else                    snprintf(lapBuf, sizeof lapBuf, "LAP %d/%d", me.lap + 1, laps);
+        float s = ps * 2.2f;
+        drawText(lapBuf, (vw - textWidth(lapBuf, s)) * 0.5f, vh * 0.66f, s, 1.0f, 0.85f, 0.25f);
+    }
+    if (me.path == 1 && me.s < 80.0f && (simEngine.getTick() / 12) % 2) {   // just onto the shortcut
+        float s = ps * 2.0f;
+        drawText("SHORTCUT", (vw - textWidth("SHORTCUT", s)) * 0.5f, vh * 0.58f, s, 0.95f, 0.78f, 0.45f);
+    }
+    // a long flight: "BIG AIR 1.2 S" for a moment after landing
+    if (myIdx < sim::MAX_RACERS && carFx[myIdx].bigAirUntil > simEngine.getTick()) {
+        char airBuf[24];
+        snprintf(airBuf, sizeof airBuf, "BIG AIR %.1f S", carFx[myIdx].bigAir);
+        float s = ps * 2.0f;
+        drawText(airBuf, (vw - textWidth(airBuf, s)) * 0.5f, vh * 0.58f, s, 0.35f, 0.95f, 1.0f);
     }
     if (simEngine.getState() == State::Countdown) {
         snprintf(buf, sizeof buf, "%d", 3 - simEngine.getTick() / 60);
@@ -3552,6 +5925,14 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
     } else if (simEngine.getState() == State::Racing && simEngine.getRaceTimer() < 1.0f) {
         float s = ps * 6.0f;
         drawText("GO!", (vw - textWidth("GO!", s)) * 0.5f, vh * 0.52f, s, 0.3f, 1.0f, 0.4f);
+    } else if (simEngine.getWinner() != 0 && !isOnline() && simEngine.getGameMode() == sim::GameSim::ModeSingle
+               && !me.finished) {
+        // a CPU won, but your race goes on until you cross the line
+        const int winner = simEngine.getWinner();
+        QByteArray msg = (hudCars.size() > 2 ? "CPU" + QByteArray::number(winner - 1) : QByteArray("CPU"))
+                         + " WON - FINISH YOUR RACE!";
+        float s = ps * 1.5f;
+        drawText(msg.constData(), (vw - textWidth(msg.constData(), s)) * 0.5f, vh * 0.74f, s, 1.0f, 0.75f, 0.30f);
     } else if (simEngine.getWinner() != 0) {
         int winner = simEngine.getWinner();
         float s = ps * 3.5f;
@@ -3559,13 +5940,15 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
             const char *winMsg = "YOU WIN!";
             drawText(winMsg, (vw - textWidth(winMsg, s)) * 0.5f, vh * 0.54f, s, 0.3f, 1.0f, 0.4f);
         } else if (me.finished) {
-            const char *finMsg = "FINISHED!";
+            char finMsg[32];
+            snprintf(finMsg, sizeof finMsg, "FINISHED %s!", posStr);
             drawText(finMsg, (vw - textWidth(finMsg, s)) * 0.5f, vh * 0.54f, s, 1.0f, 0.85f, 0.2f);
         } else {
             QByteArray online = (winner - 1 < racerNames.size() ? racerNames[winner - 1] : QString("P%1").arg(winner)).toUtf8() + " WINS!";
             const char *loseMsg = isOnline() ? online.constData()
                                 : (simEngine.getGameMode() == sim::GameSim::ModeSingle) ? "CPU WINS!" : "OPPONENT WINS!";
-            drawText(loseMsg, (vw - textWidth(loseMsg, s)) * 0.5f, vh * 0.54f, s, 1.0f, 0.35f, 0.35f);
+            const float ls = fitSize(loseMsg, s, vw * 0.9f);
+            drawText(loseMsg, (vw - textWidth(loseMsg, ls)) * 0.5f, vh * 0.54f, ls, 1.0f, 0.35f, 0.35f);
         }
         const char *rstMsg = isOnline() ? "WAITING FOR THE OTHERS..." : "PRESS [R] TO RESTART";
         float rstPs = ps * 1.10f;
@@ -3575,8 +5958,8 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
 
 void GLWidget::drawMinimap(int W, int H, float dpr)
 {
-    const float mw = 125.0f * dpr;
-    const float mh = std::min(250.0f * dpr, H * 0.44f);
+    const float mw = 150.0f * dpr;
+    const float mh = std::min(172.0f * dpr, H * 0.44f);
     const float margin = 14.0f * dpr;
     const float topOffset = 14.0f * dpr;
     const float x0 = W - margin - mw, y0 = H - topOffset - mh;
@@ -3595,49 +5978,85 @@ void GLWidget::drawMinimap(int W, int H, float dpr)
     float ps = 1.6f * dpr;
     drawText("MAP", x0 + (mw - textWidth("MAP", ps)) * 0.5f, y0 + mh - 7 * ps - 6 * dpr, ps, 1.0f, 0.9f, 0.7f);
 
-    const float pad = 12.0f * dpr;
-    const float top = y0 + mh - 7 * ps - 14 * dpr, bottom = y0 + pad;
-    const float kx = (mw - 2 * pad) / 80.0f;
-    const float ky = (top - bottom) / (sim::TRACK_LEN + 120.0f);
-    auto mx = [&](float wx) { return x0 + mw * 0.5f + wx * kx; };
-    auto my = [&](float wz) { return std::clamp(bottom + (-wz) * ky, bottom, top); };
+    // the whole circuit, north up, as big as it fits
+    const float pad = 10.0f * dpr;
+    const float top = y0 + mh - 7 * ps - 12 * dpr, bottom = y0 + pad, left = x0 + pad, right = x0 + mw - pad;
+    const auto &S = simEngine.circuit().slices();
+    const int n = int(S.size());
+    float ax = 1e9f, bx = -1e9f, az = 1e9f, bz = -1e9f;
+    for (const sim::Slice &sl : S) {
+        ax = std::min(ax, sl.x); bx = std::max(bx, sl.x);
+        az = std::min(az, sl.z); bz = std::max(bz, sl.z);
+    }
+    const float k = std::min((right - left) / std::max(1.0f, bx - ax), (top - bottom) / std::max(1.0f, bz - az));
+    const float ox = 0.5f * (left + right) - 0.5f * (ax + bx) * k, oy = 0.5f * (bottom + top) - 0.5f * (az + bz) * k;
+    auto mx = [&](float wx) { return ox + wx * k; };
+    auto my = [&](float wz) { return oy - wz * k; };     // world z points south
 
-    float rw = std::max(2.5f * dpr, roadHalf() * kx);
+    float rw = std::max(1.5f * dpr, roadHalf() * k);
     glColor4f(0.60f, 0.60f, 0.66f, 1.0f);
     glBegin(GL_QUAD_STRIP);
-    for (float d = 0; d <= sim::TRACK_LEN + 40.0f; d += 20.0f) {
-        float c = roadCenter(-d);
-        glVertex2f(mx(c) - rw, my(-d)); glVertex2f(mx(c) + rw, my(-d));
+    const int last = simEngine.sprint() ? n - 1 : n;     // (a loop ends where it began)
+    for (int i = 0;; i = std::min(i + 10, last)) {
+        const sim::Slice &sl = S[size_t(i % n)];
+        const float px = ox + sl.x * k, py = oy + sl.z * k;
+        glVertex2f(px - sl.tz * rw, py + sl.tx * rw);
+        glVertex2f(px + sl.tz * rw, py - sl.tx * rw);
+        if (i == last) break;
     }
     glEnd();
 
-    glColor4f(1, 1, 1, 1);
-    rect(mx(0) - rw - 2 * dpr, my(0) - dpr, mx(0) + rw + 2 * dpr, my(0) + dpr);
+    // start/finish line (a sprint: the start line and the finish line)
+    for (float lineS : {simEngine.startLine(), simEngine.sprint() ? simEngine.finishLine() : -1.0f}) {
+        if (lineS < 0.0f) continue;
+        const sim::Slice &sl = S[size_t(lineS)];
+        const float px = ox + sl.x * k, py = oy + sl.z * k, w = rw + 2.5f * dpr, t = 1.2f * dpr;
+        glColor4f(1, 1, 1, 1);
+        glBegin(GL_QUADS);
+        glVertex2f(px - sl.tz * w - sl.tx * t, py + sl.tx * w - sl.tz * t);
+        glVertex2f(px + sl.tz * w - sl.tx * t, py - sl.tx * w - sl.tz * t);
+        glVertex2f(px + sl.tz * w + sl.tx * t, py - sl.tx * w + sl.tz * t);
+        glVertex2f(px - sl.tz * w + sl.tx * t, py + sl.tx * w + sl.tz * t);
+        glEnd();
+    }
 
-    float fy = my(-sim::TRACK_LEN), sq = 2.0f * dpr;
-    for (int i = 0; i < 6; ++i)
-        for (int row = 0; row < 2; ++row) {
-            if ((i + row) % 2) glColor4f(0, 0, 0, 1); else glColor4f(1, 1, 1, 1);
-            float xx = mx(0) - 3 * sq + i * sq, yy = fy + row * sq;
-            rect(xx, yy, xx + sq, yy + sq);
-        }
+    if (simEngine.hasShortcut()) {                       // the shortcut, thinner and sandy
+        const auto &CS = simEngine.circuit().shortcut();
+        glColor4f(0.85f, 0.70f, 0.48f, 1.0f);
+        glLineWidth(2.0f * dpr);
+        glBegin(GL_LINE_STRIP);
+        for (size_t i = 0; i < CS.size(); i += 5) glVertex2f(ox + CS[i].x * k, oy + CS[i].z * k);
+        glVertex2f(ox + CS.back().x * k, oy + CS.back().z * k);
+        glEnd();
+        glLineWidth(1.0f);
+    }
+    glColor4f(1.0f, 0.80f, 0.10f, 1.0f);                 // the jump ramps
+    for (const sim::GameSim::Ramp &r : simEngine.ramps()) {
+        float rx, rz;
+        simEngine.pointAt(r.lip, 0.0f, rx, rz);
+        rect(mx(rx) - 2.0f * dpr, my(rz) - 2.0f * dpr, mx(rx) + 2.0f * dpr, my(rz) + 2.0f * dpr);
+    }
 
-    float ty = my(-sim::TRACK_LEN - 110.0f);
+    // the temple
+    float lx, lz, lrot;
+    simEngine.landmark(lx, lz, lrot);
+    const float ty = my(lz);
     glColor4f(0.95f, 0.78f, 0.30f, 1.0f);
     glBegin(GL_TRIANGLES);
-    glVertex2f(mx(0) - 8 * dpr, ty - 5 * dpr); glVertex2f(mx(0) + 8 * dpr, ty - 5 * dpr);
-    glVertex2f(mx(0), ty + 5 * dpr);
+    glVertex2f(mx(lx) - 5 * dpr, ty - 4 * dpr); glVertex2f(mx(lx) + 5 * dpr, ty - 4 * dpr);
+    glVertex2f(mx(lx), ty + 4 * dpr);
     glEnd();
 
     glColor4f(0.85f, 0.85f, 0.85f, 0.75f);
     for (const sim::Traffic &t : simEngine.getTraffic()) {
-        if (t.parked) continue;
-        float px = mx(roadCenter(t.z) + t.lane), py = my(t.z), s = 1.5f * dpr;
+        float tx, tz;
+        simEngine.pointAt(t.s, t.lane, tx, tz);
+        float px = mx(tx), py = my(tz), s = 1.3f * dpr;
         rect(px - s, py - s, px + s, py + s);
     }
 
     auto dot = [&](const sim::Car &c, const char *lbl) {
-        float px = mx(c.x), py = my(c.z), s = 4.0f * dpr, o = 1.5f * dpr;
+        float px = mx(c.x), py = my(c.z), s = 3.5f * dpr, o = 1.5f * dpr;
         glColor4f(1, 1, 1, 1);
         rect(px - s - o, py - s - o, px + s + o, py + s + o);
         glColor4f(c.r, c.g, c.b, 1);
@@ -3651,7 +6070,10 @@ void GLWidget::drawMinimap(int W, int H, float dpr)
     for (int i = int(cars.size()) - 1; i >= 0; --i) {       // my own dot last, so it is on top
         if (i == me && (isOnline() || simEngine.getGameMode() == sim::GameSim::ModeSingle)) continue;
         char lbl[8];
-        if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i == 1) snprintf(lbl, sizeof lbl, "CPU");
+        if (simEngine.getGameMode() == sim::GameSim::ModeSingle && i >= 1) {
+            if (cars.size() > 2) snprintf(lbl, sizeof lbl, "CPU%d", i);
+            else                 snprintf(lbl, sizeof lbl, "CPU");
+        }
         else snprintf(lbl, sizeof lbl, "P%d", i + 1);
         dot(cars[i], lbl);
     }
@@ -3944,8 +6366,14 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
     // User Info Text beside avatar
     float ptx = ax0 + asz + 10.0f * dpr;
     float pPs = ps * 0.80f;
-    drawText("USER: RACER_JAX", ptx, pCardY + pCardH - 14.0f * dpr, pPs * 1.02f, 1.0f, 1.0f, 1.0f);
-    drawText("RANK: PLATINUM II (Lv. 64) , 12,450 XP", ptx, pCardY + pCardH - 27.0f * dpr, pPs * 0.84f, 1.0f, 0.82f, 0.25f);
+    {
+        const QByteArray who = "USER: " + QByteArray::fromStdString(profileName(0));
+        drawText(who.constData(), ptx, pCardY + pCardH - 14.0f * dpr, pPs * 1.02f, 1.0f, 1.0f, 1.0f);
+        const QByteArray acct = accountUser.isEmpty() ? QByteArray("OFFLINE - LOG IN FROM MY PROFILE")
+                              : syncState == SyncState::Synced ? QByteArray("ACCOUNT SYNCED") : syncState == SyncState::Pending
+                              ? QByteArray("ACCOUNT: NOT SYNCED YET") : QByteArray("ACCOUNT: SYNCING...");
+        drawText(acct.constData(), ptx, pCardY + pCardH - 27.0f * dpr, pPs * 0.84f, 1.0f, 0.82f, 0.25f);
+    }
 
     // Glowing green server status LED
     float dotX = ptx + 3.0f * dpr, dotY = pCardY + 11.0f * dpr, dotR = 2.8f * dpr;
@@ -3986,7 +6414,7 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
         std::snprintf(carLine, sizeof(carLine), "CAR: %s", CAR_PRESETS[selectedCarPreset].model);
         drawText(carLine, panelX + 16.0f * dpr, headerTop - 12.0f * dpr, ps * 0.92f, 1.0f, 1.0f, 1.0f);
         std::snprintf(carLine, sizeof(carLine), "(%s)%s", CAR_PRESETS[selectedCarPreset].trim,
-                      menuSelection == 3 ? "  < >" : "");
+                      menuSelection == M_CAR ? "  < >" : "");
         drawText(carLine, panelX + 16.0f * dpr, headerTop - 25.0f * dpr, ps * 0.80f, 1.0f, 0.65f, 0.15f);
     }
 
@@ -3994,7 +6422,7 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
     glColor4f(0.20f, 0.45f, 0.70f, 0.45f);
     rect(panelX + 16.0f * dpr, listTop + 6.0f * dpr, panelX + panelW - 16.0f * dpr, listTop + 7.5f * dpr);
 
-    // 4. THE 7 MENU PILL BUTTONS
+    // 4. THE 8 MENU PILL BUTTONS
     float textPs = ps * 0.95f;
     for (int i = 0; i < NUM_MENU_ITEMS; ++i) {
         float by0 = listTop - (i + 1) * btnH - i * btnGap;
@@ -4003,6 +6431,23 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
         float bx1 = btnX + btnW;
         bool sel = (menuSelection == i);
         const MenuItem &item = MENU_ITEMS[i];
+        char cpuTitle[40];
+        const char *title = item.title;
+        if (i == M_CPUS) {                              // CPU RACERS: 3  < >
+            std::snprintf(cpuTitle, sizeof cpuTitle, "CPU RACERS: %d%s", cpuCount, sel ? "  < >" : "");
+            title = cpuTitle;
+        } else if (i == M_TAUNTS) {                     // TAUNTS: ON  < >
+            std::snprintf(cpuTitle, sizeof cpuTitle, "TAUNTS: %s%s", tauntsOn ? "ON" : "OFF", sel ? "  < >" : "");
+            title = cpuTitle;
+        } else if (i == M_CLONE) {                      // YOUR CLONE: ON (81%)  < >   /  ... 2/3 RACES
+            if (cloneReady)
+                std::snprintf(cpuTitle, sizeof cpuTitle, "YOUR CLONE: %s (%d%%)%s", cloneOn ? "ON" : "OFF",
+                              int(std::lround(cloneStats.agree() * 100.0f)), sel ? "  < >" : "");
+            else
+                std::snprintf(cpuTitle, sizeof cpuTitle, "YOUR CLONE: %d/%d RACES%s", std::min(cloneBook.races(), sim::CloneBook::MIN_RACES),
+                              sim::CloneBook::MIN_RACES, sel ? "  < >" : "");
+            title = cpuTitle;
+        }
 
         float cr = item.isOrange ? 1.00f : 0.15f;
         float cg = item.isOrange ? 0.48f : 0.85f;
@@ -4047,7 +6492,7 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
 
         // Text title
         float textY = by0 + (btnH - 7.0f * textPs) * 0.5f;
-        drawText(item.title, bx0 + 36.0f * dpr, textY, textPs,
+        drawText(title, bx0 + 36.0f * dpr, textY, textPs,
                  sel ? 1.0f : 0.88f, sel ? 1.0f : 0.92f, sel ? 1.0f : 0.96f);
     }
 
@@ -4139,76 +6584,137 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
     drawText("DRIVETRAIN: ATTESA E-TS AWD", specX0 + 12.0f * dpr, subTagY, subTagPs, 0.50f, 0.65f, 0.80f);
 
 
-    // 6b. MAP + CPU CARD: which map, what it looks like, how hard the CPU is
+    // 6b. BIG MAP + CPU CARD in the open space above the car: which map, what it looks like,
+    // how hard the CPU is - large enough to read at a glance
     {
         static const float ACCENT[5][3] = {{1.0f, 0.62f, 0.20f}, {1.0f, 0.78f, 0.30f}, {0.60f, 0.86f, 1.0f},
                                            {0.92f, 0.35f, 1.0f}, {0.20f, 0.86f, 1.0f}};
         const int m = selectedMapPreset;
         const sim::MapDef &md = sim::MAPS[m];
         const float *ac = ACCENT[int(md.theme)];
-        const bool selMap = (menuSelection == 4), selCpu = (menuSelection == 6);
-        float cx0 = specX0, cw = specW, ch = 150.0f * dpr;
-        float cy0 = m2Y0 + m2H + 12.0f * dpr;
-        float cps = ps * 0.80f;
+        const bool selMap = (menuSelection == M_MAP), selCpu = (menuSelection == M_PROFILE), selLaps = false;
+        const float cx0 = panelX + panelW + 24.0f * dpr, cx1 = W - 28.0f * dpr;
+        const float cy1 = gCardY - 12.0f * dpr;
+        const float cy0 = std::max(cy1 - H * 0.33f, m2Y0 + m2H + 12.0f * dpr);
+        const float cw = cx1 - cx0, ch = cy1 - cy0, pad = 16.0f * dpr;
 
         glColor4f(0.04f, 0.07f, 0.13f, 0.90f);
-        drawRoundedRect(cx0, cy0, cx0 + cw, cy0 + ch, 12.0f * dpr);
-        glColor4f(ac[0], ac[1], ac[2], selMap ? 0.95f * pulse : 0.60f);
-        drawRoundedBorder(cx0, cy0, cx0 + cw, cy0 + ch, 12.0f * dpr, (selMap ? 2.0f : 1.2f) * dpr);
+        drawRoundedRect(cx0, cy0, cx1, cy1, 14.0f * dpr);
+        glColor4f(ac[0], ac[1], ac[2], selMap ? 0.95f * pulse : 0.65f);
+        drawRoundedBorder(cx0, cy0, cx1, cy1, 14.0f * dpr, (selMap ? 2.4f : 1.4f) * dpr);
 
+        // left: the whole road from above (north up), as big as the card allows; the start in
+        // green, the shortcut as a thinner sandy line
+        const float boxW = std::min(ch - 2.0f * pad, cw * 0.38f);
+        {
+            const auto &S = simEngine.circuit().slices();
+            const auto &C = simEngine.circuit().shortcut();
+            const int n = int(S.size());
+            float ax = 1e9f, bx = -1e9f, az = 1e9f, bz = -1e9f;
+            for (const sim::Slice &sl : S) {
+                ax = std::min(ax, sl.x); bx = std::max(bx, sl.x);
+                az = std::min(az, sl.z); bz = std::max(bz, sl.z);
+            }
+            const float bx0 = cx0 + pad, bx1 = bx0 + boxW, by0 = cy0 + pad, by1 = cy1 - pad;
+            glColor4f(0.02f, 0.04f, 0.08f, 0.85f);
+            drawRoundedRect(bx0, by0, bx1, by1, 10.0f * dpr);
+            const float in = 12.0f * dpr;
+            const float k = std::min((bx1 - bx0 - 2.0f * in) / std::max(1.0f, bx - ax),
+                                     (by1 - by0 - 2.0f * in) / std::max(1.0f, bz - az));
+            const float ox = 0.5f * (bx0 + bx1) - 0.5f * (ax + bx) * k, oy = 0.5f * (by0 + by1) - 0.5f * (az + bz) * k;
+            glLineWidth(5.0f * dpr);
+            glColor4f(ac[0], ac[1], ac[2], 1.0f);
+            glBegin(simEngine.sprint() ? GL_LINE_STRIP : GL_LINE_LOOP);
+            for (int i = 0; i < n; i += 6) glVertex2f(ox + S[size_t(i)].x * k, oy + S[size_t(i)].z * k);
+            glVertex2f(ox + S[size_t(n - 1)].x * k, oy + S[size_t(n - 1)].z * k);
+            glEnd();
+            if (!C.empty()) {
+                glLineWidth(2.5f * dpr);
+                glColor4f(0.85f, 0.65f, 0.35f, 1.0f);
+                glBegin(GL_LINE_STRIP);
+                for (size_t i = 0; i < C.size(); i += 6) glVertex2f(ox + C[i].x * k, oy + C[i].z * k);
+                glVertex2f(ox + C.back().x * k, oy + C.back().z * k);
+                glEnd();
+            }
+            glLineWidth(1.0f);
+            const float r = 5.0f * dpr;
+            const sim::Slice &st = S[size_t(simEngine.startLine())];
+            glColor4f(0.3f, 1.0f, 0.5f, 1.0f);                   // the start in green
+            rect(ox + st.x * k - r, oy + st.z * k - r, ox + st.x * k + r, oy + st.z * k + r);
+            if (simEngine.sprint()) {                            // a sprint's finish in white
+                const sim::Slice &fi = S[size_t(simEngine.finishLine())];
+                glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+                rect(ox + fi.x * k - r, oy + fi.z * k - r, ox + fi.x * k + r, oy + fi.z * k + r);
+            }
+        }
+
+        // right: big text, top to bottom
+        const float tx = cx0 + pad + boxW + 22.0f * dpr, tw = cx1 - pad - tx;
+        float y = cy1 - pad - 7.0f * ps;
         char buf[64];
         std::snprintf(buf, sizeof(buf), "MAP %d/%d", m + 1, sim::NUM_MAPS);
-        drawText(buf, cx0 + 12.0f * dpr, cy0 + ch - 16.0f * dpr, cps * 0.95f, ac[0], ac[1], ac[2]);
+        drawText(buf, tx, y, ps, ac[0], ac[1], ac[2]);
         if (selMap && (simEngine.getTick() / 20) % 2 == 0) {
             const char *hint = "< LEFT / RIGHT >";
-            drawText(hint, cx0 + cw - 12.0f * dpr - textWidth(hint, cps * 0.8f), cy0 + ch - 16.0f * dpr, cps * 0.8f, 1.0f, 1.0f, 1.0f);
+            drawText(hint, cx1 - pad - textWidth(hint, ps * 0.9f), y, ps * 0.9f, 1.0f, 1.0f, 1.0f);
         }
-        drawText(md.name, cx0 + 12.0f * dpr, cy0 + ch - 36.0f * dpr, cps * 1.25f, 1.0f, 1.0f, 1.0f);
-        drawText(md.tagline, cx0 + 12.0f * dpr, cy0 + ch - 50.0f * dpr, cps * 0.66f, 0.62f, 0.72f, 0.85f);
+        float namePs = ps * 3.0f;                         // the map name, as large as fits
+        while (namePs > ps * 1.2f && textWidth(md.name, namePs) > tw) namePs *= 0.92f;
+        y -= 7.0f * namePs + 10.0f * dpr;
+        drawText(md.name, tx, y, namePs, 1.0f, 1.0f, 1.0f);
+        y -= 7.0f * ps * 0.85f + 9.0f * dpr;
+        drawText(md.tagline, tx, y, ps * 0.85f, 0.62f, 0.72f, 0.85f);
 
-        // track preview: the road's centre line from start (left) to finish (right)
-        float px0 = cx0 + 14.0f * dpr, px1 = cx0 + cw - 14.0f * dpr, pyc = cy0 + 52.0f * dpr;
-        float k = 18.0f * dpr / 34.0f;
-        glColor4f(0.20f, 0.28f, 0.40f, 0.5f);
-        rect(px0, pyc - 0.5f * dpr, px1, pyc + 0.5f * dpr);
-        glLineWidth(2.0f * dpr);
-        glColor4f(ac[0], ac[1], ac[2], 1.0f);
-        glBegin(GL_LINE_STRIP);
-        for (int i = 0; i <= 160; ++i) {
-            float d = sim::TRACK_LEN * float(i) / 160.0f;
-            glVertex2f(px0 + (px1 - px0) * float(i) / 160.0f, pyc + simEngine.roadCenter(-d) * k);
-        }
-        glEnd();
-        glLineWidth(1.0f);
-        glColor4f(0.3f, 1.0f, 0.5f, 1.0f);
-        rect(px0 - 2.5f * dpr, pyc - 2.5f * dpr, px0 + 2.5f * dpr, pyc + 2.5f * dpr);
-        glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-        rect(px1 - 2.5f * dpr, pyc - 2.5f * dpr, px1 + 2.5f * dpr, pyc + 2.5f * dpr);
+        // the lower rows sit on the bottom of the card: race length, CPU level, map difficulty
+        // (no difficulty to choose: the CPUs adapt to your profile)
+        static const char *CPU_NAMES[1] = {"ADAPTIVE"};
+        static const float CPU_COL[1][3] = {{0.35f, 0.85f, 1.0f}};
+        const int dl = 0;
+        const float cpuPs = ps * (selCpu ? 2.8f : 2.6f), lenPs = ps * (selLaps ? 1.6f : 1.5f);
+        const float lenY = cy0 + pad + 4.0f * dpr;
+        const float cpuY = lenY + 7.0f * lenPs + 30.0f * dpr;
 
-        // difficulty pips + CPU level
-        drawText("DIFFICULTY", cx0 + 12.0f * dpr, cy0 + 12.0f * dpr, cps * 0.75f, 0.70f, 0.78f, 0.90f);
-        float dx = cx0 + 12.0f * dpr + textWidth("DIFFICULTY", cps * 0.75f) + 8.0f * dpr;
+        // map difficulty: big blocks
+        y = cpuY + 7.0f * cpuPs + 26.0f * dpr;
+        drawText("MAP", tx, y, ps * 1.2f, 0.70f, 0.78f, 0.90f);
+        const float blk = 8.4f * ps, bxs = tx + textWidth("MAP", ps * 1.2f) + 12.0f * dpr;
         for (int i = 0; i < 3; ++i) {
             if (i < md.stars) glColor4f(ac[0], ac[1], ac[2], 1.0f);
             else              glColor4f(0.25f, 0.30f, 0.40f, 1.0f);
-            rect(dx + i * 10.0f * dpr, cy0 + 12.0f * dpr, dx + i * 10.0f * dpr + 7.0f * dpr, cy0 + 19.0f * dpr);
+            rect(bxs + i * (blk + 6.0f * dpr), y, bxs + i * (blk + 6.0f * dpr) + blk, y + blk);
         }
-        static const char *CPU_NAMES[3] = {"CPU: EASY", "CPU: MEDIUM", "CPU: HARD"};
-        static const float CPU_COL[3][3] = {{0.35f, 1.0f, 0.5f}, {1.0f, 0.82f, 0.25f}, {1.0f, 0.35f, 0.30f}};
-        int dl = std::clamp(simEngine.getAiDifficulty(), 0, 2);
-        const char *cpuTxt = CPU_NAMES[dl];
-        float cpuPs = cps * (selCpu ? 0.95f : 0.80f);
-        drawText(cpuTxt, cx0 + cw - 12.0f * dpr - textWidth(cpuTxt, cpuPs), cy0 + 12.0f * dpr, cpuPs,
-                 CPU_COL[dl][0], CPU_COL[dl][1], CPU_COL[dl][2]);
+
+        // CPU difficulty: the biggest line, in its own colour (green / yellow / red)
+        y = cpuY;
+        drawText("CPU", tx, y, cpuPs, 0.85f, 0.90f, 0.95f);
+        const float lx = tx + textWidth("CPU ", cpuPs);
+        const float pillW = textWidth(CPU_NAMES[dl], cpuPs) + 20.0f * dpr;
+        glColor4f(CPU_COL[dl][0] * 0.30f, CPU_COL[dl][1] * 0.30f, CPU_COL[dl][2] * 0.30f, 0.95f);
+        drawRoundedRect(lx, y - 7.0f * dpr, lx + pillW, y + 7.0f * cpuPs + 7.0f * dpr, 8.0f * dpr);
+        glColor4f(CPU_COL[dl][0], CPU_COL[dl][1], CPU_COL[dl][2], selCpu ? pulse : 0.85f);
+        drawRoundedBorder(lx, y - 7.0f * dpr, lx + pillW, y + 7.0f * cpuPs + 7.0f * dpr, 8.0f * dpr, 2.0f * dpr);
+        drawText(CPU_NAMES[dl], lx + 10.0f * dpr, y, cpuPs, CPU_COL[dl][0], CPU_COL[dl][1], CPU_COL[dl][2]);
+        std::snprintf(buf, sizeof buf, "%d CPU%s", cpuCount, cpuCount > 1 ? "S" : "");
+        drawText(buf, lx + pillW + 16.0f * dpr, y + 7.0f * (cpuPs - ps * 1.6f) * 0.5f, ps * 1.6f, 0.85f, 0.90f, 0.95f);
+
+        // race length
+        y = lenY;
+        if (simEngine.sprint())
+            std::snprintf(buf, sizeof buf, "SPRINT %.1f KM, NO LAPS", simEngine.raceDistance() / 1000.0f);
+        else
+            std::snprintf(buf, sizeof buf, "%d LAP%s X %.1f KM", simEngine.getLaps(), simEngine.getLaps() > 1 ? "S" : "",
+                          simEngine.lapLength() / 1000.0f);
+        drawText(buf, tx, y, lenPs, selLaps ? 1.0f : 0.80f, selLaps ? 0.85f : 0.86f,
+                 selLaps ? 0.30f : 0.95f);
     }
 
     // 7. BOTTOM NAVIGATION BAR / HINTS
     float footY = 14.0f * dpr;
-    const char *footHints = "[UP/DOWN] NAVIGATE   [LEFT/RIGHT] CHANGE CAR / MAP / CPU   [ENTER] SELECT";
+    const char *footHints = "[UP/DOWN] NAVIGATE   [LEFT/RIGHT] CHANGE CAR / MAP / CPUS / TAUNTS   [+/-] CPU RACERS   [ENTER] SELECT";
     float footPs = ps * 0.75f;
     drawText(footHints, 28.0f * dpr, footY, footPs, 0.65f, 0.78f, 0.90f);
 
-    if (menuSelection <= 1 && ((simEngine.getTick() / 25) % 2 == 0)) {
+    if (menuSelection <= M_VSCPU && ((simEngine.getTick() / 25) % 2 == 0)) {
         const char *readyPrompt = "PRESS [ENTER] TO START";
         float prW = textWidth(readyPrompt, footPs * 1.05f);
         drawText(readyPrompt, W - 28.0f * dpr - prW, footY, footPs * 1.05f, 0.30f, 1.0f, 0.50f);
@@ -4270,22 +6776,27 @@ void GLWidget::drawFinishOverlay(int W, int H, float dpr)
     const float cx = W * 0.5f, cy = H * 0.5f;
 
     const auto &cars = simEngine.getCars();
-    static sim::Car dummyCar;
-    const sim::Car &c1 = (cars.size() > 0) ? cars[0] : dummyCar;
-    const sim::Car &c2 = (cars.size() > 1) ? cars[1] : dummyCar;
+    const int n = int(cars.size());
+    if (n == 0) return;
     int winner = simEngine.getWinner();
     bool isSingle = (simEngine.getGameMode() == sim::GameSim::ModeSingle);
+    static const char *ORD[sim::MAX_RACERS] = {"1ST", "2ND", "3RD", "4TH", "5TH", "6TH"};
 
-    // Data for Winner and Runner-up
-    const sim::Car &cWin = (winner == 1) ? c1 : c2;
-    const sim::Car &cLoss = (winner == 1) ? c2 : c1;
-    const char *nameWin = (winner == 1) ? (isSingle ? "PLAYER 1 (YOU)" : "PLAYER 1") : (isSingle ? "CPU BOT" : "PLAYER 2");
-    const char *nameLoss = (winner == 1) ? (isSingle ? "CPU BOT" : "PLAYER 2") : (isSingle ? "PLAYER 1 (YOU)" : "PLAYER 1");
-
-    int winM = int(cWin.finishTime) / 60;
-    float winS = cWin.finishTime - winM * 60;
-    int topSpeedWin = int(cWin.topSpeed / sim::MAX_SPEED * 240.0f);
-    int topSpeedLoss = int(cLoss.topSpeed / sim::MAX_SPEED * 240.0f);
+    // names on the results: YOU and CPU1..CPU5 in vs CPU, PLAYER 1/2 in split screen
+    auto racerName = [&](int i) -> std::string {
+        if (i >= 0 && i < int(nameOverride.size()) && !nameOverride[size_t(i)].isEmpty())   // named drivers, story characters
+            return nameOverride[size_t(i)].toStdString() + (cars[size_t(i)].dirRole == 1 && cars[size_t(i)].dirRivalOf == 0 ? " (RIVAL)" : "");
+        if (isSingle) return i == 0 ? std::string("YOU") : (n > 2 ? "CPU" + std::to_string(i) : std::string("CPU"));
+        return "PLAYER " + std::to_string(i + 1);
+    };
+    std::vector<int> order(n);                     // car indices from 1st to last
+    for (int i = 0; i < n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return simEngine.rankOf(a) < simEngine.rankOf(b); });
+    const sim::Car &cWin = cars[order[0]];
+    // the ticker shows your numbers in vs CPU, the winner's in split screen
+    const int focus = isSingle ? 0 : std::clamp(winner - 1, 0, n - 1);
+    const sim::Car &cFocus = cars[focus];
+    auto kmh = [](const sim::Car &c) { return int(c.topSpeed / sim::MAX_SPEED * 240.0f); };
 
     // Gantry total boundary
     const float gw = std::min(float(W) * 0.94f, 660.0f * s);
@@ -4434,12 +6945,8 @@ void GLWidget::drawFinishOverlay(int W, int H, float dpr)
 
     // Upper Ticker Text: Winner announcement with checkered flag motif
     char upBuf[64];
-    if (isSingle) {
-        if (winner == 1) snprintf(upBuf, sizeof upBuf, "🏁  1ST PLACE: PLAYER 1 (YOU) - WINNER!  🏁");
-        else             snprintf(upBuf, sizeof upBuf, "🏁  1ST PLACE: CPU BOT - CHAMPION!  🏁");
-    } else {
-        snprintf(upBuf, sizeof upBuf, "🏁  1ST PLACE: PLAYER %d - CHAMPION!  🏁", winner);
-    }
+    if (isSingle && order[0] == 0) snprintf(upBuf, sizeof upBuf, "1ST PLACE: YOU - WINNER!");
+    else                           snprintf(upBuf, sizeof upBuf, "1ST PLACE: %s - WINNER!", racerName(order[0]).c_str());
     float upPs = 1.15f * s;
     drawText(upBuf, cx - textWidth(upBuf, upPs) * 0.5f, ty1_bot + 8.5f * s, upPs, 1.0f, 0.88f, 0.25f);
 
@@ -4466,10 +6973,15 @@ void GLWidget::drawFinishOverlay(int W, int H, float dpr)
 
     // Formatted LED telemetry matching Photo 2: "TIME 01:24:58   LAP 3/3   POSITION 1ST   TOP 240 KM/H"
     char timeTxt[32], lapTxt[32], posTxt[32], spdTxt[32];
-    snprintf(timeTxt, sizeof timeTxt, "TIME %02d:%04.1f", winM, winS);
-    snprintf(lapTxt,  sizeof lapTxt,  "LAP 3 / 3");
-    snprintf(posTxt,  sizeof posTxt,  winner == 1 ? "POSITION 1ST" : "POSITION 2ND");
-    snprintf(spdTxt,  sizeof spdTxt,  "TOP %d KM/H", topSpeedWin);
+    if (cFocus.finished) {
+        int fm = int(cFocus.finishTime) / 60;
+        snprintf(timeTxt, sizeof timeTxt, "TIME %02d:%04.1f", fm, cFocus.finishTime - fm * 60);
+    } else {
+        snprintf(timeTxt, sizeof timeTxt, "TIME DNF");
+    }
+    snprintf(lapTxt,  sizeof lapTxt,  "RACERS %d", n);
+    snprintf(posTxt,  sizeof posTxt,  "POSITION %s", ORD[std::clamp(simEngine.rankOf(focus), 1, sim::MAX_RACERS) - 1]);
+    snprintf(spdTxt,  sizeof spdTxt,  "TOP %d KM/H", kmh(cFocus));
 
     float t2Ps = 1.12f * s;
     float segW1 = textWidth(timeTxt, t2Ps);
@@ -4490,9 +7002,10 @@ void GLWidget::drawFinishOverlay(int W, int H, float dpr)
     drawText(spdTxt,  curX, ty2_bot + 8.5f * s, t2Ps, 1.0f, 0.85f, 0.25f);
 
     // =======================================================================
-    // 6. DETAILED LEADERBOARD BREAKDOWN (Clean, Generous Spacing)
+    // 6. LEADERBOARD: every car from 1st to last
     // =======================================================================
-    const float lb_h = 76.0f * s;
+    const float rowH = 21.0f * s;
+    const float lb_h = 22.0f * s + n * rowH;
     const float lb_y1 = ty2_bot - 8.0f * s;
     const float lb_y0 = lb_y1 - lb_h;
 
@@ -4505,42 +7018,69 @@ void GLWidget::drawFinishOverlay(int W, int H, float dpr)
     rect(bx0, lb_y0, bx0 + 1.0f * s, lb_y1);
     rect(bx1 - 1.0f * s, lb_y0, bx1, lb_y1);
 
-    // Table Header Bar
+    // Header bar and columns
     float colPs = 1.05f * s;
     glColor4f(0.12f, 0.16f, 0.24f, 0.95f);
     rect(bx0 + 2.0f * s, lb_y1 - 18.0f * s, bx1 - 2.0f * s, lb_y1 - 2.0f * s);
-    drawText("RANK   RACER                 TIME         TOP SPEED   STATUS",
-             bx0 + 12.0f * s, lb_y1 - 14.5f * s, colPs, 0.65f, 0.78f, 0.90f);
+    const float cRank = bx0 + 16.0f * s, cName = bx0 + 62.0f * s, cTime = bx0 + 0.36f * bw;
+    const float cBest = bx0 + 0.49f * bw, cTop = bx0 + 0.60f * bw, cWreck = bx0 + 0.72f * bw;
+    const float cRam = bx0 + 0.80f * bw, cStat = bx0 + 0.88f * bw;
+    const float hy = lb_y1 - 14.5f * s;
+    drawText("RANK", cRank, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("RACER", cName, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("TIME", cTime, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("BEST LAP", cBest, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("TOP SPEED", cTop, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("WRECKS", cWreck, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("RAMS", cRam, hy, colPs, 0.65f, 0.78f, 0.90f);
+    drawText("STATUS", cStat, hy, colPs, 0.65f, 0.78f, 0.90f);
 
-    // Row 1: Winner (Gold highlight card)
-    float r1_y0 = lb_y1 - 44.0f * s;
-    float r1_y1 = lb_y1 - 21.0f * s;
-    glColor4f(0.20f, 0.17f, 0.05f, 0.75f);
-    rect(bx0 + 4.0f * s, r1_y0, bx1 - 4.0f * s, r1_y1);
-    // Gold indicator bar on left
-    glColor4f(1.0f, 0.85f, 0.20f, 1.0f);
-    rect(bx0 + 4.0f * s, r1_y0, bx0 + 9.0f * s, r1_y1);
-    char r1Buf[96];
-    snprintf(r1Buf, sizeof r1Buf, " 1ST   %-18s %02d:%04.1f      %3d KM/H    WINNER", nameWin, winM, winS, topSpeedWin);
-    drawText(r1Buf, bx0 + 14.0f * s, r1_y0 + 6.0f * s, colPs, 1.0f, 0.92f, 0.45f);
+    for (int r = 0; r < n; ++r) {
+        const int i = order[r];
+        const sim::Car &c = cars[i];
+        const bool mine = isSingle && i == 0;
+        const float ry1 = lb_y1 - 21.0f * s - r * rowH, ry0 = ry1 - rowH + 3.0f * s;
+        if (r == 0)    glColor4f(0.20f, 0.17f, 0.05f, 0.75f);    // gold card for the winner
+        else if (mine) glColor4f(0.05f, 0.18f, 0.24f, 0.80f);    // your row stands out
+        else           glColor4f(0.09f, 0.13f, 0.20f, 0.75f);
+        rect(bx0 + 4.0f * s, ry0, bx1 - 4.0f * s, ry1);
+        glColor4f(c.r, c.g, c.b, 1.0f);                           // each car's colour on the left
+        rect(bx0 + 4.0f * s, ry0, bx0 + 9.0f * s, ry1);
 
-    // Row 2: Runner-up (Silver highlight card)
-    float r2_y0 = lb_y0 + 5.0f * s;
-    float r2_y1 = r1_y0 - 4.0f * s;
-    glColor4f(0.09f, 0.13f, 0.20f, 0.75f);
-    rect(bx0 + 4.0f * s, r2_y0, bx1 - 4.0f * s, r2_y1);
-    // Silver indicator bar on left
-    glColor4f(0.60f, 0.75f, 0.90f, 1.0f);
-    rect(bx0 + 4.0f * s, r2_y0, bx0 + 9.0f * s, r2_y1);
-    char r2Buf[96];
-    if (cLoss.finished) {
-        float diff = std::max(0.0f, cLoss.finishTime - cWin.finishTime);
-        snprintf(r2Buf, sizeof r2Buf, " 2ND   %-18s +%-4.1f SEC     %3d KM/H    RUNNER-UP", nameLoss, diff, topSpeedLoss);
-    } else {
-        float remM = std::max(0.0f, sim::TRACK_LEN + cLoss.z);
-        snprintf(r2Buf, sizeof r2Buf, " 2ND   %-18s DNF (+%3dM)    %3d KM/H    RUNNER-UP", nameLoss, int(remM), topSpeedLoss);
+        char timeBuf[32], bestBuf[16], topBuf[16];
+        if (c.finished && r == 0) {
+            int m = int(c.finishTime) / 60;
+            snprintf(timeBuf, sizeof timeBuf, "%02d:%04.1f", m, c.finishTime - m * 60);
+        } else if (c.finished) {
+            snprintf(timeBuf, sizeof timeBuf, "+%.1f SEC", std::max(0.0f, c.finishTime - cWin.finishTime));
+        } else {
+            snprintf(timeBuf, sizeof timeBuf, c.out ? "OUT +%dM" : "DNF +%dM", int(std::max(0.0f, simEngine.raceDistance() - c.progress)));
+        }
+        if (c.bestLap > 0.0f) {
+            const int m = int(c.bestLap) / 60;
+            snprintf(bestBuf, sizeof bestBuf, "%d:%04.1f", m, c.bestLap - float(m) * 60.0f);
+        } else {
+            snprintf(bestBuf, sizeof bestBuf, "-");
+        }
+        snprintf(topBuf, sizeof topBuf, "%d KM/H", kmh(c));
+        const char *status = c.out ? "ELIMINATED" : !c.finished ? "DNF" : r == 0 ? "WINNER" : r < 3 ? "PODIUM" : "FINISHED";
+        const float tr = r == 0 ? 1.0f : mine ? 0.55f : 0.78f, tg = r == 0 ? 0.92f : mine ? 0.95f : 0.86f;
+        const float tb = r == 0 ? 0.45f : mine ? 1.0f : 0.95f;
+        const float ty = ry0 + (rowH - 3.0f * s - 7.0f * colPs) * 0.5f;
+        drawText(ORD[r], cRank, ty, colPs, tr, tg, tb);
+        const std::string nm = racerName(i);
+        const float ns = fitSize(nm.c_str(), colPs, cTime - cName - 10.0f * s);
+        drawText(nm.c_str(), cName, ty + 3.5f * (colPs - ns), ns, tr, tg, tb);
+        drawText(timeBuf, cTime, ty, colPs, tr, tg, tb);
+        drawText(bestBuf, cBest, ty, colPs, tr, tg, tb);
+        drawText(topBuf, cTop, ty, colPs, tr, tg, tb);
+        char wreckBuf[8], ramBuf[8];
+        snprintf(wreckBuf, sizeof wreckBuf, "%d", c.wrecks);
+        snprintf(ramBuf, sizeof ramBuf, "%d", c.crashesCaused);
+        drawText(wreckBuf, cWreck, ty, colPs, tr, tg, tb);
+        drawText(ramBuf, cRam, ty, colPs, c.crashesCaused ? 1.0f : tr, c.crashesCaused ? 0.45f : tg, c.crashesCaused ? 0.35f : tb);
+        drawText(status, cStat, ty, colPs, tr, tg, tb);
     }
-    drawText(r2Buf, bx0 + 14.0f * s, r2_y0 + 6.0f * s, colPs, 0.75f, 0.85f, 0.95f);
 
     // =======================================================================
     // 7. INTERACTIVE ACTION BUTTONS (Gantry Base)

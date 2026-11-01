@@ -6,13 +6,13 @@
 // state and hands race snapshots to the game.
 
 #include <QObject>
-#include <QTcpSocket>
 #include <QUdpSocket>
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QStringList>
 #include <deque>
 #include "protocol.h"
+#include "link.h"
 
 class RaceClient : public QObject
 {
@@ -21,23 +21,32 @@ public:
     explicit RaceClient(QObject *parent = nullptr);
     ~RaceClient() override;
 
-    // "K7Q2" = find the room on this network; "K7Q2@host" or "K7Q2@host:port" = connect directly
+    // "K7Q2" = find the room on this network (then on the internet server, if one is set);
+    // "K7Q2@host", "K7Q2@host:port" or "K7Q2@wss://host/race" = connect directly
     void join(const QString &codeOrAddress, const QString &name, float r, float g, float b);
-    // Create a new room on the server at host:port (the host's own game uses 127.0.0.1)
-    void create(const QString &host, quint16 port, const QString &name, float r, float g, float b, int map);
+    // Create a new room on the server at host:port (the host's own game uses 127.0.0.1), or at
+    // a ws:// / wss:// URL (the internet server; port unused)
+    void create(const QString &host, quint16 port, const QString &name, float r, float g, float b, int map, int laps);
     void leave();
 
     void sendInput(quint32 seq, const sim::PlayerInput &in);
+    void sendStory(bool skipForAll);           // the race's story scene: watched it / skip it for everyone
+    bool autoStory = false;                    // (test bots: say "watched" as soon as a race starts)
     void requestStart();
     void requestAddCpu();      // host: add a CPU racer (random level 1-5)
     void requestRemoveCpu();   // host: remove the last CPU racer
-    void requestMap(int map);
+    void requestName(const QString &name);   // change my name (in the lobby)
+    void requestMap(int map, int laps);    // host: map and number of laps
+
+    QString internetUrl;                       // the internet server (wss://...); empty: none
+    QString token;                             // your account's session (sent when joining; empty: a guest)
 
     // Lobby / race state as last told by the server
     QString code;
     int slot = -1;
     bool isHost = false;
     int lobbyMap = 0;
+    int lobbyLaps = 3;
     QList<net::LobbyPlayer> players;
     int pingMs = -1;
 
@@ -46,16 +55,17 @@ signals:
     void welcomed();
     void lobbyChanged();
     // world = the host's track fingerprint (GameSim::worldChecksum) to compare with ours
-    void raceStarted(int map, int slot, const QStringList &names, quint32 world);
+    void raceStarted(int map, int laps, int slot, const QStringList &names, quint32 world);
     void snapshotArrived(quint32 lastSeq, const QByteArray &body);
     void raceOver();
+    void storyEnded();                         // everyone may race: the countdown starts
     void failed(const QString &reason);
 
 private slots:
     void onConnected();
     void onReadyRead();
     void onDisconnected();
-    void onSocketError(QAbstractSocket::SocketError);
+    void onLinkFailed();
     void onDiscoveryReply();
     void onDiscoveryTimer();
     void onPingTimer();
@@ -67,7 +77,7 @@ private:
     void dispatch(net::MsgType type, const QByteArray &payload);
     void reset();
 
-    QTcpSocket sock;
+    net::Link *link = nullptr;                 // the connection (TCP or WebSocket), made per connect
     QUdpSocket udp;
     QTimer discoverTimer, pingTimer, connectTimer;
     QElapsedTimer pingClock;
@@ -77,7 +87,7 @@ private:
     bool joined = false;
     QString myName, wantCode;
     float myR = 1, myG = 1, myB = 1;
-    int wantMap = 0;
+    int wantMap = 0, wantLaps = 3;
     int fakeLagMs = 0;
     // lag simulator queues: messages leave them in the order they came in
     std::deque<std::pair<net::MsgType, QByteArray>> lagIn;
