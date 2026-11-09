@@ -528,6 +528,7 @@ private:
     int pauseChoice = 0;
     bool soundOn = true;                  // the SOUND menu item (saved)
     void toggleSound();
+    void menuAccount();                   // the LOG OUT / LOG IN menu item
     bool uiTestOnlineBanner = false;      // (CAR_RACING_AUTOSHOT_UI: the online winner strip, offline)                  // the pause screen's choice: resume, restart, main menu
     void drawFinishOverlay(int W, int H, float dpr);
     void drawText(const char *s, float x, float y, float ps, float r, float g, float b);

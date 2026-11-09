@@ -266,8 +266,8 @@ struct MenuItem {
 // the menu's items, top to bottom
 // (the story is no menu item: it plays inside every mode, before each race)
 // (no LAPS item: every circuit race is 2 laps)
-enum MenuIdx { M_VSCPU, M_SPLIT, M_ONLINE, M_CAR, M_MAP, M_CPUS, M_PROFILE, M_TAUNTS, M_SOUND, M_CLONE, M_BOARD };
-static const MenuItem MENU_ITEMS[11] = {
+enum MenuIdx { M_VSCPU, M_SPLIT, M_ONLINE, M_CAR, M_MAP, M_CPUS, M_PROFILE, M_TAUNTS, M_SOUND, M_CLONE, M_BOARD, M_ACCOUNT };
+static const MenuItem MENU_ITEMS[12] = {
     {"PLAY VS CPU",            true},
     {"SPLIT SCREEN (2P)",       false},
 #ifdef __EMSCRIPTEN__
@@ -282,9 +282,10 @@ static const MenuItem MENU_ITEMS[11] = {
     {"TAUNTS",                  false},    // title shows ON / OFF (drawMainMenu)
     {"SOUND",                   true},     // title shows ON / OFF (also [M] in a race)
     {"YOUR CLONE",              false},    // title shows ON / OFF and how well it copies you
-    {"LEADERBOARD",             true}      // the best laps from every player's account
+    {"LEADERBOARD",             true},     // the best laps from every player's account
+    {"LOG OUT",                 false}     // title: LOG OUT (NAME) or LOG IN (drawMainMenu); opens the log-in screen
 };
-static const int NUM_MENU_ITEMS = 11;
+static const int NUM_MENU_ITEMS = 12;
 
 } // namespace
 
@@ -400,6 +401,17 @@ float GLWidget::rnd(float a, float b)
 
 // Menu pickers: 3 = car, 4 = map, 5 = number of CPU racers, 6 = CPU difficulty.
 // Returns false for other items.
+// The LOG OUT / LOG IN menu item: logged in - log out (this PC's own profile and clone come
+// back); then the log-in screen, where someone else can log in or carry on offline
+void GLWidget::menuAccount()
+{
+    const bool wasIn = !accountUser.isEmpty();
+    if (wasIn) { accountLogout(); acctUser.clear(); }
+    acctStatusBad = false;
+    openAccountScreen(false);
+    if (wasIn) acctStatus = "YOU LOGGED OUT - LOG IN, OR PLAY OFFLINE";
+}
+
 // Sound on or off (the SOUND menu item, [M] in the menu and in a race), remembered
 void GLWidget::toggleSound()
 {
@@ -1298,6 +1310,18 @@ void GLWidget::runAutoShot()
         return;
     }
 
+    // CAR_RACING_AUTOSHOT_LOGOUT: the LOG OUT menu item (a pretend account in the test settings)
+    if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_LOGOUT")) {
+        if (f == 5) { accountScreen = AccountScreen::Off; accountUser = "TESTUSR1"; accountToken = "not-a-real-token"; menuSelection = M_ACCOUNT; }
+        if (f == 30) shot("logout_1_menu");
+        if (f == 35) menuAccount();
+        if (f == 55) shot("logout_2_login_screen");
+        if (f == 60) { accountScreen = AccountScreen::Off; menuSelection = M_ACCOUNT; }
+        if (f == 80) shot("logout_3_menu_logged_out");
+        if (f == 85) QCoreApplication::quit();
+        return;
+    }
+
     // CAR_RACING_AUTOSHOT_NEWMAPS: Desert Zigzag and Ghat Road, the CPU logic driving your car
     // among 5 CPUs: pictures along each road, then the menu's map card
     if (qEnvironmentVariableIsSet("CAR_RACING_AUTOSHOT_NEWMAPS")) {
@@ -1837,6 +1861,8 @@ void GLWidget::keyPressEvent(QKeyEvent *event)
                 profileOpen = true;
             } else if (menuSelection == M_BOARD) {
                 openLeaderboard(selectedMapPreset);
+            } else if (menuSelection == M_ACCOUNT) {
+                menuAccount();
             } else {
                 cycleMenuOption(menuSelection, 1);
             }
@@ -1973,6 +1999,8 @@ void GLWidget::mousePressEvent(QMouseEvent *event)
                     profileOpen = true;
                 } else if (i == M_BOARD) {
                     openLeaderboard(selectedMapPreset);
+                } else if (i == M_ACCOUNT) {
+                    menuAccount();
                 } else {
                     cycleMenuOption(i, 1);
                 }
@@ -6763,6 +6791,10 @@ void GLWidget::drawMainMenu(int W, int H, float dpr)
             title = cpuTitle;
         } else if (i == M_TAUNTS) {                     // TAUNTS: ON  < >
             std::snprintf(cpuTitle, sizeof cpuTitle, "TAUNTS: %s%s", tauntsOn ? "ON" : "OFF", sel ? "  < >" : "");
+            title = cpuTitle;
+        } else if (i == M_ACCOUNT) {                    // LOG OUT (SSK12345)  /  LOG IN
+            if (accountUser.isEmpty()) std::snprintf(cpuTitle, sizeof cpuTitle, "LOG IN");
+            else std::snprintf(cpuTitle, sizeof cpuTitle, "LOG OUT (%s)", accountUser.toLatin1().constData());
             title = cpuTitle;
         } else if (i == M_SOUND) {                      // SOUND: ON  < >
             std::snprintf(cpuTitle, sizeof cpuTitle, "SOUND: %s%s", soundOn ? "ON" : "OFF", sel ? "  < >" : "");
