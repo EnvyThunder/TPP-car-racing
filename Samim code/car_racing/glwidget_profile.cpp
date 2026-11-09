@@ -38,6 +38,7 @@ QJsonObject toJson(const sim::PlayerProfile &p)
     o["name"] = QString::fromStdString(p.name);
     o["races"] = p.races;
     o["sure"] = double(p.sure);
+    o["challenge"] = double(p.challenge);
     QJsonObject t;
     t["skill"] = double(p.traits.skill);
     t["consistency"] = double(p.traits.consistency);
@@ -84,6 +85,7 @@ bool fromJson(const QJsonObject &o, sim::PlayerProfile &p)
     if (o["version"].toInt() != 1 || !o["traits"].isObject()) return false;
     p.races = std::max(0, o["races"].toInt());
     p.sure = std::clamp(float(o["sure"].toDouble()), 0.0f, 1.0f);
+    p.challenge = std::clamp(float(o["challenge"].toDouble()), -0.4f, 1.0f);   // (older files: 0)
     const QJsonObject t = o["traits"].toObject();
     auto trait = [&](const char *k, float def) { return std::clamp(float(t[k].toDouble(def)), 0.0f, 1.0f); };
     p.traits.skill = trait("skill", 0.5f);
@@ -136,7 +138,7 @@ QString profilePath(const std::string &name)
 // profile: an average driver), turned into the CPU precision that drives at that pace
 float GLWidget::cpuSkillFor(const sim::PlayerProfile &p) const
 {
-    return sim::cpuPrecisionFor(0.6f * (1.0f - p.sure) + p.traits.skill * p.sure);
+    return sim::cpuCentreFor(p.traits.skill, p.sure, 0.0f);
 }
 
 // What the race director may know of a person: their skill, their habits on this map and in
@@ -596,9 +598,11 @@ void GLWidget::cloneAfterRace()
     cloneSummary = "YOUR CLONE IS LEARNING THIS RACE...";
     const sim::CloneBook book = cloneBook;               // (the thread trains on its own copy)
 #ifdef __EMSCRIPTEN__
-    // (the browser has no threads: it trains here, a second or two, while the results show)
-    sim::trainClone(book, sim::bundledBrain(sim::BrainRacer), cloneNew, cloneNewStats);
-    cloneDone = true;
+    // (the browser has no threads: clonePoll trains it a few ms every frame)
+    if (!cloneSlices.begin(book, sim::bundledBrain(sim::BrainRacer))) {
+        cloneNewStats = cloneSlices.st;
+        cloneDone = true;
+    }
 #else
     cloneThread = std::thread([this, book]() {
         sim::trainClone(book, sim::bundledBrain(sim::BrainRacer), cloneNew, cloneNewStats);
@@ -609,6 +613,16 @@ void GLWidget::cloneAfterRace()
 
 void GLWidget::clonePoll()
 {
+#ifdef __EMSCRIPTEN__
+    if (cloneSlices.busy()) {
+        const bool racing = simEngine.getState() == State::Racing;   // (less while you drive)
+        if (cloneSlices.run(racing ? 2.0 : 6.0)) {
+            cloneNew = cloneSlices.out;
+            cloneNewStats = cloneSlices.st;
+            cloneDone = true;
+        }
+    }
+#endif
     if (!cloneDone) return;
     if (cloneThread.joinable()) cloneThread.join();
     cloneDone = false;

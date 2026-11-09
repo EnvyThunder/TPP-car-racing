@@ -152,7 +152,7 @@ struct Car {
 // ---- Maps ----
 // Each map has its own circuit (shared/circuits.cpp) and a scenery theme. The theme
 // decides which props the sim places; the client also uses it for sky and lighting.
-enum class MapTheme { Countryside, Desert, Snow, City, Coast };
+enum class MapTheme { Countryside, Desert, Snow, City, Coast, Jungle };
 
 struct MapDef {
     const char *name;
@@ -163,7 +163,7 @@ struct MapDef {
     int   stars;                     // 1..3 difficulty shown in the menu
 };
 
-constexpr int NUM_MAPS = 6;
+constexpr int NUM_MAPS = 8;
 extern const MapDef MAPS[NUM_MAPS];
 
 // Road traffic drives round the circuit: s along the lap, lane = metres right of the centre
@@ -175,7 +175,9 @@ struct Traffic {
 };
 
 struct Obstacle {
-    enum Type { Cone, Barrel, Barrier, Tyres, Concrete };   // (tyres: a stack you knock away; concrete: a block that never moves)
+    // (tyres: a stack you knock away; concrete: a block that never moves; stone: a heavy rock;
+    //  mine: the death trap with the red skull, 0 health at once)
+    enum Type { Cone, Barrel, Barrier, Tyres, Concrete, Stone, Mine };
     Type  type = Cone;
     bool block() const { return type == Barrier || type == Concrete; }   // stays put, the car is pushed out
     float x = 0.0f, y = 0.0f, z = 0.0f;

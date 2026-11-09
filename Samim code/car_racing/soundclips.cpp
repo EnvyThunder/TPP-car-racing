@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cmath>
 
-SoundClip loadSoundClip(const QString &resource, const SoundParts &parts, float joinSeconds)
+SoundClip loadSoundClip(const QString &resource, const SoundParts &parts, float joinSeconds, float levelSeconds, bool asRecorded)
 {
     SoundClip clip;
     QFile f(resource);
@@ -72,11 +72,13 @@ SoundClip loadSoundClip(const QString &resource, const SoundParts &parts, float 
     }
     const size_t count = out.size();
 
-    // 3. Even loudness: the level over the last/next 0.75 s (every 50 ms) is pulled towards the
-    // clip's own average, by at most 3x up or down, the gain gliding smoothly between points.
-    // Swells (cars passing the microphone) and breaks in the music go; the beat stays.
-    {
-        const size_t hop = 2205, win = 33075;            // 50 ms, 0.75 s each side
+    // 3. Even loudness: the level over the last/next levelSeconds (every 50 ms) is pulled towards
+    // the clip's own average, by at most 3x up or down, the gain gliding smoothly between points.
+    // Swells (cars passing the microphone) and breaks in the music go; the beat stays. (0: kept as
+    // it is - a piece whose quiet and loud parts are written that way.)
+    if (asRecorded) return clip;                         // (your own record: as loud as it was made)
+    if (levelSeconds > 0.0f) {
+        const size_t hop = 2205, win = size_t(levelSeconds * 44100.0f);   // 50 ms; so much each side
         const size_t pts = count / hop + 2;
         std::vector<double> prefix(count + 1, 0.0);
         for (size_t i = 0; i < count; ++i) prefix[i + 1] = prefix[i] + double(out[i]) * out[i];

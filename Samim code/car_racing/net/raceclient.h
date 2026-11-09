@@ -29,7 +29,7 @@ public:
     void create(const QString &host, quint16 port, const QString &name, float r, float g, float b, int map, int laps);
     void leave();
 
-    void sendInput(quint32 seq, const sim::PlayerInput &in);
+    void sendInput(quint32 seq, const QByteArray &bits, int want);   // bits: the last inputs, oldest first
     void sendStory(bool skipForAll);           // the race's story scene: watched it / skip it for everyone
     bool autoStory = false;                    // (test bots: say "watched" as soon as a race starts)
     void requestStart();
@@ -49,6 +49,7 @@ public:
     int lobbyLaps = 3;
     QList<net::LobbyPlayer> players;
     int pingMs = -1;
+    bool fastActive() const;                   // inputs and snapshots go by the fast lane (UDP) now
 
 signals:
     void status(const QString &text);
@@ -56,7 +57,8 @@ signals:
     void lobbyChanged();
     // world = the host's track fingerprint (GameSim::worldChecksum) to compare with ours
     void raceStarted(int map, int laps, int slot, const QStringList &names, quint32 world);
-    void snapshotArrived(quint32 lastSeq, const QByteArray &body);
+    void snapshotArrived(quint32 lastSeq, int queued, const QByteArray &body);
+    void extrasArrived(const QByteArray &body);   // obstacle changes + effects for a fast-lane snapshot
     void raceOver();
     void storyEnded();                         // everyone may race: the countdown starts
     void failed(const QString &reason);
@@ -70,6 +72,8 @@ private slots:
     void onDiscoveryTimer();
     void onPingTimer();
     void onConnectTimeout();
+    void onFastRead();
+    void onFastTimer();
 
 private:
     void connectTo(const QString &host, quint16 port);
@@ -93,6 +97,23 @@ private:
     std::deque<std::pair<net::MsgType, QByteArray>> lagIn;
     std::deque<QByteArray> lagOut;
     QString connectHost;
+    // the fast lane (net/protocol.h)
+    QUdpSocket fastSock;
+    QTimer fastTimer;
+    QHostAddress fastHost;
+    quint16 fastPort = 0;
+    quint64 fastToken = 0;
+    bool fastOk = false;                       // the server answers on it
+    qint64 fastLastRx = -1;
+    qint32 lastSnapTick = -1;                  // (an older snapshot arriving late is thrown away)
+    void sendFast(quint8 type, const QByteArray &payload);
+    void handleSnapshot(const QByteArray &payload);
+#ifdef __EMSCRIPTEN__
+public:
+    void rtcEvent(int kind, const unsigned char *data, int size);   // from the page's WebRTC (net/raceclient.cpp)
+private:
+    bool rtcWeb = false;                       // the fast lane is the browser's data channel
+#endif
 };
 
 #endif // RACECLIENT_H

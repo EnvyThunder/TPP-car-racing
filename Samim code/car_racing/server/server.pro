@@ -8,6 +8,14 @@ TEMPLATE = app
 
 INCLUDEPATH += ../shared ../net
 
+# the browsers' fast lane (WebRTC data channels), where libdatachannel is installed
+exists(/usr/local/include/rtc/rtc.hpp) {
+    DEFINES += HAVE_RTC
+    INCLUDEPATH += /usr/local/include
+    LIBS += -L/usr/local/lib -ldatachannel
+    QMAKE_LFLAGS += -Wl,-rpath,/usr/local/lib
+}
+
 SOURCES += \
     ../net/link.cpp \
     main.cpp \

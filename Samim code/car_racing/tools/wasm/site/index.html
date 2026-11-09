@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<!-- The site's front page (tools/wasm/deploy_site.sh puts it at /): the desktop game to download
+     for online races, and the browser game (/play/) to try offline. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPP Car Racing</title>
+<meta name="description" content="A fast 3D arcade racer: race CPU drivers that learn your style, or friends online. Free for Windows.">
+<style>
+  :root {
+    --bg: #0b0f1a; --panel: #121a2b; --line: #22304d; --text: #e8eefc; --muted: #9aa8c7;
+    --accent: #ff8a1f; --accent2: #22d3ee; --ok: #34d399;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  a { color: var(--accent2); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+  header { position: relative; min-height: 78vh; display: flex; align-items: flex-end; overflow: hidden; }
+  header img.bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; filter: saturate(1.1); }
+  header::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(11,15,26,.15) 0%, rgba(11,15,26,.55) 55%, var(--bg) 100%); }
+  .hero { position: relative; z-index: 1; padding: 48px 0 40px; }
+  h1 { font-size: clamp(38px, 7vw, 72px); line-height: 1.02; margin: 0 0 12px; letter-spacing: -0.02em; }
+  h1 span { color: var(--accent); }
+  .lead { font-size: clamp(17px, 2.2vw, 21px); color: #d6def0; max-width: 640px; margin: 0 0 26px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 14px; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 12px; font-weight: 700; text-decoration: none; font-size: 17px; }
+  .btn.primary { background: var(--accent); color: #1a0d00; box-shadow: 0 8px 24px rgba(255,138,31,.35); }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.ghost { background: rgba(18,26,43,.75); color: var(--text); border: 1px solid var(--line); }
+  .btn.ghost:hover { border-color: var(--accent2); }
+  .btn small { font-weight: 500; opacity: .8; font-size: 13px; }
+  section { padding: 56px 0 8px; }
+  h2 { font-size: 28px; margin: 0 0 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--muted); }
+  .steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+  .steps li { counter-increment: s; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px 14px 58px; position: relative; }
+  .steps li::before { content: counter(s); position: absolute; left: 16px; top: 13px; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #1a0d00; font-weight: 800; display: grid; place-items: center; }
+  .note { border-left: 3px solid var(--accent2); background: rgba(34,211,238,.07); padding: 12px 16px; border-radius: 0 10px 10px 0; color: #cfe9f2; margin-top: 14px; }
+  .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .shots img { width: 100%; border-radius: 14px; border: 1px solid var(--line); display: block; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  td { padding: 10px 14px; border-top: 1px solid var(--line); }
+  tr:first-child td { border-top: 0; }
+  td:first-child { width: 40%; color: var(--accent2); font-weight: 600; }
+  kbd { background: #0b1222; border: 1px solid var(--line); border-bottom-width: 3px; border-radius: 6px; padding: 1px 7px; font-size: 14px; }
+  footer { color: var(--muted); padding: 48px 0 36px; font-size: 14px; }
+  @media (max-width: 560px) { .btn { width: 100%; justify-content: center; } header { min-height: 70vh; } }
+</style>
+</head>
+<body>
+<header>
+  <img class="bg" src="img/race.jpg" alt="A race on the Sunset Valley sprint">
+  <div class="wrap hero">
+    <h1>TPP <span>Car Racing</span></h1>
+    <p class="lead">A fast 3D arcade racer. Race CPU drivers that learn how you drive, crash, jump and boost to the line, or race your friends online.</p>
+    <div class="buttons">
+      <a class="btn primary" href="download/TPP-Car-Racing-desktop.zip" download>&#11015; Download for Windows <small>38 MB · free</small></a>
+      <a class="btn ghost" href="play/">&#9654; Play offline in your browser</a>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>What you get</h2>
+    <div class="grid">
+      <div class="card"><h3>Online races</h3><p>Up to 6 racers on our internet server: host a room and share its 4-letter code. Desktop game only.</p></div>
+      <div class="card"><h3>CPUs that adapt</h3><p>Named rival drivers with their own moods and tactics, tough from your very first race.</p></div>
+      <div class="card"><h3>Varied maps</h3><p>Sprints and circuits with jumps, shortcuts, traffic and obstacles, and more to come.</p></div>
+      <div class="card"><h3>Your profile</h3><p>Log in to keep your profile, your driving clone and your place on the leaderboard.</p></div>
+    </div>
+  </section>
+
+  <section id="download">
+    <h2>Install on Windows</h2>
+    <ol class="steps">
+      <li><strong>Download</strong> the ZIP with the button above (Windows 10 or 11, 64-bit). Nothing else to install.</li>
+      <li><strong>Unzip</strong> it anywhere: right-click &rarr; <em>Extract All</em>. Don't run it from inside the ZIP.</li>
+      <li>Open the folder and double-click <strong>car_racing.exe</strong>.</li>
+    </ol>
+    <p class="note">Windows may say <em>"Microsoft Defender SmartScreen prevented an unrecognized app from starting"</em>. That is shown for any game not signed by a company. Click <strong>More info</strong> &rarr; <strong>Run anyway</strong>. If there is no such button, right-click car_racing.exe &rarr; <em>Properties</em> &rarr; tick <em>Unblock</em> &rarr; <em>OK</em>.</p>
+    <p class="note">On a Mac? The desktop game is for Windows only for now. You can still <a href="play/">play offline in your browser</a>.</p>
+  </section>
+
+  <section>
+    <h2>Race your friends</h2>
+    <ol class="steps">
+      <li>One of you: <strong>ONLINE MULTIPLAYER</strong> &rarr; <strong>HOST AN ONLINE RACE</strong>, and send the 4-letter room code to the others.</li>
+      <li>Everyone else: <strong>ONLINE MULTIPLAYER</strong> &rarr; <strong>JOIN WITH A CODE</strong> &rarr; type the code &rarr; <kbd>Enter</kbd>.</li>
+      <li>The host adds CPU cars with <kbd>+</kbd> and starts with <kbd>Enter</kbd>. Your friends can be anywhere, on any Wi-Fi or mobile data.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Keys</h2>
+    <table>
+      <tr><td><kbd>&uarr;</kbd> / <kbd>W</kbd></td><td>Accelerate</td></tr>
+      <tr><td><kbd>&darr;</kbd> / <kbd>S</kbd></td><td>Brake / reverse</td></tr>
+      <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd> / <kbd>A</kbd> <kbd>D</kbd></td><td>Steer</td></tr>
+      <tr><td><kbd>Space</kbd> / <kbd>Enter</kbd></td><td>Nitro</td></tr>
+      <tr><td><kbd>L</kbd></td><td>Boost</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Pause · skip the story scene</td></tr>
+      <tr><td><kbd>F2</kbd></td><td>Meter: frames, ping, connection</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>Screenshots</h2>
+    <div class="shots">
+      <img src="img/showroom.jpg" alt="The garage menu with the car on its turntable" loading="lazy">
+      <img src="img/race.jpg" alt="Racing on Sunset Valley" loading="lazy">
+    </div>
+  </section>
+</main>
+
+<footer class="wrap">TPP Car Racing · a college project in C++ with Qt and OpenGL · all music in the game is our own.</footer>
+</body>
+</html>

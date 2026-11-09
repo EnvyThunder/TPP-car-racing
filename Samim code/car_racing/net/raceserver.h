@@ -21,6 +21,7 @@
 
 class QTcpSocket;
 class QNetworkAccessManager;
+struct RtcPeer;                         // a browser's WebRTC connection (net/raceserver.cpp)
 
 class RaceServer : public QObject
 {
@@ -40,13 +41,17 @@ public:
     quint16 wsPort() const;
     int maxRooms = 0;
     QString apiBase;
+    // the browsers' fast lane (WebRTC, built with libdatachannel: HAVE_RTC): one UDP port for all,
+    // and the address browsers reach it at (the machine's own may be private, as on AWS)
+    quint16 rtcPort = 0;
+    QString publicIp;
     static constexpr int MAX_PER_ADDRESS = 8;
     int roomCount() const { return rooms.size(); }
     // Join attempts that reached this PC from other machines (room searches + connections).
     // Stays 0 while a friend is trying to join => a firewall or the Wi-Fi is blocking them.
     int remoteAttempts() const { return remoteSeen; }
     // measurements for the scripted online test (read from the game's thread)
-    std::atomic<int> statMaxGapMs{0}, statStarved{0}, statDropped{0};
+    std::atomic<int> statMaxGapMs{0}, statStarved{0}, statDropped{0}, statSkipped{0};
 
 signals:
     void log(const QString &line);
@@ -57,6 +62,7 @@ private slots:
     void onDisconnected();
     void onDiscovery();
     void onTick();
+    void onFast();
 
 private:
     struct Player {
@@ -69,6 +75,16 @@ private:
         std::deque<std::pair<quint32, sim::PlayerInput>> inputs;   // queued, each used exactly once
         float budget = 0.0f;             // inputs this player may still use (stops "fast forward")
         quint32 lastSeq = 0;             // seq of the input applied most recently
+        quint32 lastQueued = 0;          // newest seq queued (inputs come with copies of the last ones)
+        int want = 2;                    // inputs their game wants waiting here (more on a shaky line)
+        std::vector<sim::SimEvent> events;        // effects since their last snapshot
+        sim::GameSim::SnapshotMemory mem;         // what their earlier snapshots said
+        int skipped = 0;                 // snapshots held back in a row (their connection backed up)
+        quint64 fastToken = 0;           // the fast lane: their secret, their address, when inputs last came by it
+        QHostAddress fastAddr;
+        quint16 fastPort = 0;
+        qint64 fastInputAt = -1;
+        RtcPeer *rtc = nullptr;          // a browser's data channel (the fast lane for it)
         int cpuLevel = 0;                // CPU racer (driven by the server) with difficulty 1..5
         bool isCpu() const { return cpuLevel > 0; }
     };
@@ -81,8 +97,6 @@ private:
         QList<Player *> players;         // index == car slot during a race
         Player *host = nullptr;
         sim::GameSim sim;
-        std::vector<sim::SimEvent> pendingEvents;
-        std::vector<sim::Obstacle> lastSentObstacles;
         int steps = 0;
         // the story scene before the race: the race waits until every person in the room has
         // watched it, one of them skips it for everyone, or STORY_MAX ticks have passed
@@ -97,6 +111,10 @@ private:
     void endStory(Room *room);
 
     void handle(Player *p, net::MsgType type, const QByteArray &payload);
+    void fastPacket(Player *p, const QByteArray &data);
+    void sendFastTo(Player *p, const QByteArray &dg);
+    void rtcOffer(Player *p, const QString &sdp);
+    void closeRtc(Player *p);
     void join(Player *p, QDataStream &in);
     void startRace(Room *room);
     void endRace(Room *room);
@@ -115,6 +133,8 @@ private:
     QTcpServer tcp;
     QTcpServer ws;
     QUdpSocket udp;
+    QUdpSocket fast;                     // the fast lane (game port + 2)
+    QElapsedTimer upClock;
     QNetworkAccessManager *nam = nullptr;
     quint64 nextId = 0;
     QHash<QString, int> perAddress;

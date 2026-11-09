@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <random>
 #include <vector>
 
 namespace sim {
@@ -74,6 +75,26 @@ struct CloneStats {
 // Trains a clone (from `start`, or from small random numbers without one), holding the
 // newest race out to measure how often it means what you meant. Same data, same result.
 bool trainClone(const CloneBook &book, const Brain *start, Brain &out, CloneStats &st, int epochs = 20);
+
+// The same training a little at a time: the browser has no threads, and training a long history
+// in one go stops the page for many seconds. run() works for about budgetMs (below 0: to the
+// end) and says whether it is finished; slices or not, the result is exactly the same.
+class CloneTrainer {
+public:
+    bool begin(const CloneBook &book, const Brain *start, int epochs = 20);   // false: too little to learn from
+    bool run(double budgetMs = -1.0);
+    bool busy() const { return active; }
+    Brain out{};
+    CloneStats st;
+private:
+    CloneBook book;
+    std::vector<int> train, test;
+    std::mt19937 rng;
+    std::vector<float> W, M, V, G;
+    int epochs = 0, ep = 0, step = 0;
+    size_t b0 = 0;
+    bool shuffled = false, active = false;
+};
 
 bool saveCloneBrain(const std::string &path, const Brain &b, const CloneStats &st);
 bool loadCloneBrain(const std::string &path, Brain &b, CloneStats &st);

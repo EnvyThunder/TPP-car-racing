@@ -56,7 +56,7 @@ QString GLWidget::apiBase() const
     free(page);
     if (!fromPage.isEmpty()) return fromPage;
 #endif
-    return QSettings("TPP", acctApp()).value("api/base", "https://13-49-109-8.sslip.io").toString();
+    return QSettings("TPP", acctApp()).value("api/base", "https://tppcarracing.duckdns.org").toString();
 }
 
 // scripted tests keep their account apart from yours
@@ -402,7 +402,7 @@ void GLWidget::drawAccountScreen(int W, int H, float dpr)
         glColor4f(0.03f, 0.05f, 0.10f, 1.0f);
         rect(lx + 2.0f * dpr, y - s, lx + s + 2.0f * dpr, y);
         if (acctShare) { glColor4f(0.35f, 1.0f, 0.55f, 1.0f); rect(lx + 4.0f * dpr, y - s + 2.0f * dpr, lx + s, y - 2.0f * dpr); }
-        drawText("SHARE MY RACES FOR TRAINING (OPTIONAL - YOUR CLONE RECORDINGS HELP TRAIN THE CPUS)", lx + s + 12.0f * dpr, y - s,
+        drawText("SHARE MY RACES TO TRAIN THE CPUS (UNTICK TO SAY NO - MY PROFILE: S CHANGES IT LATER)", lx + s + 12.0f * dpr, y - s,
                  ps * 0.8f, sel == RowShare ? 1.0f : 0.80f, sel == RowShare ? 1.0f : 0.85f, sel == RowShare ? 1.0f : 0.92f);
         acctHits.push_back({lx, y - s - 4.0f * dpr, lx + fw, y + 4.0f * dpr, RowShare});
         y -= s + 18.0f * dpr;

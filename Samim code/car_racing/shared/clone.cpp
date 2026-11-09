@@ -3,6 +3,7 @@
 #include "gamesim.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -162,30 +163,40 @@ static void targetsFor(const CloneSample &c, float t[BRAIN_OUT], float w[BRAIN_O
     w[OutRamps] = 0.05f;
 }
 
-bool trainClone(const CloneBook &book, const Brain *start, Brain &out, CloneStats &st, int epochs)
+bool CloneTrainer::begin(const CloneBook &b, const Brain *start, int epochCount)
 {
-    st = CloneStats();
-    st.races = book.races();
-    if (st.races < CloneBook::MIN_RACES) return false;
+    *this = CloneTrainer();
+    st.races = b.races();
+    if (st.races < CloneBook::MIN_RACES) { st.races = 0; return false; }
+    book = b;
     uint16_t newest = book.samples.back().race;
-    std::vector<int> train, test;
     for (int i = 0; i < int(book.samples.size()); ++i) (book.samples[size_t(i)].race == newest ? test : train).push_back(i);
     st.samples = int(book.samples.size());
-    if (train.size() < 300 || test.empty()) return false;
+    if (train.size() < 300 || test.empty()) { st.races = 0; return false; }   // (nothing learned: keep the old clone)
 
-    std::mt19937 rng(20261101u);
-    std::vector<float> W(BRAIN_SIZE), M(BRAIN_SIZE, 0.0f), V(BRAIN_SIZE, 0.0f), G(BRAIN_SIZE);
+    rng.seed(20261101u);
+    W.resize(BRAIN_SIZE); M.assign(BRAIN_SIZE, 0.0f); V.assign(BRAIN_SIZE, 0.0f); G.resize(BRAIN_SIZE);
     if (start) std::copy(start->w, start->w + BRAIN_SIZE, W.begin());
     else { std::normal_distribution<float> g(0.0f, 0.3f); for (float &x : W) x = g(rng); }
+    epochs = epochCount;
+    active = true;
+    return true;
+}
 
+bool CloneTrainer::run(double budgetMs)
+{
+    if (!active) return true;
+    const auto t0 = std::chrono::steady_clock::now();
     const int BATCH = 32;
     const float LR = 0.003f, B1 = 0.9f, B2 = 0.999f;
-    int step = 0;
     float z[BRAIN_HID], h[BRAIN_HID], a[BRAIN_OUT], y[BRAIN_OUT], dA[BRAIN_OUT], dZ[BRAIN_HID], t[BRAIN_OUT], wt[BRAIN_OUT];
     const int OUT0 = BRAIN_HID * (BRAIN_IN + 1);         // where the output layer's numbers start
-    for (int ep = 0; ep < epochs; ++ep) {
-        std::shuffle(train.begin(), train.end(), rng);
-        for (size_t b0 = 0; b0 < train.size(); b0 += BATCH) {
+    for (; ep < epochs; ++ep, b0 = 0, shuffled = false) {
+        if (!shuffled) { std::shuffle(train.begin(), train.end(), rng); shuffled = true; }
+        for (; b0 < train.size(); b0 += BATCH) {
+            if (budgetMs >= 0.0
+                && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() >= budgetMs)
+                return false;                            // (carries on from this batch next time)
             std::fill(G.begin(), G.end(), 0.0f);
             const size_t b1 = std::min(train.size(), b0 + BATCH);
             for (size_t bi = b0; bi < b1; ++bi) {
@@ -233,6 +244,7 @@ bool trainClone(const CloneBook &book, const Brain *start, Brain &out, CloneStat
         }
     }
     std::copy(W.begin(), W.end(), out.w);
+    active = false;
 
     // how often it means what you meant, on the race it never saw
     int sameSteer = 0, samePedal = 0;
@@ -245,7 +257,19 @@ bool trainClone(const CloneBook &book, const Brain *start, Brain &out, CloneStat
     }
     st.agreeSteer = float(sameSteer) / float(test.size());
     st.agreePedal = float(samePedal) / float(test.size());
+    book = CloneBook();                                  // (done: the copy and the numbers can go)
+    train.clear(); test.clear(); W.clear(); M.clear(); V.clear(); G.clear();
     return true;
+}
+
+bool trainClone(const CloneBook &book, const Brain *start, Brain &out, CloneStats &st, int epochs)
+{
+    CloneTrainer t;
+    const bool ok = t.begin(book, start, epochs);
+    if (ok) t.run();
+    st = t.st;
+    if (ok) out = t.out;
+    return ok;
 }
 
 // the clone's file: "TPPBRAN1", its stats, its weights

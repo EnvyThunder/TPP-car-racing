@@ -495,7 +495,7 @@ int main(int argc, char **argv)
 
     // online road: 5 lanes of 4.67 m; rails 4 m beyond the edge
     const float halfRoad = 7.0f + 4.67f, halfCorridor = halfRoad + 4.0f;
-    static const uint32_t GROUND[5] = {rgb(92, 140, 70), rgb(196, 150, 100), rgb(225, 232, 240), rgb(40, 44, 60), rgb(110, 160, 90)};
+    static const uint32_t GROUND[6] = {rgb(92, 140, 70), rgb(196, 150, 100), rgb(225, 232, 240), rgb(40, 44, 60), rgb(110, 160, 90), rgb(46, 110, 60)};   // (by theme)
 
     int bad = 0;
     const auto &circuits = sim::draftCircuits();
@@ -521,7 +521,7 @@ int main(int argc, char **argv)
         std::printf("%-16s lap alone %.1f s (clean %.1f s), with the shortcut %.1f s (saves %.2f s), "
                     "longest jump %.2f s / %.0f m, stuck %d\n", def.name, ms.lapMain, ms.clean, ms.lapCut,
                     ms.lapMain - ms.lapCut, ms.air, ms.flight, ms.stuck);
-        render(def, tr, r, ms, halfRoad, GROUND[i % 5], i == 4, QDir(outDir).filePath(name));
+        render(def, tr, r, ms, halfRoad, GROUND[int(sim::MAPS[i].theme)], sim::MAPS[i].theme == sim::MapTheme::Coast, QDir(outDir).filePath(name));
     }
     std::printf("%d circuit(s) with problems\n", bad);
     return bad ? 1 : 0;

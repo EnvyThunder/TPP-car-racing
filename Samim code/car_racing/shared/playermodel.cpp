@@ -126,8 +126,18 @@ int PlayerProfile::nemesis() const
     return best;
 }
 
+float PlayerProfile::challengeAfter(float now, int place, int cars)
+{
+    float step = -0.015f;                                // 3rd, 4th ...: a little easier
+    if (place <= 1) step = 0.06f;                        // you won: clearly tougher
+    else if (place >= cars) step = -0.03f;               // last: a bit easier
+    else if (place == 2) step = 0.025f;                  // 2nd: a little tougher
+    return std::clamp(now + step, -0.4f, 1.0f);
+}
+
 void PlayerProfile::addRace(const RaceObs &o, const RaceSummary &s, const std::vector<RivalRace> &rivalsHere)
 {
+    if (s.cars >= 2) challenge = challengeAfter(challenge, s.place, s.cars);
     for (const RivalRace &rr : rivalsHere) {
         if (rr.rosterId < 0 || rr.rosterId >= PM_ROSTER) continue;
         RivalRecord &r = rivals[size_t(rr.rosterId)];

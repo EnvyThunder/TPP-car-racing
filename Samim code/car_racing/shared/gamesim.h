@@ -34,14 +34,24 @@ public:
     // Fingerprint of the track as built by reset(): obstacles, nitro cans, starting
     // traffic, scenery count. Online, every player's copy must match the host's.
     uint32_t worldChecksum() const;
+    std::string worldParts() const;     // (diagnosis: the fingerprint part by part, to see where two systems differ)
 
     // ---- Network snapshots (server -> clients) ----
     // Only the parts that change during a race are sent; the track, props and the
     // starting traffic are rebuilt identically on every machine from the map + seed.
-    // lastSentObstacles (server side) limits obstacle updates to the ones that moved.
-    void writeSnapshot(QDataStream &out, const std::vector<SimEvent> &events,
-                       std::vector<Obstacle> *lastSentObstacles) const;
+    // mem (server side, one per receiver) remembers what their earlier snapshots said: obstacle
+    // updates go only for the ones that moved, each car's rare facts only now and then.
+    struct SnapshotMemory {
+        std::vector<Obstacle> obstacles;
+        std::vector<uint32_t> slowHash;
+        std::vector<int> slowAge;
+        int count = 0;
+    };
+    // extras: obstacle changes and effects go there instead (the fast lane: they must not be lost)
+    void writeSnapshot(QDataStream &out, const std::vector<SimEvent> &events, SnapshotMemory *mem,
+                       QDataStream *extras = nullptr, int exact = -1) const;   // exact: the receiver's own car, unrounded
     void readSnapshot(QDataStream &in, std::vector<SimEvent> &eventsOut);
+    void readExtras(QDataStream &in, std::vector<SimEvent> &eventsOut);
 
     uint64_t checksum() const;
 
@@ -63,7 +73,11 @@ public:
     static int nitroLenFor(int take) { static const int LEN[5] = {120, 138, 150, 168, 180}; return LEN[std::clamp(take, 1, 5) - 1]; }
     // A jump: every launch off a ramp is a little stronger than it used to be, and each next
     // car over the same ramp is thrown a little higher, up to the 4th (the same after that)
-    static float jumpMulFor(int jumper) { static const float MUL[4] = {1.08f, 1.14f, 1.20f, 1.26f}; return MUL[std::clamp(jumper, 1, 4) - 1]; }
+    // Together with JUMP_CARRY a jump covers about 35% more road than it did: worth the risk.
+    static float jumpMulFor(int jumper) { static const float MUL[4] = {1.25f, 1.32f, 1.39f, 1.46f}; return MUL[std::clamp(jumper, 1, 4) - 1]; }
+    static constexpr float JUMP_CARRY = 1.16f;                    // in the air the car covers this much more ground
+    static constexpr float STEER_RATE = 0.024f;                   // radians a tick at full lock (was 0.030)
+    static constexpr float STEER_TAP  = 0.6f;                     // a key just pressed turns this much, full after a few ticks
     // A sprint (Sunset Valley, Coastal Highway) is one open road raced once from the start
     // line to the finish line: no laps, s clamped to the road's ends
     bool sprint() const { return track.sprint(); }
@@ -143,6 +157,9 @@ public:
     GameMode getGameMode() const { return mode; }
     void setGameMode(GameMode m) { mode = m; }
 
+    // the challenge (shared/playermodel.h): above 0 the CPUs also make fewer mistakes and take more
+    // of the jumps, the shortcut and their boosts; at most a little sharper or duller around the skill
+    void setCpuChallenge(float c) { cpuChallenge = std::clamp(c, -0.4f, 1.0f); }
     int getAiDifficulty() const { return aiDifficulty; }
     void setAiDifficulty(int d) { aiDifficulty = d; }
 
@@ -172,10 +189,15 @@ public:
     // The CPU driver's decision for this tick. asRival = apply the difficulty level and
     // catch-up help against player 1; false = neutral driver at normal top speed.
     PlayerInput computeAIInput(Car &c, int carIndex, bool asRival);
+    PlayerInput computeAIDrive(Car &c, int carIndex, bool asRival);   // (what it would do without looking for mines)
     void collideWorld(Car &c, int carIndex);
     // Client-side prediction only: bump into barriers and traffic like collideWorld does,
     // but without knocking anything over or making events (the server decides those).
     void predictCollisions(Car &c) const;
+    // online: my car bumping another racer on my own screen at once (only my car moves, as
+    // the server will move it - half the overlap, the speeds shared when one runs into the
+    // other's back; the damage stays the server's). true: they touched
+    bool predictBump(Car &me, const Car &other) const;
     void collideCars(Car &a, Car &b, int idxA, int idxB);
     bool knock(Obstacle &o, float x, float z, float fx, float fz, float speed, int carIndex);
 
@@ -285,6 +307,7 @@ private:
     State state = Menu;
     GameMode mode = ModeSingle;
     int aiDifficulty = 1;
+    float cpuChallenge = 0.0f;
     int mapIndex = 0;
     float halfWidth = ROAD_HALF;
     int lanes = 3;

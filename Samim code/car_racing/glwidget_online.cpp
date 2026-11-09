@@ -7,6 +7,9 @@
 //   * my own car is predicted locally (no input lag) and corrected by each snapshot
 //   * the other cars are drawn INTERP_DELAY_MS in the past, blended between snapshots
 #include "glwidget.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 #include "raceserver.h"
 #include "raceclient.h"
 #include "protocol.h"
@@ -93,6 +96,12 @@ QString GLWidget::lanAddress()
 
 void GLWidget::openOnline()
 {
+#ifdef __EMSCRIPTEN__
+    // Online races are for the desktop game (smooth over the internet; a browser is not): the
+    // site's download page opens in a new tab and this game carries on
+    EM_ASM({ window.open('/#download', '_blank'); });
+    return;
+#endif
     if (!net) {
         net = new RaceClient(this);
         netClock.start();
@@ -107,6 +116,7 @@ void GLWidget::openOnline()
             simEngine.setLaps(laps);
             simEngine.startRace(sim::GameSim::ModeOnline, int(names.size()));
             trackMismatch = (simEngine.worldChecksum() != world);
+            std::printf("WORLD %s (host %08x)\n", simEngine.worldParts().c_str(), world); std::fflush(stdout);   // (diagnosis)
             mySlot = slot;
             racerNames = names;
             nameEditing = false;
@@ -119,9 +129,14 @@ void GLWidget::openOnline()
             netEvents.clear();
             history.clear();
             sentInputs.clear();
+            presentCars.clear(); presVx.clear(); presVz.clear(); presVs.clear();
             inputSeq = 0;
             corrX = corrZ = 0.0f;
-            if (slot >= 0 && slot < int(simEngine.getCars().size())) predicted = simEngine.getCars()[slot];
+            netInterpTarget = netInterpMs = net::INTERP_DELAY_MS;
+            netJitter = 0.0; netLastSnapAt = netLastCompose = -1;
+            netRenderT = netLastComposeNs = -1.0;
+            statStalls = statLate = 0;
+            if (slot >= 0 && slot < int(simEngine.getCars().size())) predicted = predictedPrev = simEngine.getCars()[slot];
             keys.clear();
             simAccumulator = 0.0f;
             elapsedTimer.restart();
@@ -130,6 +145,14 @@ void GLWidget::openOnline()
         });
         connect(net, &RaceClient::storyEnded, this, [this]() { endOnlineStory(); });
         connect(net, &RaceClient::snapshotArrived, this, &GLWidget::onNetSnapshot);
+        connect(net, &RaceClient::extrasArrived, this, [this](const QByteArray &body) {
+            if (!isOnline()) return;
+            QDataStream in(body);
+            net::prepare(in);
+            std::vector<sim::SimEvent> evs;
+            simEngine.readExtras(in, evs);
+            netEvents.insert(netEvents.end(), evs.begin(), evs.end());
+        });
         connect(net, &RaceClient::raceOver, this, [this]() {
             if (story != StoryScreen::Off) endOnlineStory();
             netStoryHold = false;
@@ -173,7 +196,7 @@ void GLWidget::netHostInternet()
 void GLWidget::netHost()
 {
 #ifdef __EMSCRIPTEN__
-    netMessage = "IN THE BROWSER, HOST ON THE INTERNET SERVER";   // (a web page can't be a server)
+    netMessage = "IN THE BROWSER, HOST AN ONLINE RACE";   // (a web page can't be a server)
     return;
 #endif
     float r, g, b;
@@ -228,9 +251,15 @@ void GLWidget::netLeave(const QString &message)
 // ===========================================================================
 //  The networked race
 // ===========================================================================
-void GLWidget::onNetSnapshot(quint32 lastSeq, const QByteArray &body)
+void GLWidget::onNetSnapshot(quint32 lastSeq, int queued, const QByteArray &body)
 {
     if (!isOnline()) return;
+    netQueued += (double(queued) - netQueued) * 0.1;
+    {
+        const qint64 t = netClock.elapsed();
+        if (netLastSnapAt >= 0 && t - netLastSnapAt >= 150) ++statStalls;
+        netLastSnapAt = t;
+    }
     if (!netTest.isEmpty()) {                            // scripted test: how evenly snapshots arrive
         const qint64 t = netClock.elapsed();
         if (statLastSnap >= 0) {
@@ -253,6 +282,15 @@ void GLWidget::onNetSnapshot(quint32 lastSeq, const QByteArray &body)
     const auto &cars = simEngine.getCars();
     const double serverMs = simEngine.getTick() * (1000.0 / 60.0);
     const double ahead = serverMs - double(netClock.elapsed());
+    // how late this one is against the quickest: the buffer of the other cars follows it - a steady
+    // connection shows them sooner, a shaky one a little later but without stops
+    const double lateBy = history.empty() ? 0.0 : std::max(0.0, serverClockAhead - ahead);
+    netJitter = std::max(lateBy, netJitter * 0.985);     // (peaks fade over about 4 s)
+    static const bool buf250 = qEnvironmentVariableIsSet("CAR_RACING_NET_BUF250");   // (test: the bigger buffer)
+    netInterpTarget = std::clamp(40.0 + netJitter * 1.1, 60.0, buf250 ? 250.0 : 150.0);   // (other cars no further in the past: clashes line up)
+    static const bool fixedBuffer = qEnvironmentVariableIsSet("CAR_RACING_NET_FIXED");   // (test: the old fixed 80 ms)
+    if (fixedBuffer) netInterpTarget = 80.0;
+    if (lateBy > netInterpMs) ++statLate;
     if (history.empty() || ahead > serverClockAhead) serverClockAhead = ahead;
     else serverClockAhead -= 2.0;
     history.push_back({serverMs, cars});
@@ -265,19 +303,61 @@ void GLWidget::onNetSnapshot(quint32 lastSeq, const QByteArray &body)
     sim::Car p = cars[mySlot];
     p.aiTarget = predicted.aiTarget; p.aiReverse = predicted.aiReverse;     // test autopilot memory
     p.aiCheckTimer = predicted.aiCheckTimer; p.aiCheckProg = predicted.aiCheckProg;
+    // While my car is replayed, the other cars move on as they did on the server (at their pace
+    // between the last two snapshots) - frozen where this snapshot left them, my replayed car
+    // would bump into them again at every step, and the next snapshot would pull it back
+    // (the push and pull shook the screen near other cars)
+    static const bool frozenReplay = qEnvironmentVariableIsSet("CAR_RACING_NET_FROZENREPLAY");   // (test: the old replay)
+    static const bool bumpOn = !qEnvironmentVariableIsSet("CAR_RACING_NET_NOBUMP");   // (test: no bumps on my screen, as before)
+    auto &live = simEngine.getCars();
+    const std::vector<sim::Car> base = live;
+    std::vector<float> vx(base.size(), 0.0f), vz(base.size(), 0.0f), vs(base.size(), 0.0f);
+    if (!frozenReplay && history.size() >= 2) {
+        const Sample &pa = history[history.size() - 2];
+        const float ticks = float((history.back().t - pa.t) / (1000.0 / 60.0));
+        if (ticks > 0.5f)
+            for (size_t i = 0; i < base.size() && i < pa.cars.size(); ++i) {
+                const sim::Car &o = pa.cars[i];
+                if (int(i) == mySlot || o.path != base[i].path || base[i].wreck > 0) continue;
+                const float dx = (base[i].x - o.x) / ticks, dz = (base[i].z - o.z) / ticks;
+                if (dx * dx + dz * dz > 9.0f) continue;     // (a respawn, not a pace)
+                vx[i] = dx; vz[i] = dz;
+                vs[i] = (base[i].progress - o.progress) / ticks;
+            }
+    }
+    int k = 0;
     for (const SentInput &si : sentInputs) {
+        ++k;
+        if (!frozenReplay)
+            for (size_t i = 0; i < live.size(); ++i) {
+                if (int(i) == mySlot || (vx[i] == 0.0f && vz[i] == 0.0f)) continue;
+                live[i].x = base[i].x + vx[i] * float(k);
+                live[i].z = base[i].z + vz[i] * float(k);
+                live[i].s = simEngine.wrapS(base[i].s + vs[i] * float(k));
+                live[i].hint = int(live[i].s);
+            }
         simEngine.updateCar(p, si.in, mySlot);
         simEngine.predictCollisions(p);
+        if (bumpOn)
+            for (size_t i = 0; i < live.size(); ++i)
+                if (int(i) != mySlot) simEngine.predictBump(p, live[i]);
     }
+    presentCars = live;                                  // (where the others are now, by the same rule)
+    presVx = vx; presVz = vz; presVs = vs;
+    for (size_t i = 0; i < live.size() && i < base.size(); ++i)
+        if (int(i) != mySlot) live[i] = base[i];
     simEngine.clearEvents();
     // hide corrections by blending them out over a few frames instead of jumping
     float ex = (predicted.x + corrX) - p.x, ez = (predicted.z + corrZ) - p.z;
     float err2 = ex * ex + ez * ez;
     ++statSnapshots;
     if (err2 > 0.25f) ++statSmallFix;
+    statErrSum += std::sqrt(err2);
     if (err2 > 36.0f) ++statSnaps;                       // big: usually a crash the server saw first
     if (err2 < 225.0f) { corrX = ex; corrZ = ez; }       // up to 15 m: glide there over a few frames
     else               { corrX = corrZ = 0.0f; }         // further: jump (respawn-sized error)
+    predictedPrev.x += p.x - predicted.x; predictedPrev.z += p.z - predicted.z; predictedPrev.y += p.y - predicted.y;
+    predictedPrev.heading += p.heading - predicted.heading;   // (the step before moves with it)
     predicted = p;
 }
 
@@ -285,7 +365,16 @@ void GLWidget::netUpdate(float realDt)
 {
     const float DT = 1.0f / 60.0f;
     auto &cars = simEngine.getCars();
-    simAccumulator += realDt;
+    // Time stretching: the server keeps a few of my inputs waiting so a late packet doesn't
+    // stop my car there (more on a shaky connection). Too few waiting: this game runs up to 2%
+    // faster for a moment; too many: up to 2% slower. Nobody can feel 2%.
+    // (the server keeps a few of my inputs waiting - more on a shaky connection - so a late
+    // packet doesn't stop my car there; this game always runs at exactly 60 steps a second:
+    // stretching it added and dropped steps, a jerky camera)
+    const int want = std::clamp(int(netJitter / 16.7) + 1, 1, 8);
+    static const bool stretchOn = qEnvironmentVariableIsSet("CAR_RACING_NET_STRETCH");   // (test: the old time stretching)
+    const double stretch = stretchOn ? 1.0 + std::clamp((double(want) - netQueued) * 0.005, -0.02, 0.02) : 1.0;
+    simAccumulator += realDt * float(stretch);
     while (simAccumulator >= DT) {
         simAccumulator -= DT;
         sim::PlayerInput in;                             // online: arrows or WASD both drive
@@ -297,13 +386,44 @@ void GLWidget::netUpdate(float realDt)
         in.boost = isDown(Qt::Key_L);
         if (!netTest.isEmpty() && mySlot < int(cars.size()))
             in = simEngine.computeAIInput(predicted, mySlot, false);   // scripted test: CPU drives
-        net->sendInput(++inputSeq, in);
-        sentInputs.push_back({inputSeq, in});
+        if (!netTest.isEmpty() && qEnvironmentVariableIsSet("CAR_RACING_NETTEST_RAM") && mySlot < int(cars.size())) {
+            // (test: drive into the nearest car ahead, as a player looking for a clash)
+            int best = -1; float bestD = 60.0f;
+            for (int i = 0; i < int(cars.size()); ++i) {
+                if (i == mySlot || cars[i].wreck > 0) continue;
+                const float dx = cars[i].x - predicted.x, dz = cars[i].z - predicted.z;
+                const float fx = std::sin(predicted.heading), fz = -std::cos(predicted.heading);
+                const float along = dx * fx + dz * fz, dist = std::sqrt(dx * dx + dz * dz);
+                if (along > -1.0f && dist < bestD) { bestD = dist; best = i; }
+            }
+            if (best >= 0) {
+                const float dx = cars[best].x - predicted.x, dz = cars[best].z - predicted.z;
+                const float rx = std::cos(predicted.heading), rz = std::sin(predicted.heading);   // (the car's right)
+                const float side = dx * rx + dz * rz;
+                in.left = side < -0.3f; in.right = side > 0.3f; in.up = true; in.down = false;
+            }
+        }
+        sentInputs.push_back({++inputSeq, in});
         while (sentInputs.size() > 180) sentInputs.pop_front();
+        {                                                // this input and copies of the last ones
+            QByteArray bits;
+            const size_t from = sentInputs.size() > size_t(net::INPUT_COPIES) ? sentInputs.size() - net::INPUT_COPIES : 0;
+            for (size_t k = from; k < sentInputs.size(); ++k) bits.append(char(net::packInput(sentInputs[k].in)));
+            net->sendInput(inputSeq, bits, want);
+        }
 
         if (mySlot < int(cars.size())) {                                             // prediction
+            predictedPrev = predicted;
             simEngine.updateCar(predicted, in, mySlot);
             simEngine.predictCollisions(predicted);
+            static const bool bumpLive = !qEnvironmentVariableIsSet("CAR_RACING_NET_NOBUMP");
+            for (size_t i = 0; i < presentCars.size() && i < presVx.size(); ++i) {
+                if (int(i) == mySlot) continue;
+                sim::Car &o = presentCars[i];
+                o.x += presVx[i]; o.z += presVz[i];
+                o.s = simEngine.wrapS(o.s + presVs[i]); o.hint = int(o.s);
+                if (bumpLive) simEngine.predictBump(predicted, o);
+            }
         }
         for (sim::Traffic &t : simEngine.trafficMut()) {                             // traffic between snapshots
             t.s = simEngine.wrapS(t.s + t.speed);
@@ -312,6 +432,11 @@ void GLWidget::netUpdate(float realDt)
         for (int i = 0; i < int(cars.size()) && i < sim::MAX_RACERS; ++i) updateCarFx(i, cars[i]);
     }
     simEngine.clearEvents();               // prediction makes its own effects; the server's are used
+    for (const sim::SimEvent &e : netEvents)                 // (tests: clashes the server saw for my car)
+        if (e.carIndex == mySlot) {
+            if (e.type == sim::SimEvent::Crash) ++myCrashEvents;
+            if (e.type == sim::SimEvent::Damage && e.count >= 0 && e.count < sim::MAX_RACERS) ++myClashes;
+        }
     processSimEvents(netEvents);
     netEvents.clear();
     composeOnlineCars();
@@ -321,7 +446,24 @@ void GLWidget::composeOnlineCars()
 {
     auto &cars = simEngine.getCars();
     if (history.empty()) return;
-    const double renderT = double(netClock.elapsed()) + serverClockAhead - net::INTERP_DELAY_MS;
+    const qint64 nowMs = netClock.elapsed();
+    const float frameS = netLastCompose < 0 ? 0.016f : std::clamp(float(nowMs - netLastCompose) * 0.001f, 0.001f, 0.1f);
+    netLastCompose = nowMs;
+    // the buffer changes size slowly (more quickly when it must grow), so the cars don't visibly shift
+    netInterpMs += std::clamp(netInterpTarget - netInterpMs, -15.0 * double(frameS), 60.0 * double(frameS));
+    // The other cars' playback clock runs at real time, measured to the microsecond, and eases
+    // towards where it should be (at most 5% faster or slower) instead of jumping each time the
+    // estimate of the server's clock moves - a jump shows as all the other cars jerking at once.
+    const double nowExact = double(netClock.nsecsElapsed()) * 1e-6;
+    const double frameMs = netLastComposeNs < 0 ? 16.7 : std::clamp(nowExact - netLastComposeNs, 0.1, 100.0);
+    netLastComposeNs = nowExact;
+    const double targetT = nowExact + serverClockAhead - netInterpMs;
+    static const bool jumpyClock = qEnvironmentVariableIsSet("CAR_RACING_NET_JUMPYCLOCK");   // (test: the old clock)
+    if (jumpyClock || netRenderT < 0 || std::fabs(targetT - netRenderT) > 300.0) netRenderT = targetT;
+    else netRenderT += frameMs + std::clamp((targetT - netRenderT) * 0.05, -0.05 * frameMs, 0.05 * frameMs);
+    const double renderT = netRenderT;
+    ++statComposed;
+    if (renderT > history.back().t) ++statStarved;      // nothing newer to show
 
     // the two snapshots around renderT
     const Sample *a = &history.front(), *b = nullptr;
@@ -364,19 +506,128 @@ void GLWidget::composeOnlineCars()
             c.speed += (n.speed - c.speed) * f;
             c.wheelSpin = n.wheelSpin;
         }
+        else if (a == &history.back() && history.size() >= 2 && renderT > a->t) {
+            // Nothing newer yet (a late update): keep the car driving for up to 0.35 s. On the
+            // ground it follows its line on the road - the road's bends turn it, so it doesn't
+            // slide straight on into a wall - at the pace it had; in the air, straight on.
+            const Sample &p = history[history.size() - 2];
+            const float span = float(a->t - p.t);
+            if (span > 0.0f && i < int(p.cars.size()) && c.wreck == 0 && p.cars[i].path == c.path) {
+                const sim::Car &o = p.cars[i];
+                static const bool longGuess = qEnvironmentVariableIsSet("CAR_RACING_NET_LONGGUESS");   // (test: the old 0.35 s)
+                const float ahead = std::min(float(renderT - a->t), longGuess ? 350.0f : 100.0f);   // (short: a long guess snaps back)
+                const float k = ahead / span;
+                const float dx = c.x - o.x, dz = c.z - o.z;
+                const float dp = c.progress - o.progress;
+                if (dx * dx + dz * dz < 25.0f && dp > -1.0f && dp < 5.0f) {   // (not across a respawn)
+                    if (c.air > 0 || c.path == 1 || simEngine.sprint()) {
+                        c.x += dx * k;
+                        c.z += dz * k;
+                        c.y += (c.y - o.y) * k;
+                    } else {
+                        const float oldS = c.s;
+                        c.progress += dp * k;
+                        c.d += (c.d - o.d) * k * 0.5f;          // (drifting across: damped)
+                        c.lap = int(std::floor(c.progress / simEngine.lapLength()));
+                        c.s = c.progress - float(c.lap) * simEngine.lapLength();
+                        float x0, z0, x1, z1, x2, z2, x3, z3;
+                        simEngine.pointAt(c.s, c.d, x2, z2, 0);
+                        c.x = x2; c.z = z2;
+                        simEngine.pointAt(oldS, 0.0f, x0, z0, 0);
+                        simEngine.pointAt(simEngine.wrapS(oldS + 2.0f), 0.0f, x1, z1, 0);
+                        simEngine.pointAt(c.s, 0.0f, x3, z3, 0);
+                        simEngine.pointAt(simEngine.wrapS(c.s + 2.0f), 0.0f, x2, z2, 0);
+                        const float turn = std::atan2(x2 - x3, -(z2 - z3)) - std::atan2(x1 - x0, -(z1 - z0));
+                        c.heading += std::remainder(turn, 6.2831853f);   // (the road's bend turns the car)
+                        c.hint = int(c.s);
+                    }
+                }
+            }
+        }
+        // near my car: drawn where it is now (as my car bumps it), blending to the smooth delayed
+        // view further away - so a clash on screen is where the server has it
+        static const bool nearNow = !qEnvironmentVariableIsSet("CAR_RACING_NET_NOBUMP");
+        if (nearNow && i < int(presentCars.size()) && mySlot >= 0 && mySlot < int(presentCars.size()) && c.wreck == 0) {
+            const sim::Car &pc = presentCars[i];
+            const float dx = pc.x - predicted.x, dz = pc.z - predicted.z, dist = std::sqrt(dx * dx + dz * dz);
+            float want[4] = {pc.x - c.x, pc.z - c.z, pc.d - c.d, simEngine.aheadOf(c.s, pc.s)};
+            const bool ok = dist < 40.0f && want[0] * want[0] + want[1] * want[1] < 400.0f && pc.path == c.path;
+            const float w = ok ? std::clamp((40.0f - dist) / 20.0f, 0.0f, 1.0f) : 0.0f;
+            // the offset glides to where it should be over about 0.06 s (each snapshot moves the
+            // "now" a little; jumping there would jerk the car)
+            float *off = nearOff[std::min(i, 7)];
+            const float g = 1.0f - std::exp(-frameS / 0.06f);
+            for (int k = 0; k < 4; ++k) off[k] += (want[k] * w - off[k]) * g;
+            c.x += off[0]; c.z += off[1]; c.d += off[2];
+            c.s = simEngine.wrapS(c.s + off[3]); c.hint = int(c.s);
+        }
         cars[i] = c;
     }
     if (mySlot >= 0 && mySlot < int(cars.size())) {
         sim::Car me = predicted;
+        // drawn between its last two steps by the time since the last one: a frame with no step
+        // (or two) no longer jerks it - the screen draws at 60-144 fps, the race runs 60 steps
+        static const bool stepped = qEnvironmentVariableIsSet("CAR_RACING_NET_STEPPED");   // (test: drawn on the steps)
+        if (!stepped && predictedPrev.path == predicted.path) {
+            const float f = std::clamp(simAccumulator * 60.0f, 0.0f, 1.0f);
+            const float dx = predicted.x - predictedPrev.x, dz = predicted.z - predictedPrev.z;
+            if (dx * dx + dz * dz < 25.0f) {             // (not across a respawn)
+                me.x = predictedPrev.x + dx * f;
+                me.z = predictedPrev.z + dz * f;
+                me.y = predictedPrev.y + (predicted.y - predictedPrev.y) * f;
+                me.heading = lerpAngle(predictedPrev.heading, predicted.heading, f);
+            }
+        }
         me.x += corrX;
         me.z += corrZ;
-        corrX *= 0.85f;
-        corrZ *= 0.85f;
+        // the correction fades by time, not by frames; a big one takes a little longer, so it glides
+        const float big = std::min(1.0f, std::sqrt(corrX * corrX + corrZ * corrZ) / 4.0f);
+        const float fade = std::exp(-frameS / (0.09f + 0.13f * big));
+        corrX *= fade;
+        corrZ *= fade;
         const sim::Car &srv = history.back().cars[mySlot];   // facts only the server knows
         me.finished = srv.finished;
         me.finishTime = srv.finishTime;
         me.r = srv.r; me.g = srv.g; me.b = srv.b;
         cars[mySlot] = me;
+    }
+    // the shake meter: how much each car's step from one frame to the next changes (a car
+    // moving smoothly has nearly the same step every frame; a jerk shows as a big change)
+    // (by speed: distance over the frame's own time, so uneven frame times don't count as a jerk)
+    static QElapsedTimer shakeClock;
+    static qint64 shakeLastNs = -1;
+    if (!shakeClock.isValid()) shakeClock.start();
+    const qint64 ns = shakeClock.nsecsElapsed();
+    const float fdt = shakeLastNs < 0 ? 0.016f : std::max(0.002f, float(ns - shakeLastNs) * 1e-9f);
+    shakeLastNs = ns;
+    if (!netTest.isEmpty() && simEngine.getState() == State::Racing) {
+        ++shakeFrames;
+        shakeCam += view1.shake;                         // (the camera's own crash shake, 0..1)
+        if (mySlot >= 0 && mySlot < int(cars.size()))    // (my car drawn inside another: a clash that didn't happen on screen)
+            for (int i = 0; i < int(cars.size()); ++i) {
+                const sim::Car &m = cars[mySlot], &o = cars[i];
+                if (i == mySlot || o.wreck > 0 || m.path != o.path) continue;
+                if (std::fabs(m.d - o.d) < 1.5f && std::fabs(simEngine.aheadOf(o.s, m.s)) < 3.5f) { ++statOverlap; break; }
+            }
+        {
+            const double camStep = std::remainder(double(view1.camHeading) - shakeLastCamH, 6.2831853) / fdt;   // (rad/s)
+            shakeCamTurn += std::min(10.0, std::fabs(camStep - shakeLastCamStep));
+            shakeLastCamStep = camStep; shakeLastCamH = view1.camHeading;
+        }
+        for (int i = 0; i < int(cars.size()) && i < 8; ++i) {
+            const float x = cars[i].x, z = cars[i].z;
+            if (shakeHave[i]) {
+                const float sx = (x - shakeLast[i][0]) / fdt, sz = (z - shakeLast[i][1]) / fdt;   // (m/s)
+                const float jx = sx - shakeStep[i][0], jz = sz - shakeStep[i][1];
+                const double j = std::sqrt(double(jx * jx + jz * jz)) * 0.01;   // (x100 below: m/s)
+                if (j < 0.6) {                           // (not a respawn)
+                    if (i == mySlot) { shakeMe += j; shakeMax = std::max(shakeMax, j); }
+                    else shakeOthers += j;
+                }
+                shakeStep[i][0] = sx; shakeStep[i][1] = sz;
+            }
+            shakeLast[i][0] = x; shakeLast[i][1] = z; shakeHave[i] = true;
+        }
     }
 }
 
@@ -395,8 +646,8 @@ bool GLWidget::handleOnlineKey(QKeyEvent *event)
         else if (k == Qt::Key_Down || k == Qt::Key_S) netChoice = (netChoice + 1) % 4;
         else if (k == Qt::Key_Escape)                 netScreen = NetScreen::Off;
         else if (enter || k == Qt::Key_Space) {
-            if (netChoice == 0)      netHost();
-            else if (netChoice == 1) netHostInternet();
+            if (netChoice == 0)      netHostInternet();
+            else if (netChoice == 1) netHost();
             else if (netChoice == 2) { netScreen = NetScreen::EnterCode; joinText.clear(); netMessage.clear(); }
             else                     netScreen = NetScreen::Off;
         }
@@ -462,7 +713,6 @@ bool GLWidget::handleOnlineKey(QKeyEvent *event)
             netLeave("YOU LEFT THE RACE");
             return true;
         }
-        if (k == Qt::Key_C) { view1.camMode = (view1.camMode + 1) % 3; return true; }
         if (k == Qt::Key_R || k == Qt::Key_P) return true;   // no restart / pause online
         return false;                                         // driving keys
     }
@@ -517,9 +767,10 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         centered(QString("UP TO %1 RACERS - ONE HOSTS, EVERYONE ELSE JOINS WITH THE ROOM CODE").arg(sim::MAX_RACERS),
                  y, ps * 0.75f, 0.70f, 0.78f, 0.92f);
         y -= 40.0f * dpr;
-        static const char *OPTS[4] = {"HOST A RACE ON THIS PC", "HOST ON THE INTERNET SERVER", "JOIN WITH A CODE", "BACK"};
-        static const char *SUB[4] = {"FRIENDS ON THE SAME WI-FI JOIN WITH YOUR CODE", "ANYONE, ANYWHERE JOINS WITH YOUR CODE",
-                                     "TYPE THE CODE YOUR FRIEND GOT (WI-FI FIRST, THEN THE INTERNET)", "MAIN MENU"};
+        static const char *OPTS[4] = {"HOST AN ONLINE RACE", "HOST ON THIS WI-FI ONLY", "JOIN WITH A CODE", "BACK"};
+        static const char *SUB[4] = {"FRIENDS ANYWHERE JOIN WITH YOUR CODE - ANY WI-FI OR MOBILE DATA",
+                                     "ONLY FOR FRIENDS ON THE SAME WI-FI AS THIS PC",
+                                     "TYPE THE CODE YOUR FRIEND GOT - WORKS FROM ANYWHERE", "MAIN MENU"};
         const float bw = pw * 0.62f, bh = 54.0f * dpr, bx = (W - bw) * 0.5f;
         for (int i = 0; i < 4; ++i) {
             float by1 = y, by0 = y - bh;
@@ -559,7 +810,7 @@ void GLWidget::drawOnlineScreen(int W, int H, float dpr)
         y -= bh + 26.0f * dpr;
         centered("4 LETTERS, FOR EXAMPLE K7Q2", y, ps * 0.7f, 0.65f, 0.72f, 0.85f);
         y -= 18.0f * dpr;
-        centered("NOT ON THIS WI-FI? THE INTERNET SERVER IS ASKED NEXT - OR TYPE CODE@ADDRESS", y, ps * 0.62f, 0.55f, 0.62f, 0.78f);
+        centered("YOUR FRIEND CAN BE ANYWHERE - SAME WI-FI OR NOT", y, ps * 0.62f, 0.55f, 0.62f, 0.78f);
         if (!netMessage.isEmpty()) message(y - 30.0f * dpr, ps * 0.8f, 1.0f, 0.55f, 0.35f);
         centered("[ENTER] JOIN   [BACKSPACE] DELETE   [ESC] BACK", y0 + pad, ps * 0.7f, 0.70f, 0.78f, 0.90f);
         break;
@@ -773,9 +1024,20 @@ void GLWidget::runNetAutoShot()
             stats.write(QString("snapshots %1, corrections >0.5 m: %2, large (>6 m, smoothed): %3, ping %4 ms, jumps landed %5\n")
                             .arg(statSnapshots).arg(statSmallFix).arg(statSnaps).arg(net ? net->pingMs : -1)
                             .arg(statLandings).toUtf8());
+            stats.write(QString("camera: crash shake %1 on average, turn jerk %2 rad/s per frame; server saw %3 clashes with cars, %4 crash events for my car\n")
+                            .arg(shakeCam / std::max(1, shakeFrames), 0, 'f', 3).arg(shakeCamTurn / std::max(1, shakeFrames), 0, 'f', 3)
+                            .arg(myClashes).arg(myCrashEvents).toUtf8());
+            stats.write(QString("my car drawn inside another car: %1 frames\n").arg(statOverlap).toUtf8());
+            stats.write(QString("shake (speed change per frame, m/s): my car %1 (worst %2), other cars %3\n")
+                            .arg(100.0 * shakeMe / std::max(1, shakeFrames), 0, 'f', 2).arg(100.0 * shakeMax, 0, 'f', 1)
+                            .arg(100.0 * shakeOthers / std::max(1, shakeFrames * std::max(1, int(simEngine.getCars().size()) - 1)), 0, 'f', 2).toUtf8());
+            stats.write(QString("average correction per snapshot %1 cm\n").arg(100.0 * statErrSum / std::max(1, statSnapshots), 0, 'f', 2).toUtf8());
             stats.write(QString("frames %1, slower than 25 ms: %2, drawing avg %3 ms max %4 ms\n")
                             .arg(statFrames).arg(statSlowFrames).arg(statPaintMs / std::max(1, statFrames), 0, 'f', 2)
                             .arg(statPaintMax, 0, 'f', 1).toUtf8());
+            stats.write(QString("frames with nothing newer to show: %1 of %2, stalls %3, late %4, jitter %5 ms, buffer %6 ms\n")
+                            .arg(statStarved).arg(statComposed).arg(statStalls).arg(statLate)
+                            .arg(netJitter, 0, 'f', 0).arg(netInterpMs, 0, 'f', 0).toUtf8());
             stats.write(QString("snapshot gaps: longest %1 ms, over 50 ms: %2, average size %3 bytes\n")
                             .arg(statSnapGapMax, 0, 'f', 0).arg(statSnapLate)
                             .arg(statSnapBytes / std::max(1, statSnapshots), 0, 'f', 0).toUtf8());

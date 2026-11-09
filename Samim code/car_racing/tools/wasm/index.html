@@ -80,12 +80,74 @@
           && !(e.target instanceof HTMLInputElement)) e.preventDefault();
     }, { passive: false });
 
+    // ---- If the game's code ever stops with an error, say so instead of a frozen picture ----
+    function stoppedNotice(reason) {
+      console.error('[game stopped]', reason);
+      saveFiles();
+      if (document.querySelector('#stopped')) return;
+      const box = document.createElement('div');
+      box.id = 'stopped';
+      box.textContent = 'The game stopped because of an error. Your saves are safe: press F5 to reload.';
+      box.style.cssText = 'position:fixed;left:0;right:0;top:0;padding:14px;text-align:center;'
+                        + 'background:#7a1020;color:#fff;font:16px sans-serif;z-index:10';
+      document.body.appendChild(box);
+    }
+    addEventListener('error', (e) => stoppedNotice(e.message));
+    addEventListener('unhandledrejection', (e) => stoppedNotice(e.reason));
+    addEventListener('webglcontextlost', (e) => stoppedNotice('the graphics were lost'), true);
+
+    // ---- The game says it is alive every frame: 8 s of silence in a visible tab gets the same notice ----
+    let lastHidden = 0;
+    setInterval(() => {
+      const now = performance.now();
+      if (document.hidden) { lastHidden = now; return; }
+      if (window.tppBeat && now - window.tppBeat > 8000 && now - lastHidden > 8000) stoppedNotice('no frames for 8 seconds');
+    }, 1000);
+
+    // ---- The keys always reach the game: wherever the page's focus went, they are passed on ----
+    function gameWindow() {
+      const host = document.querySelector('#screen > div');
+      return host && host.shadowRoot ? host.shadowRoot.querySelector('.qt-window') : null;
+    }
+    function gameFocus() {
+      const win = gameWindow();
+      const helper = win && win.querySelector('.qt-window-focus-helper');
+      if (helper) helper.focus();
+    }
+    function passKey(e) {
+      const win = gameWindow();
+      if (!win || e.composedPath().includes(win) || e.target instanceof HTMLInputElement) return;
+      gameFocus();
+      const helper = win.querySelector('.qt-window-focus-helper');
+      if (!helper) return;
+      helper.dispatchEvent(new KeyboardEvent(e.type, {
+        key: e.key, code: e.code, keyCode: e.keyCode, which: e.which, location: e.location, repeat: e.repeat,
+        ctrlKey: e.ctrlKey, shiftKey: e.shiftKey, altKey: e.altKey, metaKey: e.metaKey,
+        bubbles: true, composed: true, cancelable: true,
+      }));
+      e.preventDefault();
+    }
+    addEventListener('keydown', passKey, true);
+    addEventListener('keyup', passKey, true);
+    addEventListener('focus', gameFocus);
+
     async function start() {
       const loading = document.querySelector('#loading');
       const screen = document.querySelector('#screen');
       const status = document.querySelector('#status');
+      // phones and tablets: no keyboard, and the download would be wasted
+      if (matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches
+          && !location.search.includes('anydevice')) {
+        document.querySelector('#bar').style.display = 'none';
+        status.textContent = 'This game is only for desktop or laptop - the phone version is unavailable now.';
+        for (const p of document.querySelectorAll('#loading p')) if (p !== status) p.style.display = 'none';
+        return;
+      }
       try {
         await qtLoad({
+          // the game's files sit in a folder named after this build (deploy_site.sh), kept by the
+          // browser for good: a second visit loads them from the computer, not the internet
+          locateFile: (path) => 'v/__BUILD__/' + path,
           qt: {
             onLoaded: () => { loading.style.display = 'none'; screen.style.display = 'block'; },
             onExit: (exit) => {
@@ -111,7 +173,7 @@
     }
     addEventListener('load', start);
   </script>
-  <script src="car_racing.js"></script>
-  <script src="qtloader.js"></script>
+  <script src="v/__BUILD__/car_racing.js"></script>
+  <script src="v/__BUILD__/qtloader.js"></script>
 </body>
 </html>

@@ -73,7 +73,7 @@ int main(int argc, char *argv[])
             b->racing = true;
         });
         QObject::connect(&b->client, &RaceClient::raceOver, [b]() { b->racing = false; });
-        QObject::connect(&b->client, &RaceClient::snapshotArrived, [b](quint32, const QByteArray &body) {
+        QObject::connect(&b->client, &RaceClient::snapshotArrived, [b](quint32, int, const QByteArray &body) {
             QDataStream in(body);
             net::prepare(in);
             std::vector<sim::SimEvent> evs;
@@ -141,7 +141,7 @@ int main(int argc, char *argv[])
         const qint64 due = inputClock.elapsed() * 60 / 1000;
         for (; inputsDue < due; ++inputsDue)
             for (auto &b : bots)
-                if (b->racing) b->client.sendInput(++b->seq, b->input);
+                if (b->racing) b->client.sendInput(++b->seq, QByteArray(1, char(net::packInput(b->input))), 2);
     });
     inputTimer.setTimerType(Qt::PreciseTimer);
     inputTimer.start(16);

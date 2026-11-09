@@ -21,6 +21,8 @@ const MapDef MAPS[NUM_MAPS] = {
     {"NEON CITY",       "NIGHT STREETS - SQUARE CORNERS - TRAFFIC", MapTheme::City, 22, 95.0f, 125.0f, 3},
     {"COASTAL HIGHWAY", "FLAT-OUT OCEAN ROAD LINED WITH PALMS", MapTheme::Coast, 14, 100.0f, 140.0f, 1},
     {"RIVER SERPENT",   "HAIRPINS, A SPIRAL, BRIDGES OVER THE RIVER", MapTheme::Countryside, 12, 100.0f, 140.0f, 3},
+    {"DESERT ZIGZAG",   "NINE STACKED HAIRPINS UP A DESERT RIDGE", MapTheme::Desert, 10, 105.0f, 145.0f, 3},
+    {"GHAT ROAD",       "JUNGLE HAIRPINS AND A CLIFF SPIRAL IN THE MIST", MapTheme::Jungle, 14, 100.0f, 140.0f, 3},
 };
 
 GameSim::GameSim(uint32_t seed)
@@ -326,7 +328,7 @@ bool GameSim::overWater(const Car &c) const
 {
     if (c.x > seaX - 30.0f) return true;
     const MapTheme t = MAPS[mapIndex].theme;
-    if (t != MapTheme::Countryside && t != MapTheme::Coast) return false;
+    if (t != MapTheme::Countryside && t != MapTheme::Coast && t != MapTheme::Jungle) return false;
     const int i = std::clamp(int(wrapS(c.outS)), 0, int(lapLen) - 1);
     return track.slices()[size_t(i)].flags & TF_BRIDGE;
 }
@@ -334,7 +336,7 @@ bool GameSim::overWater(const Car &c) const
 bool GameSim::overGorge(float s) const
 {
     const MapTheme t = MAPS[mapIndex].theme;
-    if (t == MapTheme::Countryside || t == MapTheme::Coast) return false;
+    if (t == MapTheme::Countryside || t == MapTheme::Coast || t == MapTheme::Jungle) return false;
     return track.slices()[size_t(std::clamp(int(wrapS(s)), 0, int(lapLen) - 1))].flags & TF_BRIDGE;
 }
 
@@ -388,8 +390,8 @@ void GameSim::placeSideRamps(uint32_t seed)
         }
         for (const SideRamp &o : sideList) if (std::fabs(aheadOf(o.s, s)) < 80.0f) return false;
         // the road may bend after it - that is the driver's job in the air - but not more
-        // than 0.7 rad over the first 120 m (no flying straight off into a hairpin)
-        for (float k = 10.0f; k <= 120.0f; k += 10.0f)
+        // than 0.7 rad over the first 170 m (no flying straight off into a hairpin)
+        for (float k = 10.0f; k <= 170.0f; k += 10.0f)
             if (std::fabs(wrapAngle(headingAt(s + k) - headingAt(s))) > 0.7f) return false;
         for (const NitroPickup &n : nitroPickups) { const float a = aheadOf(s, n.s); if (a > -run - 30.0f && a < 30.0f) return false; }
         return true;
@@ -855,7 +857,10 @@ void GameSim::reset(uint32_t seed, int racers)
             for (int l = 0; l < 3; ++l) if (l != open1) addBarrier(d, laneX(l));
             for (int l = 0; l < 3; ++l) if (l != open2) addBarrier(d + 38.0f, laneX(l));
         } else if (pattern == 2) { // barrels
-            for (int i = 0; i < 3; ++i) addRound(Obstacle::Barrel, d + R(0, 18), R(-5.5f, 5.5f));
+            for (int i = 0; i < 3; ++i) {               // (one draw at a time: in a call the compilers order them differently)
+                const float off = R(-5.5f, 5.5f), along = R(0, 18);
+                addRound(Obstacle::Barrel, d + along, off);
+            }
         } else { // cone wall with one gap
             int gap = int(R(0, 3)) % 3;
             for (float x = -6.0f; x <= 6.01f; x += 1.5f)
@@ -864,6 +869,46 @@ void GameSim::reset(uint32_t seed, int racers)
     }
     }
     fromLap = 0;
+    std::mt19937 rx(uint32_t(seed) ^ 0x5DEECE66u);
+    auto Rx = [&](float a, float b) { return a + (b - a) * float(rx() % 100000u) / 100000.0f; };
+    // The death traps: a mine in one lane under a red skull you can see from far away. 0 health at
+    // once - drive around it or jump over it. A few on each map, one more in the last third;
+    // never soon after the start or a bend, or near anything else.
+    {
+        auto addMine = [&](float from) {
+            for (float t = from; t < from + 400.0f && t < sEnd - 300.0f; t += 15.0f) {
+                if (keepClear(t, 10.0f, 220.0f) || std::fabs(wrapAngle(headingAt(t) - headingAt(t - 90.0f))) > 0.55f) continue;
+                addRound(Obstacle::Mine, t, laneX(int(rx() % uint32_t(lanes))));
+                obstacles.back().rot = -headingAt(obstacles.back().s) * roadRot;
+                return;
+            }
+        };
+        const int mines = std::clamp(int((sEnd - s0) / 1500.0f) + 2, 2, 4);
+        for (int i = 0; i < mines; ++i)
+            addMine(s0 + 400.0f + (sEnd - s0 - 800.0f) * (float(i) + 0.3f) / float(mines) + Rx(0.0f, 80.0f));
+        if (sEnd - third > 500.0f) addMine(third + Rx(80.0f, sEnd - third - 400.0f));
+    }
+    // Stones and more road blocks, on every map: always a lane open, clear of the ramps, the fork
+    // and the merge (keepClear), closer together in the last third. A pack of cars or a sprint:
+    // one lane closed at most, like its other obstacles.
+    int extraBlocks = 0;
+    for (float d = s0 + 260.0f; d < sEnd - 220.0f; d += Rx(150.0f, 230.0f) * closer(d)) {
+        if (!slideClear(d, 30.0f, 180.0f)) continue;
+        const int open = int(rx() % uint32_t(lanes));
+        const bool rocks = (extraBlocks++ % 5) < 3;          // (three of five: every map gets its stones)
+        for (int l = 0; l < lanes; ++l) {
+            if (l == open || (small && l != (open + 1) % lanes)) continue;
+            if (rocks) {                                 // a rockfall: a few stones across the lane
+                for (int i = 0; i < 2; ++i) {           // (one draw at a time, as above)
+                    const float off = Rx(-1.2f, 1.2f), along = Rx(0.0f, 5.0f);
+                    addRound(Obstacle::Stone, d + float(i) * 9.0f + along, laneX(l) + off);
+                }
+            } else {                                     // a road block, with cones as the warning
+                addRound(Obstacle::Cone, d, laneX(l));
+                addBarrier(d + 12.0f, laneX(l), Obstacle::Concrete);
+            }
+        }
+    }
     leadLap = 0;
     obsList.assign(cars.size(), RaceObs());
     rolesSet = false;
@@ -1037,6 +1082,31 @@ void GameSim::reset(uint32_t seed, int racers)
         addLamps(60.0f, false);
         break;
     }
+    case MapTheme::Jungle:
+        // thick rainforest right up to the road: broad trees, coconut palms, mossy rocks, the odd
+        // roadside house; tall trees behind
+        for (float d = 20.0f; d < L; d += R(8.0f, 13.0f)) {
+            for (int s = 0; s < 2; ++s) {
+                float side = (s == 0) ? -1.0f : 1.0f;
+                float r = R(0, 1);
+                if (r < 0.05f && d < L - 220.0f) {
+                    const float off = R(9, 13), scale = R(0.8f, 1.0f);
+                    addProp(Prop::House, d, side, off, scale, int(R(0, 4)) % 4, (side < 0) ? 90.0f : -90.0f, 8.0f, true);
+                } else if (r < 0.55f) {
+                    const float dd = d + R(-3, 3), off = R(2.5f, 16), scale = R(1.0f, 1.6f);
+                    addProp(Prop::RoundTree, dd, side, off, scale, 0, R(0, 360), 3.0f);
+                } else if (r < 0.82f) {
+                    const float dd = d + R(-3, 3), off = R(2.5f, 18), scale = R(0.9f, 1.4f);
+                    addProp(Prop::Palm, dd, side, off, scale, 0, R(0, 360), 2.0f);
+                } else if (r < 0.92f) {
+                    const float dd = d + R(-3, 3), off = R(3, 14), scale = R(0.6f, 1.3f);
+                    addProp(Prop::Rock, dd, side, off, scale, 3, R(0, 360), 2.0f * scale);
+                }
+                const float dd = d + R(-5, 5), off = R(20, 60), scale = R(1.4f, 2.2f);
+                addProp(R(0, 1) < 0.7f ? Prop::RoundTree : Prop::Pine, dd, side, off, scale, 0, R(0, 360), 4.0f);
+            }
+        }
+        break;
     }
 
     // Torches lining the run to the start/finish line (a sprint: to the start line)
@@ -1570,8 +1640,10 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
     const float dir = c.speed >= 0.0f ? 1.0f : -1.0f;
     const float bank = bankAt(c.s, c.path) * (along >= 0.0f ? 1.0f : -1.0f);   // + = the car's right side is lower
     const float bankGrip = steer * dir * bank > 0.0f ? 1.0f + 1.5f * std::fabs(bank) : 1.0f;
-    // in the air a third of normal steering lines the car up for the landing
-    c.heading  += steer * 0.030f * grip * dir * (flying ? 0.33f : bankGrip) * (dirt ? 0.9f : 1.0f);
+    // in the air about half of normal steering lines the car up for the landing
+    // (a tap makes a small correction: full lock comes after a few ticks of holding the key)
+    const float held = steer * c.steerVis > 0.0f ? std::min(1.0f, std::fabs(c.steerVis) / 0.45f) : 0.0f;
+    c.heading  += steer * STEER_RATE * (STEER_TAP + (1.0f - STEER_TAP) * held) * grip * dir * (flying ? 0.55f : bankGrip) * (dirt ? 0.9f : 1.0f);
     if (flying) {
         // a flat spin keeps turning the car until steered out of; a twisted ramp's roll goes
         // on at its rate, the brake slowing it (never backwards)
@@ -1622,8 +1694,9 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
     c.pitch += (targetPitch - c.pitch) * 0.20f;
 
     float moveAngle = c.heading + c.driftAngle * 0.45f;
-    c.x += std::sin(moveAngle) * c.speed;
-    c.z -= std::cos(moveAngle) * c.speed;
+    const float carry = flying ? JUMP_CARRY : 1.0f;      // (a jump covers more road)
+    c.x += std::sin(moveAngle) * c.speed * carry;
+    c.z -= std::cos(moveAngle) * c.speed * carry;
 
     c.topSpeed = std::max(c.topSpeed, c.speed);
     c.wheelSpin = std::fmod(c.wheelSpin + c.speed * 136.0f, 360.0f);
@@ -1770,13 +1843,13 @@ void GameSim::fly(Car &c, float along, int carIndex)
     const float rollErr = std::fabs(wrapAngle(c.barrel));
     const bool sideJump = c.jumpDanger > 0.0f, rolled = c.barrelRate != 0.0f, spun = std::fabs(c.spinRate) > 0.0005f;
     const float rollBad = std::clamp((rollErr - 0.30f) / 1.3f, 0.0f, 1.0f);
-    float lose = impact > 16.0f ? 0.15f : impact > 12.0f ? 0.05f : 0.0f;
-    float hurt = impact > 16.0f ? 10.0f : impact > 12.0f ? 4.0f : 0.0f;
+    float lose = impact > 19.0f ? 0.15f : impact > 14.0f ? 0.05f : 0.0f;      // (limits raised with the longer jumps)
+    float hurt = impact > 19.0f ? 10.0f : impact > 14.0f ? 4.0f : 0.0f;
     if (sideJump) {
         // (a side ramp throws the car high: coming down from there is expected, only a very
         // hard landing - full nitro off a high ramp - costs extra)
-        lose = impact > 20.0f ? 0.1f : 0.0f;
-        hurt = 1.0f + 0.5f * std::max(0.0f, impact - 20.0f) + 15.0f * std::clamp((off - 0.10f) / 0.45f, 0.0f, 1.0f)
+        lose = impact > 23.0f ? 0.1f : 0.0f;
+        hurt = 1.0f + 0.5f * std::max(0.0f, impact - 23.0f) + 15.0f * std::clamp((off - 0.10f) / 0.45f, 0.0f, 1.0f)
              + 25.0f * rollBad + (std::fabs(c.d) > roadHalfAt(c.s, c.path) ? 4.0f : 0.0f);
         hurt *= c.jumpDanger;
         lose += 0.3f * rollBad;
@@ -1840,7 +1913,7 @@ int GameSim::airTimeLeft(const Car &c) const
 {
     float y = c.y, vy = c.vy, sAt = c.s;
     int t = 0;
-    do { y += vy; vy -= GRAVITY; sAt += c.speed; ++t; } while (t < 400 && y > surfaceAt(sAt, c.d, c.path));
+    do { y += vy; vy -= GRAVITY; sAt += c.speed * JUMP_CARRY; ++t; } while (t < 400 && y > surfaceAt(sAt, c.d, c.path));
     return t;
 }
 
@@ -1907,7 +1980,31 @@ void GameSim::updateAI(Car &c, int carIndex)
     updateCar(c, in, carIndex);
 }
 
+// A CPU sees a death trap in its lane and steers out of the way in good time - only about one
+// time in twelve does it miss it (a hash of the mine, the car and the lap: the same on every computer).
 PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
+{
+    PlayerInput in = computeAIDrive(c, carIndex, asRival);
+    if (c.wreck > 0 || c.air > 0 || c.path != 0) return in;
+    const float reach = 25.0f + std::fabs(c.speed) * 75.0f;
+    for (const Obstacle &o : obstacles) {
+        if (o.type != Obstacle::Mine || o.knocked || !present(o.fromLap)) continue;
+        const float ahead = aheadOf(o.s, c.s);
+        if (ahead < 0.0f || ahead > reach || std::fabs(c.d - o.d) > 3.4f) continue;
+        const uint32_t h = (uint32_t(o.s) * 2654435761u) ^ (uint32_t(carIndex + 1) * 2246822519u) ^ (uint32_t(c.lap + 1) * 3266489917u);
+        if ((h >> 8) % 12u == 0u) continue;
+        const float edge = roadHalfAt(c.s, 0) - 1.6f;
+        const float away = c.d >= o.d ? (c.d + 1.0f < edge ? 1.0f : -1.0f) : (c.d - 1.0f > -edge ? -1.0f : 1.0f);
+        const float off = wrapAngle(c.heading - headingAt(c.s, 0));
+        in.left = in.right = false;
+        if (std::fabs(off) > 0.16f) (off > 0.0f ? in.left : in.right) = true;   // (not sideways: back along the road)
+        else (away > 0.0f ? in.right : in.left) = true;
+        break;
+    }
+    return in;
+}
+
+PlayerInput GameSim::computeAIDrive(Car &c, int carIndex, bool asRival)
 {
     PlayerInput in;
     if (c.wreck > 0) {                                   // wrecked: wait to be back in the race
@@ -2006,7 +2103,7 @@ PlayerInput GameSim::computeAIInput(Car &c, int carIndex, bool asRival)
     for (const Obstacle &o : obstacles) {
         if (o.knocked || !present(o.fromLap) || (c.path != 0 && !nearMerge)) continue;
         float off = o.d, dist = distTo(o.s);
-        float r = o.block() ? o.hx : (o.type == Obstacle::Cone ? 0.45f : 0.7f);
+        float r = o.block() ? o.hx : o.type == Obstacle::Cone ? 0.45f : o.type == Obstacle::Mine ? 1.5f : o.type == Obstacle::Stone ? 0.9f : 0.7f;
         addHazard(dist, off - r - CAR_HALF, off + r + CAR_HALF, o.type == Obstacle::Cone);
     }
     // Traffic and racers alongside us (overlapping lengthwise) go into `beside`: they limit
@@ -2417,6 +2514,10 @@ bool GameSim::knock(Obstacle &o, float x, float z, float fx, float fz, float spe
     deb.x = o.x; deb.y = heightAt(o.s, o.d) + (o.type == Obstacle::Cone ? 0.4f : 0.6f); deb.z = o.z;
     if (o.type == Obstacle::Cone) {
         deb.r = 0.95f; deb.g = 0.45f; deb.b = 0.05f; deb.count = 6;
+    } else if (o.type == Obstacle::Stone) {
+        deb.r = 0.45f; deb.g = 0.43f; deb.b = 0.40f; deb.count = 8;
+    } else if (o.type == Obstacle::Mine) {
+        deb.r = 1.0f; deb.g = 0.45f; deb.b = 0.05f; deb.count = 24;
     } else {
         deb.r = 0.85f; deb.g = 0.1f; deb.b = 0.1f; deb.count = 8;
     }
@@ -2515,8 +2616,27 @@ void GameSim::collideWorld(Car &c, int carIndex)
                 cr.carIndex = carIndex;
                 events.push_back(cr);
             }
+        } else if ((o.type == Obstacle::Mine || o.type == Obstacle::Stone) && c.air > 0
+                   && c.y > heightAt(o.s, o.d) + 1.0f) {
+            continue;                                    // (jumped over it)
+        } else if (o.type == Obstacle::Mine) {
+            if (c.wreck == 0 && c.ghost == 0 && knock(o, c.x, c.z, fx, fz, c.speed, carIndex)) {
+                // the whole of its health (damage() scales it: the sum is worked out backwards), and the driver is thrown out
+                damage(c, carIndex, (c.health + 1.0f) / (DAMAGE_SCALE * positionDamage(carIndex)), SimEvent::ByObject, true, 1.0f);
+                SimEvent spk;
+                spk.type = SimEvent::Sparks;
+                spk.x = c.x; spk.y = c.y + 0.5f; spk.z = c.z;
+                spk.count = 24;
+                spk.carIndex = carIndex;
+                events.push_back(spk);
+            }
         } else if (knock(o, c.x, c.z, fx, fz, c.speed, carIndex)) {
             const float v0 = std::fabs(c.speed);
+            if (o.type == Obstacle::Stone) {             // a heavy rock: it costs health and a lot of speed
+                damage(c, carIndex, 11.0f * OBSTACLE_DAMAGE * v0, SimEvent::ByObject, true, v0);
+                c.speed *= 0.5f;
+                continue;
+            }
             const float hit = o.type == Obstacle::Cone ? 1.5f : o.type == Obstacle::Tyres ? 7.0f : 9.0f;
             damage(c, carIndex, hit * OBSTACLE_DAMAGE * v0, SimEvent::ByObject, true, v0);
             c.speed *= (o.type == Obstacle::Cone) ? 0.85f : (o.type == Obstacle::Tyres) ? 0.65f : 0.55f;
@@ -2585,6 +2705,30 @@ void GameSim::predictCollisions(Car &c) const
     }
     if (c.path == 0)
         for (const Traffic &t : traffic) hitTraffic(c, t);
+}
+
+bool GameSim::predictBump(Car &a, const Car &b) const
+{
+    if (a.wreck > 0 || b.wreck > 0 || a.ghost > 0 || b.ghost > 0) return false;
+    if (std::fabs(a.y - b.y) > 1.4f) return false;
+    if (a.path != b.path) {
+        const float dx = b.x - a.x, dz = b.z - a.z, d2 = dx * dx + dz * dz;
+        if (d2 >= 2.4f * 2.4f || d2 < 1e-6f) return false;
+        const float d = std::sqrt(d2), push = (2.4f - d) * 0.5f;
+        a.x -= dx / d * push; a.z -= dz / d * push;
+        locate(a);
+        return true;
+    }
+    const float lx = a.d - b.d, lz = aheadOf(b.s, a.s);
+    if (std::fabs(lx) >= 1.9f || std::fabs(lz) >= 4.2f) return false;
+    const float px = 1.9f - std::fabs(lx), pz = 4.2f - std::fabs(lz);
+    if (px < pz) {
+        moveOnTrack(a, 0.0f, ((lx > 0) ? 1.0f : -1.0f) * px * 0.5f);
+    } else {
+        moveOnTrack(a, ((lz > 0) ? 1.0f : -1.0f) * pz * 0.5f, 0.0f);
+        a.speed = (a.speed + b.speed) * 0.5f * 0.95f;
+    }
+    return true;
 }
 
 // Two racers: a box each, across = d, along = s (so it works whichever way the road runs).
@@ -2839,6 +2983,23 @@ void GameSim::wreckStep(Car &c, int idx)
         ev.x = c.x; ev.y = c.y; ev.z = c.z;
         events.push_back(ev);
     }
+}
+
+std::string GameSim::worldParts() const
+{
+    auto q = [](float v) { return long(std::lround(v * 10.0f)); };
+    struct H { uint32_t h = 2166136261u; void mix(long v) { h = (h ^ uint32_t(v)) * 16777619u; } };
+    H heights, obst, nitro, traf, side, lapsFrom;
+    for (size_t i = 0; i < track.slices().size(); i += 5) heights.mix(q(heightAt(float(i), 0.0f)));
+    for (const Obstacle &o : obstacles) { obst.mix(o.type); obst.mix(q(o.x)); obst.mix(q(o.z)); obst.mix(q(o.hx)); lapsFrom.mix(o.fromLap); }
+    for (const NitroPickup &n : nitroPickups) { nitro.mix(q(n.x)); nitro.mix(q(n.z)); }
+    for (const Traffic &t : traffic) { traf.mix(q(t.s)); traf.mix(q(t.lane)); traf.mix(t.truck ? 1 : 0); }
+    for (const SideRamp &r : sideList) { side.mix(q(r.s)); side.mix(q(r.d)); side.mix(q(r.height)); side.mix(long(r.twist)); side.mix(r.fromLap); }
+    char buf[400];
+    std::snprintf(buf, sizeof buf, "map %d lanes %d slices %zu cut %zu | heights %08x | obstacles %zu %08x | nitro %zu %08x | traffic %zu %08x | props %zu | side %zu %08x | fromLap %08x | total %08x",
+                  mapIndex, lanes, track.slices().size(), track.shortcut().size(), heights.h, obstacles.size(), obst.h,
+                  nitroPickups.size(), nitro.h, traffic.size(), traf.h, props.size(), sideList.size(), side.h, lapsFrom.h, worldChecksum());
+    return buf;
 }
 
 uint32_t GameSim::worldChecksum() const

@@ -875,8 +875,54 @@ static void cloneFiles(const char *dir)
                 ? "saved" : "FAILED", st.races, st.samples, 100.0 * st.agree());
 }
 
+// The challenge: the reference driver against 5 CPUs at fixed challenges, then a player who
+// starts at 0 and lets each result move it, as the game does.
+static int challengeRace(int m, float challenge, float skill, uint32_t seed)
+{
+    sim::GameSim s;
+    s.setMap(m);
+    s.setLaps(1);
+    s.setAiSeed(seed);
+    s.setCpuChallenge(challenge);
+    s.setCpuSkill(sim::cpuPrecisionFor(skill) + 0.5f * challenge);
+    s.startRace(sim::GameSim::ModeSingle, 6);
+    for (int i = 1; i < 6; ++i) s.getCars()[size_t(i)].aiLevel = 1;
+    for (int t = 0; t < 60 * 300 && s.getState() != sim::GameSim::Finished; ++t) {
+        sim::PlayerInput in[1];
+        in[0] = s.computeAIInput(s.getCars()[0], 0, false);
+        s.step(in, 1);
+    }
+    return s.rankOf(0);
+}
+
+static void challengeTest()
+{
+    std::printf("challenge  avg place  wins of 18\n");
+    uint32_t seed = 5;
+    for (float ch : {-0.4f, 0.0f, 0.3f, 0.6f, 1.0f}) {
+        float sum = 0.0f;
+        int wins = 0;
+        for (int k = 0; k < 18; ++k) {
+            const int place = challengeRace(k % sim::NUM_MAPS, ch, 0.8f, ++seed);
+            sum += float(place);
+            wins += place == 1;
+        }
+        std::printf("%9.2f %10.2f %11d\n", double(ch), double(sum / 18.0f), wins);
+    }
+    float ch = 0.0f;
+    int wins = 0;
+    std::printf("the same driver over 60 races, the challenge following the results:\n");
+    for (int r = 1; r <= 60; ++r) {
+        const int place = challengeRace(r % sim::NUM_MAPS, ch, 0.8f, ++seed);
+        ch = sim::PlayerProfile::challengeAfter(ch, place, 6);
+        wins += place == 1;
+        if (r % 10 == 0) { std::printf("  race %2d: challenge %.2f, wins in the last 10: %d\n", r, double(ch), wins); wins = 0; }
+    }
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && std::strcmp(argv[1], "challenge") == 0) { challengeTest(); return 0; }
     if (argc > 2 && std::strcmp(argv[1], "clonefiles") == 0) { cloneFiles(argv[2]); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "clone") == 0) { cloneTest(); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "nobrains") == 0) { gBrains = false; ++argv; --argc; }

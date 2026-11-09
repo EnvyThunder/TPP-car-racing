@@ -3,6 +3,8 @@
 
 #include <QObject>
 #include <QIODevice>
+#include <QCoreApplication>
+#include <QFile>
 #ifndef __EMSCRIPTEN__
 #include <QAudioFormat>
 #include <QAudioSink>
@@ -21,20 +23,40 @@ class AudioSynthStream : public QIODevice {
     Q_OBJECT
 public:
     explicit AudioSynthStream(QObject *parent = nullptr) : QIODevice(parent) {
-        // the recorded sounds (sounds/README.md), only their steady parts. The music on every
-        // screen but the race: two bars from 5.075 s and two from 12.658 s (it is 126.6 BPM, bars
-        // start on those beats) - without its quiet intro, the stutter at 9.8-11.5 s and the
-        // fade-out. The race recording as the track's atmosphere under the engine while you drive:
-        // from 3 s to 8 s before its end. Without them the synthesized tracks below play instead.
-        raceClip = loadSoundClip(":/sounds/race.mp3", {{3.0f, -8.0f}}, 2.0f);
-        musicClip = loadSoundClip(":/sounds/music.mp3", {{5.075f, 8.867f}, {12.658f, 16.450f}}, 0.03f);
-        haveClips = !raceClip.empty() && !musicClip.empty();
+        // The music on every screen but the race is our own "Pole Position" (sounds/README.md),
+        // written to loop. While you drive: our race track "Grid to Glory" - its intro once from GO,
+        // then round from bar 5 - with a very faint engine under it that follows your speed
+        // (engineSample). Without the music file the synthesized tracks below play.
+        musicClip = loadSoundClip(":/sounds/music.mp3", {{0.06f, 68.55f}}, 0.02f);   // (past the silence MP3 files start and end with)
+#ifndef __EMSCRIPTEN__
+        // Your own menu music, on your own computer only: an MP3 beside the program, played from
+        // 0:15 to 1:20. It is never built in, so it is not part of the website or the repository.
+        const QString own = QCoreApplication::applicationDirPath() + "/private_menu_music.mp3";
+        if (QFile::exists(own)) {
+            SoundClip clip = loadSoundClip(own, {{15.0f, 80.0f}}, 1.0f, 0.0f, true);   // (as loud as the record itself)
+            if (!clip.empty()) { musicClip = std::move(clip); musicLevel = 1.0f; }
+        }
+#endif
+        raceTrack = loadSoundClip(":/sounds/race_music.mp3", {{0.0f, 187.1f}}, 0.0f, 0.0f);   // (its own build-ups kept)
+#ifndef __EMSCRIPTEN__
+        // ... and while racing too, the whole of it from the start, round and round, at the menu's
+        // evened-out loudness (a finished record is far louder than our own track)
+        if (QFile::exists(own)) {
+            SoundClip clip = loadSoundClip(own, {{0.06f, 100000.0f}}, 1.0f, 0.0f, true);
+            if (!clip.empty()) { raceTrack = std::move(clip); raceLoopAt = 0.0f; raceLevel = 1.0f; raceDirect = true; }
+        }
+#endif
+        if (qEnvironmentVariableIsSet("CAR_RACING_AUDIO_ENGINE_ONLY")) raceTrack = SoundClip();   // (tests: the engine alone)
+        cabinOnly = qEnvironmentVariableIsSet("CAR_RACING_AUDIO_CABIN_ONLY");                    // (tests: the cabin sounds alone)
+        haveClips = !musicClip.empty();
         if (qEnvironmentVariableIsSet("CAR_RACING_AUDIO_TRACE")) {   // (tests: silent, with the clips' lengths)
             muted = true;
-            std::printf("AUDIO: race %.1f s, music %.1f s\n", raceClip.samples.size() / 44100.0, musicClip.samples.size() / 44100.0);
+            auto rms = [](const SoundClip &c) { double t = 0; for (float v : c.samples) t += double(v) * v; return c.empty() ? 0.0 : std::sqrt(t / double(c.samples.size())); };
+            std::printf("AUDIO: music %.1f s, race music %.1f s; played at RMS %.3f (menu), %.3f (race)\n", musicClip.samples.size() / 44100.0, raceTrack.samples.size() / 44100.0,
+                        rms(musicClip) * musicLevel, rms(raceTrack) * raceLevel);
             std::fflush(stdout);
         }
-        open(QIODevice::ReadOnly);
+        open(QIODevice::ReadOnly | QIODevice::Unbuffered);   // (no read-ahead: the sound keeps up with the car)
     }
 
     qint64 readData(char *data, qint64 maxlen) override {
@@ -75,18 +97,35 @@ public:
             const float fadeTime = haveClips ? 0.25f : 0.6f;
             if (want != track) {
                 fade -= dt / fadeTime;
-                if (fade <= 0.0f) { fade = 0.0f; track = want; trackPos = 0; }
+                if (fade <= 0.0f) {
+                    fade = 0.0f;
+                    track = want;
+                    trackPos = 0;
+                    if (track == 1) {                    // a new race: the track from its start, the engine from where the car is
+                        rpm = rpmFor(engineWant.load(std::memory_order_relaxed), false);
+                        load = 0.35f;
+                        racePos = 0;
+                    }
+                }
             } else if (fade < 1.0f) {
                 fade = std::min(1.0f, fade + dt / fadeTime);
             }
             if (haveClips) {
                 float v;
                 if (track == 1) {
-                    // driving: your engine over the track's atmosphere, at one steady loudness
-                    v = engineSample(dt, pinkNoise) * 0.75f + raceClip.samples[racePos] * 0.5f;
-                    if (++racePos >= raceClip.samples.size()) racePos = 0;
+                    v = engineSample(dt, rawNoise) * ENGINE_MIX;
+                    const float cabin = cabinSample(rawNoise);
+                    if (cabinOnly) { samples[i] = static_cast<int16_t>(std::clamp(cabin * fade, -1.0f, 1.0f) * 32000.0f); continue; }
+                    if (!raceTrack.empty()) {
+                        speakers += (raceTrack.samples[racePos] - speakers) * (raceDirect ? 1.0f : SPEAKER_CUT);   // (the music through the car's speakers; your own record as it is)
+                        v += speakers * raceLevel + cabin;
+                        if (++racePos >= raceTrack.samples.size())
+                            racePos = std::min(raceTrack.samples.size() - 1, size_t(raceLoopAt * 44100.0f));
+                    } else {
+                        v /= ENGINE_MIX;                 // (no race track: the engine on its own)
+                    }
                 } else {
-                    v = musicClip.samples[musicPos];
+                    v = musicClip.samples[musicPos] * musicLevel;
                     if (++musicPos >= musicClip.samples.size()) musicPos = 0;
                 }
                 samples[i] = static_cast<int16_t>(std::clamp(v * fade, -1.0f, 1.0f) * 32000.0f);
@@ -149,7 +188,25 @@ public:
     qint64 writeData(const char*, qint64) override { return 0; }
     qint64 bytesAvailable() const override { return 44100 * sizeof(int16_t); }
 
-    void setEngine(float speedRatio) { engineWant.store(std::clamp(speedRatio, 0.0f, 1.0f), std::memory_order_relaxed); }
+    // Every frame: the speed (a share of top speed; nitro goes above 1) and what the driver does
+    void setEngine(float speedRatio) { engineWant.store(std::clamp(speedRatio, 0.0f, 1.6f), std::memory_order_relaxed); }
+    void setDrive(bool throttle, bool brake, bool air, bool nitro)
+    {
+        driveBits.store((throttle ? 1 : 0) | (brake ? 2 : 0) | (air ? 4 : 0) | (nitro ? 8 : 0), std::memory_order_relaxed);
+    }
+    // The engine's revs (0..1) at a speed: six gears. In each gear the revs climb with the speed and
+    // drop at the change up; above 82% of top speed the car is in 6th and the note stays put (nitro
+    // still pushes it up). In the air the wheels spin free: a little higher.
+    static constexpr float GEAR_AT[7] = {0.0f, 0.12f, 0.27f, 0.44f, 0.62f, 0.82f, 1.6f};
+    static float rpmFor(float speed, bool air)
+    {
+        int g = 0;
+        while (g < 5 && speed >= GEAR_AT[g + 1]) ++g;
+        const float within = std::clamp((speed - GEAR_AT[g]) / (GEAR_AT[g + 1] - GEAR_AT[g]), 0.0f, 1.0f);
+        const float lo = g == 0 ? 0.18f : 0.52f;
+        return std::min(1.0f, lo + (0.97f - lo) * within + (air ? 0.18f : 0.0f));
+    }
+    static float engineHz(float rpm) { return 28.0f + 190.0f * rpm; }   // the firing note
     void setDrift(bool) {}
     void setNitro(bool) {}
     void triggerCrash(float = 1.0f) {}
@@ -308,35 +365,79 @@ private:
     float pinkNoise = 0.0f;
     float airNoise = 0.0f;
 
-    // The recordings (see the constructor)
-    SoundClip raceClip, musicClip;
+    // The music recording (see the constructor)
+    SoundClip musicClip;
     bool haveClips = false;
-    size_t racePos = 0, musicPos = 0;
-    std::atomic<float> engineWant{0.0f};
-    float engineGain = 0.0f;
+    size_t musicPos = 0;
+    static constexpr float MUSIC_LEVEL = 0.3f;
+    float musicLevel = MUSIC_LEVEL;                    // (your own record beside the program: 1, as loud as made)
+    bool raceDirect = false;                           // (your own record in races: not through the car's speakers)
+    // While racing: the race track at twice the menu music's level, the engine about 24 dB under it -
+    // there if you listen for it, never in the way
+    SoundClip raceTrack;
+    size_t racePos = 0;
+    static constexpr float RACE_LEVEL = 0.6f, RACE_LOOP_AT = 10.170f, ENGINE_MIX = 0.12f;
+    float raceLoopAt = RACE_LOOP_AT, raceLevel = RACE_LEVEL;   // (your own music beside the program: from the start, quieter)   // (twice the menu music: louder while racing)
 
-    // Your engine, made here from the car's speed: five gears - in each the revs climb, and at a
-    // shift they drop - so the pitch follows the race the way the car does. The loudness stays
-    // the same (about -20 dB, like the recordings): only the pitch and the tone change.
-    float rpm = 0.25f, enginePhase = 0.0f, rumblePhase = 0.0f;
+    // ---- Inside the car: a deep rumble through the body and the rush of air outside, both from
+    // your speed every frame, and the music a little softer at the top, as through the car's own
+    // speakers. The rumble is the engine's low notes only: felt more than heard.
+    static constexpr float SPEAKER_CUT = 0.45f;        // (one-pole: about 4.5 kHz)
+    static constexpr float RUMBLE_MIX = 0.030f, WIND_MIX = 0.020f;
+    bool cabinOnly = false;
+    float speakers = 0.0f, rumbleLp = 0.0f, rumbleLp2 = 0.0f, windLo = 0.0f, windHi = 0.0f;
+    float cabinSample(float noise)
+    {
+        const float speed = std::min(1.0f, engineWant.load(std::memory_order_relaxed));
+        const float twoPi = 6.2831853f;
+        const float body = std::sin(twoPi * halfPhase) + 0.6f * std::sin(twoPi * enginePhase);   // (the engine's own phases: in step with it)
+        rumbleLp += (body - rumbleLp) * 0.018f;                              // (two gentle lows: about 130 Hz)
+        rumbleLp2 += (rumbleLp - rumbleLp2) * 0.018f;
+        const float rumble = rumbleLp2 * RUMBLE_MIX * (0.25f + 0.75f * speed) * (0.7f + 0.3f * load);
+        windLo += (noise - windLo) * 0.02f;                                  // (air: between about 150 Hz and 1.5 kHz)
+        windHi += (noise - windHi) * 0.2f;
+        const float wind = (windHi - windLo) * WIND_MIX * speed * speed;
+        return rumble + wind;
+    }
+
+    // ---- The engine: the revs follow the speed within about 15 ms (no slow fades), the load
+    // (growl and loudness) follows the keys within about 60 ms. A soft tone of harmonics, an
+    // uneven half-beat, intake noise, a little saturation under load, a whine with nitro.
+    static constexpr float ENGINE_LEVEL = 0.075f;      // low: about -25 dB at top speed, softer at idle
+    std::atomic<float> engineWant{0.0f};
+    std::atomic<int> driveBits{0};
+    float rpm = 0.18f, load = 0.35f, enginePhase = 0.0f, halfPhase = 0.0f, whinePhase = 0.0f, intake = 0.0f;
     float engineSample(float dt, float noise)
     {
-        engineGain += (engineWant.load(std::memory_order_relaxed) - engineGain) * 0.0001f;   // (~0.25 s)
-        const float s = std::clamp(engineGain, 0.0f, 1.0f) * 5.0f;
-        const int gear = std::min(4, int(s));
-        const float within = s - float(gear);
-        const float target = gear == 0 ? 0.25f + 0.75f * within : 0.42f + 0.58f * within;
-        rpm += (target - rpm) * 0.0004f;                                                       // (a quick glide, ~55 ms)
-        const float f = 38.0f + 130.0f * rpm;                                                  // firing frequency, Hz
-        enginePhase += f * dt;
-        if (enginePhase > 1.0f) enginePhase -= 1.0f;
-        rumblePhase += 0.5f * f * dt;
-        if (rumblePhase > 1.0f) rumblePhase -= 1.0f;
+        const int bits = driveBits.load(std::memory_order_relaxed);
+        const bool throttle = bits & 1, brake = bits & 2, air = bits & 4, nitro = bits & 8;
+        const float target = rpmFor(engineWant.load(std::memory_order_relaxed), air);
+        rpm += (target - rpm) * 0.0015f;                                     // (about 15 ms)
+        const float loadWant = air ? 0.5f : throttle ? 1.0f : brake ? 0.15f : 0.35f;
+        load += (loadWant - load) * 0.00038f;                                // (about 60 ms)
+        const float f = engineHz(rpm);
         const float twoPi = 6.2831853f;
-        float tone = 0.0f;                                                                     // harmonics 1..8, softer upwards
-        for (int h = 1; h <= 8; ++h) tone += std::sin(twoPi * enginePhase * float(h)) / float(h) * (h % 2 ? 1.0f : 0.7f);
-        tone *= 1.0f + 0.15f * std::sin(twoPi * rumblePhase);                                  // the uneven beat of the cylinders
-        return (tone * 0.11f + noise * (0.10f + 0.12f * rpm)) * 0.95f;
+        enginePhase += f * dt;
+        if (enginePhase >= 1.0f) enginePhase -= 1.0f;
+        halfPhase += 0.5f * f * dt;
+        if (halfPhase >= 1.0f) halfPhase -= 1.0f;
+        const float tilt = 1.7f - 0.6f * load;                               // (more load, brighter)
+        float tone = 0.0f;
+        for (int h = 1; h <= 10; ++h)
+            tone += std::sin(twoPi * enginePhase * float(h)) * std::pow(float(h), -tilt) * (h % 2 ? 1.0f : 0.75f);
+        tone *= 1.0f + 0.22f * std::sin(twoPi * halfPhase);                  // the cylinders' uneven beat
+        tone += 0.25f * std::sin(twoPi * halfPhase);
+        const float cut = std::min(0.5f, (300.0f + 2600.0f * rpm) / 44100.0f * twoPi);
+        intake += (noise - intake) * cut;                                    // breathing in, brighter at high revs
+        float x = tone * 0.55f + intake * (0.15f + 0.35f * load);
+        const float drive = 1.0f + 1.5f * load;
+        x = std::tanh(x * drive) / std::tanh(drive);
+        if (nitro) {
+            whinePhase += 9.0f * f * dt;
+            if (whinePhase >= 1.0f) whinePhase -= 1.0f;
+            x += 0.10f * std::sin(twoPi * whinePhase) + 0.06f * noise;
+        }
+        return x * ENGINE_LEVEL * (0.45f + 0.35f * load + 0.20f * rpm);
     }
 
     // Background music sequencer state
@@ -366,7 +467,7 @@ public:
 
         stream = new AudioSynthStream(this);
         audioSink = new QAudioSink(defaultDevice, format, this);
-        audioSink->setBufferSize(44100 * sizeof(int16_t) / 4); // ~250ms buffer
+        audioSink->setBufferSize(44100 * sizeof(int16_t) / 12); // ~80 ms: the engine keeps up with the car
         audioSink->start(stream);
 #endif
     }
@@ -382,6 +483,7 @@ public:
     void update(float speedRatio, bool drifting, bool nitro) {
         if (!stream) return;
         stream->setEngine(speedRatio);
+        stream->setDrive(false, false, false, false);
         stream->setDrift(drifting);
         stream->setNitro(nitro);
     }
@@ -402,6 +504,13 @@ public:
         if (stream) stream->triggerFanfare();
     }
 
+    // while driving, every frame: the speed and what the driver does
+    void drive(float speedRatio, bool throttle, bool brake, bool air, bool nitro) {
+        if (!stream) return;
+        stream->setEngine(speedRatio);
+        stream->setDrive(throttle, brake, air, nitro);
+    }
+
     // the music for what is on screen: 0 the menu, 1 a race, 2 the results
     void setMusic(int track) {
         if (stream) stream->setTrack(track);
@@ -409,6 +518,10 @@ public:
 
     void toggleMute() {
         if (stream) stream->setMuted(!stream->isMuted());
+    }
+
+    void setMuted(bool m) {
+        if (stream) stream->setMuted(m);
     }
 
     bool isMuted() const {

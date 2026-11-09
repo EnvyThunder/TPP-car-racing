@@ -92,7 +92,7 @@ private:
     bool open = false;
 };
 
-// The five maps, circuits and sprints (shared/circuits.cpp)
+// The maps, circuits and sprints (shared/circuits.cpp)
 const std::vector<CircuitDef> &draftCircuits();
 
 } // namespace sim

@@ -36,7 +36,7 @@ Wants=network-online.target
 [Service]
 User=racing
 Group=racing
-ExecStart=/opt/car-racing-race/turbo8_server 47800 --ws 47810 --max-rooms 4 --api http://127.0.0.1:3000
+ExecStart=/opt/car-racing-race/turbo8_server 47800 --ws 47810 --max-rooms 4 --api http://127.0.0.1:3000 --rtc 47803 --public-ip 13.127.16.77
 Restart=always
 RestartSec=2
 NoNewPrivileges=true

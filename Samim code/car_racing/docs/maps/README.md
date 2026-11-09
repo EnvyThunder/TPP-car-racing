@@ -99,3 +99,34 @@ and race 5–18 → 3–8; damage from barriers and blocks 0–15 → 0–54; wr
 0–0.06 → 0–0.11; finishing rates and difficulty levels the same. Every launch off the new
 ramps with steering lands on the road (`ai_bench jumps`). `CAR_RACING_AUTOSHOT_OBST=1` takes a
 screenshot before the first concrete block, tyre stack and last ramp on every map.
+
+## Longer jumps, gentler steering, mines and stones
+
+| Knob (`shared/gamesim.h`) | Value | What it does |
+|---|---|---|
+| `STEER_RATE` | 0.024 (was 0.030) | radians a tick at full lock |
+| `STEER_TAP` | 0.6 | a key just pressed turns this much of full lock; full after a few ticks |
+| `jumpMulFor` | 1.25-1.46 (was 1.08-1.26) | each next car over a ramp is still thrown higher, every case stronger |
+| `JUMP_CARRY` | 1.16 | in the air a car covers this much more ground |
+
+Together a jump covers about 25-32% more road (`ai_bench jumps`). Steering in the air went from 0.33 to 0.55 of normal,
+and a side ramp needs a fairly straight road for 170 m (was 120 m), so a longer flight still lands on the road.
+
+Every map gets, automatically and with their own random numbers (`GameSim::startRace` obstacles section):
+
+- **Mines:** a black mine under a red skull sign, with a red cross on the road, in one lane. Hitting one takes all your
+  health at once and throws the driver out; flying over it is safe. The placement aims for 2-4 plus one in the last
+  third, but only places what fits (`keepClear`, not soon after a bend), so a map can have fewer (1-3 at last count).
+- **Stones and road blocks:** one extra pattern every 150-230 m where there is room, always leaving a lane open.
+
+CPUs steer out of a mine's way in good time and miss about one time in twelve (`computeAIInput`).
+Screenshots: `CAR_RACING_AUTOSHOT_OBST=1`. Wreck causes per map changed from the first version after CPUs were flying over
+the rails: at last check 0-0.33 wrecks per car and race.
+
+## The challenge: CPUs follow your results
+
+No level to choose. `PlayerProfile::challenge` (-0.4 to 1.0, saved with the profile) moves after each race: 1st +0.06,
+2nd +0.025, last -0.03, other places -0.015. It moves the CPUs' skill centre, and above 0 they also make fewer mistakes and
+take more jumps, shortcuts and boosts. No rubber band: the same cars, driven better. Online the room's people are averaged.
+`ai_bench challenge`, a strong reference driver against 5 CPUs: at 0 it won 17 of 18, at 1.0 it won 4 of 18, and following
+its results over 60 races it settled at 1-4 wins in 10.

@@ -4,7 +4,7 @@ Online races can now run on the game server on AWS instead of a player's PC, so 
 anywhere can race. They go over **WebSockets**, the only connection a browser can open, so the
 browser version (Phase D) will join the same races. LAN play on one Wi-Fi works as before.
 
-- **Address:** `wss://13-49-109-8.sslip.io/race` (Caddy does the TLS and passes it to the race
+- **Address:** `wss://tppcarracing.duckdns.org/race` (AWS Mumbai) (Caddy does the TLS and passes it to the race
   server on 127.0.0.1:47810).
 - **Free:** it runs on the same free-plan EC2 machine as the accounts API.
 
@@ -63,3 +63,20 @@ browser version (Phase D) will join the same races. LAN play on one Wi-Fi works 
 - **The guest window's 565 ms:** in the two-window live test it measured a 565 ms ping (two
   windows starting on one PC). Worth watching in real play.
 - **Room limit:** 4 rooms is cautious. With 1% CPU per room, it can go up later.
+
+## Smoothness (no change to the protocol)
+
+- The other cars' buffer follows the connection: 60-150 ms instead of a fixed 80 ms, from how late snapshots
+  arrive. With nothing newer to show (a stalled update) a car keeps moving for up to 120 ms.
+- Corrections of your own car fade by time, not by frames, and larger ones take a little longer.
+- **F2** shows FPS, the slowest frame, graphics level, ping, jitter, buffer, stalls, late updates and corrections.
+- Graphics are automatic (`gfxFrame` in glwidget.cpp): over about 22 ms a frame or 12% of frames above 33 ms, one
+  level down (0-3: view distance, trees and houses, particles, skid marks, and in the browser the resolution);
+  smooth for 20 s or more, one level up. The player never chooses. `?gfx=N` on the page holds a level for tests.
+- Test with a poor connection (40 ms each way, up to 40 ms jitter, a 200 ms stall every 5 s, one short race):
+  frames with nothing newer to show went from 22 to 13 of 939 against the old fixed buffer.
+
+**The pull-backs (found with a 400 ms stall both ways every 5 s, like TCP resending a lost packet).** Inputs that waited
+in a stall arrived together, the server kept only 0.2 s of them and dropped the rest, and each dropped input pulled the
+player's car back about a metre. The server now keeps a whole second. Same test: 58 small and 12 large corrections before,
+0 and 0 after (two runs). The browser's resolution step also never ran in online races; it does now.

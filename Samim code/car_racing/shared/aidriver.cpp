@@ -63,7 +63,14 @@ float cpuPrecisionFor(float measuredSkill)
 }
 
 void GameSim::setAiSeed(uint32_t s) { aiSeed = s ? s : 1u; }
+float cpuCentreFor(float measuredSkill, float sure, float challenge)
+{
+    const float known = NEW_PLAYER_SKILL * (1.0f - sure) + measuredSkill * sure;
+    return std::max(CPU_FLOOR, cpuPrecisionFor(known) + 0.5f * challenge);
+}
+
 void GameSim::setCpuSkill(float centre) { cpuSkillCentre = std::clamp(centre, 0.0f, 1.0f); }
+// (the challenge moves the centre itself: GLWidget::startRace and the race server add it)
 
 // A CPU gets its personality and skill the first time it thinks in a race: the personality
 // from the race's AI seed; the skill spread around the centre (the player's profile: offline
@@ -155,7 +162,8 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
     // human mistakes, once a second a small chance (more under pressure, fewer when confident)
     if (racing && (tick + idx) % 60 == 0 && tick >= c.aiMistakeUntil) {
         static const float MOOD_MUL[NUM_MOODS] = {1.0f, 0.7f, 1.8f, 1.3f, 1.2f, 1.5f};
-        const float p = (0.045f * (1.0f - s) + 0.004f) * P.mistakes * MOOD_MUL[mood] * c.dirMistake;   // (the director's lever too)
+        const float bold = std::max(0.0f, cpuChallenge);
+        const float p = (0.045f * (1.0f - s) + 0.004f) * P.mistakes * MOOD_MUL[mood] * c.dirMistake * (1.0f - 0.8f * bold);   // (the director's lever too)
         if (aiRand(aiSeed, idx, tick, 41) < p) {
             const float k = aiRand(aiSeed, idx, tick, 42);
             c.aiMistake = c.boosting && k < 0.25f ? MistakeOverBoost : k < 0.55f ? MistakeLateBrake : k < 0.85f ? MistakeWide : MistakeLateSee;
@@ -233,8 +241,9 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
     v.commit = std::min(1.0f, 0.60f + 0.40f * s + (mood == MoodConfident ? 0.02f : 0.0f) + (mood == MoodDesperate ? 0.03f : 0.0f)
                               + (mood == MoodRevenge ? 0.02f : 0.0f) - (mood == MoodShaken ? 0.05f : 0.0f) + c.dirEffort);
     v.rampChance = std::clamp(int(25.0f + 55.0f * P.rampLove + 15.0f * s) + (mood == MoodDesperate ? 25 : 0) - (mood == MoodShaken ? 30 : 0), 5, 97);
-    v.rampChance = std::clamp(v.rampChance + c.dirRamp, 5, 97);
-    v.cutChance = c.dirCut == 1 ? 95 : std::clamp(int(25.0f + 50.0f * s + 20.0f * P.aggression) + (mood == MoodDesperate ? 20 : 0), 5, 95);
+    const float bold = std::max(0.0f, cpuChallenge);
+    v.rampChance = std::clamp(v.rampChance + c.dirRamp + int(30.0f * bold), 5, 97);
+    v.cutChance = c.dirCut == 1 ? 95 : std::clamp(int(25.0f + 50.0f * s + 20.0f * P.aggression + 30.0f * bold) + (mood == MoodDesperate ? 20 : 0), 5, 95);
     if (carOk(c.aiTacticCar)) {
         switch (c.aiTactic) {
         case TacticPassLeft:  v.passCar = c.aiTacticCar; v.passSide = -1; break;
@@ -246,7 +255,7 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
         }
     }
     // nitro and the L boost: a late charger keeps both for the last third
-    v.saveNitro = P.lateCharger && !lastThird;
+    v.saveNitro = P.lateCharger && !lastThird && bold < 0.5f;
     const int presses = obsOf(idx) ? obsOf(idx)->boosts : 0;   // (each press has its own length)
     const float b = aiRand(aiSeed, idx, presses, 61);
     v.boostHold = 60 + int(120.0f * P.boostLove * (0.5f + b));
@@ -254,8 +263,8 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
     if (c.aiPersona == PersonaWildCard && b < 0.15f) v.boostHold = 660 + int(b * 600.0f);   // sometimes far too long
     if (mood == MoodDesperate) v.boostHold = std::max(v.boostHold, 300);
     if (c.aiMistake == MistakeOverBoost) v.boostHold = 480;
-    v.boostEvery = mood == MoodDesperate ? 300 : int(1500.0f - 1000.0f * P.boostLove);
-    if (P.lateCharger && !lastThird) v.boostEvery = 1000000;
+    v.boostEvery = mood == MoodDesperate ? 300 : std::max(300, int((1500.0f - 1000.0f * P.boostLove) * (1.0f - 0.6f * bold)));
+    if (P.lateCharger && !lastThird && bold < 0.5f) v.boostEvery = 1000000;
     v.boostAnyRoad = P.boostLove > 0.8f || c.aiPersona == PersonaWildCard || mood == MoodDesperate;
     // the director's wishes on top
     if (c.dirBoostEvery > 0) {

@@ -263,6 +263,8 @@ void Link::send(const QByteArray &bytes)
     else sendFrame(0x2, bytes);
 }
 
+qint64 Link::backlog() const { return sock ? sock->bytesToWrite() : 0; }
+
 QByteArray Link::take()
 {
     QByteArray out;
@@ -390,6 +392,8 @@ void Link::send(const QByteArray &bytes)
     if (!open || ws <= 0) return;
     emscripten_websocket_send_binary(ws, const_cast<char *>(bytes.constData()), uint32_t(bytes.size()));
 }
+
+qint64 Link::backlog() const { return 0; }
 
 QByteArray Link::take()
 {

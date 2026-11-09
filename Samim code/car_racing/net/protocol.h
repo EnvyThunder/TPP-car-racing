@@ -64,7 +64,7 @@ inline QList<QNetworkAddressEntry> lanEntries()
 }
 #endif
 
-constexpr quint16 PROTOCOL_VERSION = 22;   // 2: same track everywhere + fingerprint; 3: CPU racers; 4: wide road;
+constexpr quint16 PROTOCOL_VERSION = 26;   // 2: same track everywhere + fingerprint; 3: CPU racers; 4: wide road;
                                            // 5: rooms of 6, names changed in the lobby; 6: circuits with laps;
                                            // 7: hills and banking; 8: jumps (car height in snapshots);
                                            // 9: tunnels, bridges, the raised highway; 10: shortcuts;
@@ -83,10 +83,18 @@ constexpr quint16 PROTOCOL_VERSION = 22;   // 2: same track everywhere + fingerp
                                            // 20: the shortcut is closed to the top 3 (flag in snapshots)
                                            // 21: WebSocket links (net/link.h); C_JOIN ends with an account token
                                            // 22: more ramps and obstacles (tyres, concrete), gentler landings
+                                           // 24: inputs carry copies of the last ones and how many the game
+                                           //     wants waiting; snapshots say how many of yours wait;
+                                           //     smaller snapshots; the fast lane (UDP) for inputs and
+                                           //     snapshots, S_WELCOME ends with its port and token
+                                           // 25: your own car exact in your snapshots (no rounding shake)
+                                           // 26: two new maps (Desert Zigzag, Ghat Road)
 constexpr quint16 GAME_PORT        = 47800;   // TCP; a busy port makes the host try the next ones
 constexpr quint16 DISCOVERY_PORT   = 47801;   // UDP
 constexpr int     SNAPSHOT_EVERY   = 2;       // sim ticks per snapshot: 60 Hz sim -> 30 Hz snapshots
 constexpr int     INTERP_DELAY_MS  = 80;      // other cars are drawn this far in the past (smoothness)
+constexpr int     INPUT_COPIES     = 8;       // each input packet repeats the last inputs: a lost one costs nothing
+constexpr int     SNAPSHOT_BACKLOG = 6000;    // bytes still waiting to go to a player: hold their next snapshots
 
 // Player names: up to MAX_NAME of the characters the game's pixel font can show
 constexpr int MAX_NAME = 16;
@@ -103,7 +111,7 @@ inline QString cleanName(const QString &raw)
 enum MsgType : quint8 {
     // client -> server
     C_JOIN = 1,      // version, name, r, g, b, room code ("" = create a new room), map, laps
-    C_INPUT,         // seq, input bits
+    C_INPUT,         // newest seq, inputs wanted waiting, count, input bits (oldest first)
     C_START,         // host: start the race
     C_SET_MAP,       // host: choose the map and the number of laps in the lobby
     C_PING,          // client clock in ms (echoed back to measure ping)
@@ -111,16 +119,26 @@ enum MsgType : quint8 {
     C_REMOVE_BOT,    // host: remove the last CPU racer
     C_SET_NAME,      // new name for yourself (in the lobby)
     C_STORY,         // the race's story scene: 0 = I watched it, 1 = skip it for everyone
+    C_RTC_OFFER,     // the browser's fast lane: its WebRTC offer (SDP text, all candidates in it)
     // server -> client
     S_WELCOME = 64,  // your slot, room code, are you the host
     S_ERROR,         // reason; the server then closes the connection
     S_LOBBY,         // map, laps, players
     S_RACE_START,    // map, laps, your slot, racer names, track fingerprint
-    S_SNAPSHOT,      // last input seq applied for you + world snapshot
+    S_SNAPSHOT,      // last input seq applied for you, your inputs waiting + world snapshot
     S_PONG,          // echoed client clock
     S_RACE_OVER,     // race finished: back to the lobby
-    S_STORY_END      // the story scene is over for everyone (skipped or watched): the countdown starts
+    S_STORY_END,     // the story scene is over for everyone (skipped or watched): the countdown starts
+    S_EXTRAS,        // obstacle changes + effects for a snapshot that went by the fast lane (they must not be lost)
+    S_RTC_ANSWER     // the server's WebRTC answer (SDP text); the browser's datagrams then go by its data channel
 };
+
+// The fast lane: UDP datagrams beside the connection, for what is better late-dropped than late -
+// inputs one way (each repeats the last ones), snapshots the other (each complete in itself; an old
+// one is thrown away). [type][token: 8 bytes][...]; the token from S_WELCOME proves who sends.
+// Where UDP can't get through, everything stays on the connection. Browsers can't send UDP
+// themselves: theirs goes by a WebRTC data channel (unordered, never resent), same datagrams.
+enum FastType : quint8 { F_HELLO = 1, F_HELLO_OK = 2, F_INPUT = 3, F_SNAPSHOT = 4 };
 
 struct LobbyPlayer {
     QString name;

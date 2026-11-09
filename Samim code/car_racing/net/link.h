@@ -40,6 +40,7 @@ public:
     void close();                        // goes once what was sent is out
     void abort();
     bool isOpen() const { return open; }
+    qint64 backlog() const;              // bytes sent but not out yet (a slow connection backs up)
     bool isWebSocket() const { return mode != Tcp; }
     bool isLoopback() const;
     QString clientAddress() const;       // the player's address (behind Caddy: X-Forwarded-For)

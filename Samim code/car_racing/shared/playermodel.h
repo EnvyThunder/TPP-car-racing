@@ -123,6 +123,11 @@ struct PlayerProfile {
     int races = 0;
     Traits traits;
     float sure = 0.0f;               // 0..1: how far the profile can be trusted (more races, surer)
+    // How hard the CPUs push you, set by your last results (never chosen): 1st clearly tougher, 2nd a
+    // little tougher, further back a little easier, last a bit easier. No help for the CPUs in
+    // speed: the same cars, driven better (see challengeAfter).
+    float challenge = 0.0f;
+    static float challengeAfter(float now, int place, int cars);
     std::array<MapHabits, PM_MAPS> habits;
     std::vector<RaceSummary> recent; // newest first, at most 10
     std::array<RivalRecord, PM_ROSTER> rivals{};   // per named driver

@@ -1,5 +1,5 @@
-// The six maps (step 1 of docs/ROADMAP.md): four circuits raced in laps and two sprints
-// (Sunset Valley, Coastal Highway) raced once from start to finish. tools/track_preview
+// The maps (step 1 of docs/ROADMAP.md): four circuits raced in laps and four sprints (Sunset
+// Valley, Coastal Highway, Desert Zigzag, Ghat Road) raced once from start to finish. tools/track_preview
 // draws each one from above with its height profile and measures it in the game's simulation.
 // Top view in metres: x east, z north; y = height. Point 0 is the start/finish line; it
 // stands on a straight (the points just before and after it lie on one line).
@@ -230,12 +230,155 @@ CircuitDef coastalSprint()
     return c;
 }
 
+
+// ---- Hairpin sprints: a mountain road of stacked switchbacks ----
+// Rows of road stacked up a slope, each joined to the next by a hairpin. The first row starts at
+// (x, z) heading east (dir +1) or west (-1); each next row lies `gap` metres further north and runs
+// the other way. A row climbs `climb` metres, a hairpin `turnClimb`; `wave` bends the rows a
+// little (as such roads follow the hillside), `slant` tilts them (the row's far end that many
+// metres further north). Returns the height at the end.
+float switchbacks(std::vector<CtrlPoint> &p, float x, float z, float y, float dir, float rowLen, int rows,
+                  float gap, float climb, float turnClimb, float wave, float slant)
+{
+    const float r = gap * 0.5f;
+    const int steps = std::max(2, int(rowLen / 70.0f));
+    for (int k = 0; k < rows; ++k) {
+        const float d = (k % 2 == 0) ? dir : -dir;
+        // the row's start: the west or east end, depending on its direction
+        const float startX = (d == dir) ? x : x + dir * rowLen;
+        const float baseZ = z + float(k) * gap;
+        for (int i = (k == 0 ? 0 : 1); i <= steps; ++i) {
+            const float f = float(i) / float(steps);
+            const float px = startX + d * rowLen * f;
+            const float tilt = slant * ((d == dir) ? f : 1.0f - f);   // (every row parallel)
+            const float pz = baseZ + tilt + wave * std::sin(f * 3.14159265f * 2.0f) * (k % 2 ? -1.0f : 1.0f);
+            p.push_back(P(px, pz, y + climb * f));
+        }
+        y += climb;
+        if (k + 1 == rows) break;
+        // the hairpin: half a circle north, round its centre beside the row's end
+        const float ex = startX + d * rowLen, ez = baseZ + ((d == dir) ? slant : 0.0f);
+        const float bank = (d > 0) ? -8.0f : 8.0f;       // (left turn: the left edge lower)
+        for (int a = 1; a <= 3; ++a) {
+            const float th = -1.5707963f + 0.7853982f * float(a);
+            p.push_back(P(ex + d * r * std::cos(th), ez + r + r * std::sin(th), y + turnClimb * float(a) / 4.0f, 0, bank));
+        }
+        y += turnClimb;
+    }
+    return y;
+}
+
+// DESERT ZIGZAG: across the desert to the foot of a ridge, up nine stacked switchbacks, through
+// a mesa at the top and down a canyon to the finish
+CircuitDef desertZigzag()
+{
+    CircuitDef c;
+    c.name = "DESERT ZIGZAG";
+    c.features = "HARD SPRINT. ACROSS THE DESERT WITH A JUMP OVER A DRY WASH, NINE STACKED HAIRPINS UP THE RIDGE, A TUNNEL THROUGH THE MESA AT THE TOP, A BRIDGE OVER A CANYON, A CREST JUMP. SHORTCUT: A DRY RIVERBED.";
+    c.sprint = true;
+    c.laps = 1;
+    std::vector<CtrlPoint> &p = c.pts;
+    p = {P(0, 0, 0), P(150, 0, 0), P(300, 0, 0), P(450, 0, 0), P(700, -30, 1), P(950, 15, 2),
+         P(1150, 0, 3), P(1250, 0, 3, TF_JUMP), P(1400, 0, 3), P(1550, 10, 3), P(1700, 60, 4), P(1810, 140, 4)};
+    float y = switchbacks(p, 1880, 190, 4, 1.0f, 420.0f, 9, 80.0f, 8.0f, 1.0f, 5.0f, 0.0f);
+    const float zt = 190 + 8 * 80.0f;                   // the top row
+    p.push_back(P(2420, zt + 5, y));
+    p.push_back(P(2560, zt + 10, y, TF_TUNNEL));         // through the mesa
+    p.push_back(P(2760, zt + 10, y - 2));
+    p.push_back(P(2920, zt - 15, y - 6));
+    p.push_back(P(3060, zt - 90, y - 13));
+    p.push_back(P(3160, zt - 210, y - 21));
+    p.push_back(P(3210, zt - 340, y - 28, TF_BRIDGE));   // over the canyon
+    p.push_back(P(3240, zt - 470, y - 32));
+    p.push_back(P(3290, zt - 600, y - 37));
+    p.push_back(P(3330, zt - 720, y - 41));
+    const int cutFrom = int(p.size());
+    p.push_back(P(3420, zt - 850, y - 45));
+    p.push_back(P(3470, zt - 1040, y - 47));            // round the rock...
+    p.push_back(P(3560, zt - 1180, y - 49));
+    p.push_back(P(3700, zt - 1220, y - 51));
+    p.push_back(P(3830, zt - 1150, y - 52));
+    p.push_back(P(3880, zt - 1010, y - 53));
+    p.push_back(P(3930, zt - 880, y - 54));
+    const int cutTo = int(p.size());
+    p.push_back(P(3990, zt - 780, y - 55));
+    p.push_back(P(4030, zt - 700, y - 58));
+    p.push_back(P(4150, zt - 560, y - 62));
+    p.push_back(P(4350, zt - 540, y - 64, TF_JUMP));     // the crest
+    p.push_back(P(4500, zt - 540, y - 65));
+    p.push_back(P(4750, zt - 550, y - 67));
+    p.push_back(P(5000, zt - 560, y - 69));               // the finish line
+    p.push_back(P(5300, zt - 560, y - 69));               // run-off
+    c.shortcut.fromPt = cutFrom;
+    c.shortcut.toPt = cutTo;
+    c.shortcut.via = {D(3540, zt - 885, y - 48), D(3680, zt - 900, y - 51), D(3810, zt - 880, y - 53)};
+    c.rampLipDeg = 7.0f;
+    return c;
+}
+
+// GHAT ROAD: up a valley through the jungle and over its river, eight hairpins up the
+// hillside, a spiral on the cliff that climbs over its own road, a tunnel through the rock and
+// along the misty ridge to the finish
+CircuitDef ghatRoad()
+{
+    CircuitDef c;
+    c.name = "GHAT ROAD";
+    c.features = "HARD SPRINT. A JUNGLE VALLEY AND A RIVER BRIDGE, EIGHT HAIRPINS UP THE HILLSIDE, A SPIRAL ON THE CLIFF THAT CROSSES OVER ITSELF, A TUNNEL THROUGH THE ROCK, A RAMP JUMP ON THE RIDGE. SHORTCUT: THROUGH A TEA ESTATE.";
+    c.sprint = true;
+    c.laps = 1;
+    std::vector<CtrlPoint> &p = c.pts;
+    p = {P(0, 0, 0), P(0, 150, 0), P(0, 300, 0), P(0, 450, 0), P(25, 700, 1), P(-30, 950, 2),
+         P(-10, 1150, 2, TF_BRIDGE), P(0, 1330, 2),      // over the river
+         P(10, 1480, 3), P(30, 1590, 4)};
+    float y = switchbacks(p, 70, 1660, 4, 1.0f, 330.0f, 8, 76.0f, 11.0f, 1.5f, 6.0f, 0.0f);
+    const float zt = 1660 + 7 * 76.0f;                   // the top row, heading west
+    // the spiral: right round, climbing, over its own entry (River Serpent's, moved here)
+    const float sx = -1250.0f, sz = zt - 176.0f;
+    p.push_back(P(-90, zt, y));
+    p.push_back(P(1110 + sx, 172 + sz, y + 0.5f));
+    p.push_back(P(1000 + sx, 176 + sz, y + 1));
+    p.push_back(P(900 + sx, 215 + sz, y + 3, 0, -4));
+    p.push_back(P(860 + sx, 300 + sz, y + 5, 0, -4));
+    p.push_back(P(930 + sx, 372 + sz, y + 7, 0, -4));
+    p.push_back(P(1030 + sx, 345 + sz, y + 9, 0, -4));
+    p.push_back(P(1052 + sx, 255 + sz, y + 10, TF_OVERPASS));
+    p.push_back(P(1035 + sx, 130 + sz, y + 10));
+    p.push_back(P(965 + sx, 80 + sz, y + 10));
+    p.push_back(P(800 + sx, 70 + sz, y + 10));
+    const float ye = y + 10, ze = 70 + sz;
+    p.push_back(P(-650, ze - 10, ye, TF_TUNNEL));         // through the rock
+    p.push_back(P(-850, ze - 20, ye));
+    p.push_back(P(-1050, ze - 50, ye - 2));
+    p.push_back(P(-1250, ze - 100, ye - 4));
+    p.push_back(P(-1400, ze - 140, ye - 6));
+    p.push_back(P(-1500, ze - 160, ye - 7, TF_JUMP));     // the ramp on the ridge
+    p.push_back(P(-1650, ze - 185, ye - 8));
+    p.push_back(P(-1800, ze - 200, ye - 10));
+    const int cutFrom = int(p.size());
+    p.push_back(P(-2000, ze - 230, ye - 12));
+    p.push_back(P(-2200, ze - 300, ye - 13));            // round the tea estate...
+    p.push_back(P(-2330, ze - 470, ye - 15));
+    p.push_back(P(-2260, ze - 650, ye - 17));
+    const int cutTo = int(p.size());
+    p.push_back(P(-2080, ze - 700, ye - 18));
+    p.push_back(P(-1950, ze - 720, ye - 20));
+    p.push_back(P(-1780, ze - 735, ye - 22));
+    p.push_back(P(-1600, ze - 745, ye - 23));
+    p.push_back(P(-1400, ze - 750, ye - 24));             // the finish line
+    p.push_back(P(-1100, ze - 750, ye - 24));             // run-off
+    c.shortcut.fromPt = cutFrom;
+    c.shortcut.toPt = cutTo;
+    c.shortcut.via = {D(-2110, ze - 320, ye - 13), D(-2150, ze - 450, ye - 15), D(-2150, ze - 580, ye - 17)};
+    c.rampLipDeg = 7.0f;
+    return c;
+}
+
 } // namespace
 
 const std::vector<CircuitDef> &draftCircuits()
 {
     static const std::vector<CircuitDef> all = {sunsetSprint(), canyonRun(), alpinePass(), neonCity(), coastalSprint(),
-                                                  riverSerpent()};
+                                                  riverSerpent(), desertZigzag(), ghatRoad()};
     return all;
 }
 

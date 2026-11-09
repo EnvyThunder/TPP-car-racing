@@ -22,6 +22,8 @@ int main(int argc, char *argv[])
         if (args[i] == "--ws" && i + 1 < args.size()) wsPort = quint16(args[++i].toUInt());
         else if (args[i] == "--max-rooms" && i + 1 < args.size()) server.maxRooms = args[++i].toInt();
         else if (args[i] == "--api" && i + 1 < args.size()) server.apiBase = args[++i];
+        else if (args[i] == "--rtc" && i + 1 < args.size()) server.rtcPort = quint16(args[++i].toUInt());
+        else if (args[i] == "--public-ip" && i + 1 < args.size()) server.publicIp = args[++i];
         else port = quint16(args[i].toUInt());
     }
     QObject::connect(&server, &RaceServer::log, [&out](const QString &line) { out << line << Qt::endl; });

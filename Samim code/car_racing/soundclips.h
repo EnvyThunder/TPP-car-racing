@@ -22,6 +22,8 @@ struct SoundClip {
 // clip is exactly as long as the parts - cut on bar lines, music stays on the beat. The loudness
 // is evened out (no swells or dips longer than a beat). Empty if the file is missing or not an MP3.
 using SoundParts = std::vector<std::pair<float, float>>;
-SoundClip loadSoundClip(const QString &resource, const SoundParts &parts, float joinSeconds);
+// levelSeconds: how short a swell the evening-out removes (each side of a moment).
+// asRecorded: the loudness left exactly as in the file (no evening-out, no common level)
+SoundClip loadSoundClip(const QString &resource, const SoundParts &parts, float joinSeconds, float levelSeconds = 0.75f, bool asRecorded = false);
 
 #endif // SOUNDCLIPS_H

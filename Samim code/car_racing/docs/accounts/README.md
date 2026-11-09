@@ -6,7 +6,7 @@ and the browser version.
 
 - **The server:** `car-racing-backend`, a separate repo (Node 24, Fastify, SQLite, argon2id),
   running on AWS EC2 under the free plan.
-- **Address:** https://13-49-109-8.sslip.io
+- **Address:** https://tppcarracing.duckdns.org (AWS Mumbai; before 1 Nov 2026: https://13-49-109-8.sslip.io, Stockholm)
 - **The API:** documented in that repo's README.
 
 ## Milestone B1: the server

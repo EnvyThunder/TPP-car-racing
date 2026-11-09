@@ -40,7 +40,6 @@ struct CarView {
     float camHeading = 0.0f;      // Smoothed heading for the chase camera
     float fov = 64.0f;            // Dynamic field of view (widens with speed/nitro)
     float shake = 0.0f;           // Camera shake after collisions
-    int   camMode = 0;            // 0: Chase, 1: Hood, 2: Bumper
     float camDist = 8.0f;         // Smoothed chase distance (pulls back with speed)
     bool  snap = true;            // first frame of a race: point the camera along the car
     float camY = 0.0f;            // Smoothed height of the car (the camera rides hills gently)
@@ -169,16 +168,40 @@ private:
     std::deque<SentInput> sentInputs;      // inputs the server hasn't confirmed yet
     quint32 inputSeq = 0;
     sim::Car predicted;                    // my car, simulated locally so it reacts instantly
+    std::vector<sim::Car> presentCars;      // the other racers where they are now (the last snapshot moved on at their pace):
+    std::vector<float> presVx, presVz, presVs;   // my car bumps them there at once, and near ones are drawn there
+    float nearOff[8][4] = {};                // (how far each near car is drawn from its delayed view: glides, never jumps)
+    int statOverlap = 0;                     // (tests: frames my car is drawn inside another car)
+    sim::Car predictedPrev;                // ... one step before: it is drawn between the two (smooth at any frame rate)
+    // the shake meter (tests): how jerkily my car and the others move from frame to frame
+    double shakeMe = 0.0, shakeOthers = 0.0, shakeMax = 0.0; int shakeFrames = 0;
+    double shakeCam = 0.0, shakeCamTurn = 0.0, shakeLastCamH = 0.0, shakeLastCamStep = 0.0; int myClashes = 0, myCrashEvents = 0;
+    float shakeLast[8][2] = {}, shakeStep[8][2] = {}; bool shakeHave[8] = {};
     float corrX = 0.0f, corrZ = 0.0f;      // smooths out small prediction corrections
     struct Sample { double t; std::vector<sim::Car> cars; };   // t = server time (ms) of the snapshot
     std::deque<Sample> history;            // recent snapshots: other cars are drawn slightly in the past
     QElapsedTimer netClock;
     double serverClockAhead = 0.0;         // server time minus netClock, from the quickest snapshots
+    double netRenderT = -1.0;              // the other cars' playback clock (server ms): runs smoothly, eased to its target
+    double netLastComposeNs = -1.0;
     QString netTest;                       // CAR_RACING_NETTEST: scripted online test (see runNetAutoShot)
     int statSnapshots = 0, statSmallFix = 0, statSnaps = 0;   // how often the prediction was corrected
     int statLandings = 0;                                    // jumps your car landed
     // more scripted-test measurements: frame times, drawing time, gaps between snapshots
     int statFrames = 0, statSlowFrames = 0, statSnapLate = 0;
+    int statComposed = 0, statStarved = 0;
+    int statStalls = 0, statLate = 0;      // (the F2 meter) snapshots 150 ms+ apart; ones later than the buffer
+    double netInterpTarget = 80.0, netInterpMs = 80.0, netJitter = 0.0;   // (the other cars' buffer, ms)
+    qint64 netLastSnapAt = -1, netLastCompose = -1;
+    // automatic graphics and the F2 meter (glwidget.cpp)
+    void gfxSet(int level);
+    void gfxFrame(float rawDt);
+    void drawMeter(int W, int H, float dpr);
+    int gfxLevel = 0, gfxCount = 0, gfxSlow = 0;
+    bool gfxFixed = false, meterOn = false;
+    float gfxScale = 1.0f, gfxSum = 0.0f, gfxCalm = 0.0f, gfxPatience = 20.0f, gfxSinceRaise = 1000.0f;
+    float meterTime = 0.0f, meterFps = 0.0f, meterWorst = 0.0f, meterWorstNow = 0.0f;
+    int meterFrames = 0;
     double statPaintMs = 0.0, statPaintMax = 0.0, statSnapGapMax = 0.0, statSnapBytes = 0.0;
     qint64 statLastSnap = -1;
     bool trackMismatch = false;            // my track differs from the host's (different game version)
@@ -189,7 +212,10 @@ private:
     void netJoin();
     void netLeave(const QString &message);
     void netUpdate(float realDt);
-    void onNetSnapshot(quint32 lastSeq, const QByteArray &body);
+    void onNetSnapshot(quint32 lastSeq, int queued, const QByteArray &body);
+    double statErrSum = 0.0;                 // (tests: how far my car is put right, in all)
+    double netQueued = 2.0;                  // my inputs waiting on the server (smoothed)
+    bool netShaky() const;                   // the connection is struggling: show the warning
     void composeOnlineCars();
     bool handleOnlineKey(QKeyEvent *event);
     void drawOnlineScreen(int W, int H, float dpr);
@@ -385,6 +411,10 @@ private:
     bool  cloneResetArmed = false;              // MY PROFILE: R pressed once (again deletes it)
     std::thread cloneThread;                    // trains after a race, in the background
     std::atomic<bool> cloneTraining{false}, cloneDone{false};
+#ifdef __EMSCRIPTEN__
+    void storyTestStep();                       // (?storytest on the page: every story scene of every map, see glwidget_story.cpp)
+    sim::CloneTrainer cloneSlices;              // (no threads in the browser: a few ms every frame)
+#endif
     sim::Brain cloneNew{};
     sim::CloneStats cloneNewStats;
     QByteArray cloneSummary;                    // after a race: what your clone learned
@@ -401,7 +431,7 @@ private:
     enum class AccountScreen { Off, Login, Create };
     AccountScreen accountScreen = AccountScreen::Off;   // the LOG IN / CREATE ACCOUNT screen
     QString acctUser, acctPass, acctPass2;              // what is typed (the password is dropped after use)
-    bool  acctShare = false;                            // CREATE: share my races for training
+    bool  acctShare = true;                             // CREATE: share my races for training (ticked; they can untick it)
     int   acctRow = 0;
     QString acctStatus;                                 // the last answer or problem
     bool  acctStatusBad = false, acctBusy = false;
@@ -495,6 +525,10 @@ private:
     void drawMainMenu(int W, int H, float dpr);
     void drawMenuModal(int W, int H, float dpr);
     void drawPauseOverlay(int W, int H, float dpr);
+    int pauseChoice = 0;
+    bool soundOn = true;                  // the SOUND menu item (saved)
+    void toggleSound();
+    bool uiTestOnlineBanner = false;      // (CAR_RACING_AUTOSHOT_UI: the online winner strip, offline)                  // the pause screen's choice: resume, restart, main menu
     void drawFinishOverlay(int W, int H, float dpr);
     void drawText(const char *s, float x, float y, float ps, float r, float g, float b);
     float textWidth(const char *s, float ps) const;

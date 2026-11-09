@@ -197,6 +197,7 @@ const RulesCard &rulesCard(int chapter)
             "NO L BOOST IN THE 2 PLAYER SPLIT SCREEN."}},
         {"THE LAST THIRD", {
             "THE LAST THIRD OF EVERY ROAD HAS MORE OBSTACLES AND MORE RAMPS.",
+            "A RED SKULL OVER A MINE: 0 HEALTH AT ONCE. DRIVE AROUND IT OR JUMP OVER IT.",
             "RAMPS WITH RED EDGES ARE HIGHER: EVERY LANDING COSTS 1.5 TIMES AS MUCH.",
             "ON THE FINAL LAP NEW OBSTACLES AND RAMPS APPEAR.",
             "A NITRO JUMP FLIES FURTHER - AND LANDS HARDER.",
@@ -919,3 +920,90 @@ void GLWidget::drawStoryRules(int W, int H, float dpr, int chapter)
     if (int(storyTime * 2.0f) % 2 == 0 || story != StoryScreen::Scene)
         drawText(keys, (bx0 + bx1 - textWidth(keys, ps)) * 0.5f, by0 + 12.0f * dpr, ps, 1.0f, 0.80f, 0.25f);
 }
+
+// ===========================================================================
+//  Browser test: car_racing.html?storytest&mute
+// ===========================================================================
+// Plays every map's scenes through, as Enter would, with a race start and finish between them,
+// and says on the console what it is doing, the slowest frame and the memory in use. A stop in
+// the browser shows as the last line printed. Two rounds: anything that grows shows too.
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#include <emscripten/console.h>
+#include <emscripten/heap.h>
+EM_JS(int, tpp_page_storytest, (), { return window.location.search.indexOf("storytest") >= 0 ? 1 : 0; });
+
+void GLWidget::storyTestStep()
+{
+    static int on = -1, phase = 0, map = 0, round = 0, wait = 60;
+    static double last = 0.0, worst = 0.0;
+    if (on < 0) on = tpp_page_storytest();
+    if (!on) return;
+    const double now = emscripten_get_now();
+    if (last > 0.0) worst = std::max(worst, now - last);
+    last = now;
+    if (wait > 0) { --wait; return; }
+    auto say = [&](const char *what) {
+        char b[160];
+        snprintf(b, sizeof b, "[storytest] round %d map %d (%s): %s - slowest frame %.0f ms, memory %d MB", round, map,
+                 sim::MAPS[map].name, what, worst, int(emscripten_get_heap_size() / (1024 * 1024)));
+        emscripten_console_log(b);
+    };
+    auto enter = [&]() {
+        QKeyEvent e(QEvent::KeyPress, Qt::Key_Return, Qt::NoModifier);
+        handleStoryKey(&e);
+    };
+    switch (phase) {
+    case 0:                                              // the grid and the chapter's scene
+        say("starting the scene");
+        worst = 0.0;
+        selectedMapPreset = map;
+        cpuCount = sim::MAX_RACERS - 1;
+        beginRaceWithStory(sim::GameSim::ModeSingle);
+        phase = 1;
+        wait = 8;
+        break;
+    case 1:                                              // through its lines and the rules
+        if (story == StoryScreen::Scene) { enter(); wait = 5; break; }
+        say("scene over, racing");
+        phase = 2;
+        wait = 300;
+        break;
+    case 2:                                              // the race ends (the results, the profile, the clone)
+        say("the race ends");
+        simEngine.setState(State::Finished);
+        profileAfterRace();
+        phase = 3;
+        wait = 60;
+        break;
+    case 3:                                              // Enter on the results: the "you lost" scene
+        say("results, Enter");
+        story = StoryScreen::Race;
+        enter();
+        phase = 4;
+        wait = 8;
+        break;
+    case 4:
+        if (story == StoryScreen::Scene) { enter(); wait = 5; break; }
+        say("the 'lost' scene is over");
+        storyMode = sim::GameSim::ModeSingle;
+        storyBeginScene(storyChapter, 1);                // the "you won" scene
+        phase = 5;
+        wait = 8;
+        break;
+    case 5:
+        if (story == StoryScreen::Scene) { enter(); wait = 5; break; }
+        say("the 'won' scene is over");
+        simEngine.setState(State::Menu);
+        story = StoryScreen::Off;
+        phase = 0;
+        wait = 30;
+        if (++map >= sim::NUM_MAPS) {
+            map = 0;
+            if (++round >= 2) { emscripten_console_log("[storytest] FINISHED"); on = 0; }
+        }
+        break;
+    default: break;
+    }
+}
+#endif

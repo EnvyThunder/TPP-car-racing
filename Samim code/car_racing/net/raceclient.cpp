@@ -1,12 +1,66 @@
 #include "raceclient.h"
 
 #include <QNetworkDatagram>
+#include <QHostInfo>
+#include <QUrl>
+#include <QtEndian>
 #ifndef __EMSCRIPTEN__
 #include <QNetworkInterface>
 #endif
 #include <algorithm>
 
 using namespace net;
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// The browser's fast lane: a WebRTC data channel to the server, unordered and never resent
+// (what UDP is to the desktop game). The offer, with all its candidates, goes over the
+// WebSocket; the answer comes back the same way. Everything the page hears lands in
+// tppRtcBuf and is handed to tpp_rtc_event (0 offer ready, 1 a message, 2 open, 3 closed).
+static RaceClient *rtcClient = nullptr;
+static unsigned char tppRtcBuf[65536];
+extern "C" EMSCRIPTEN_KEEPALIVE void tpp_rtc_event(int kind, int size)
+{
+    if (rtcClient) rtcClient->rtcEvent(kind, tppRtcBuf, size);
+}
+EM_JS(void, tpp_rtc_start, (unsigned char *buf, int cap), {
+    try {
+        if (window.tppRtc) { try { window.tppRtc.pc.close(); } catch (e) {} }
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        const dc = pc.createDataChannel("fast", { ordered: false, maxRetransmits: 0 });
+        dc.binaryType = "arraybuffer";
+        window.tppRtc = { pc: pc, dc: dc };
+        const give = function (kind, bytes) {
+            const n = Math.min(bytes.length, cap);
+            HEAPU8.set(bytes.subarray(0, n), buf);
+            _tpp_rtc_event(kind, n);
+        };
+        dc.onopen = function () { give(2, new Uint8Array(0)); };
+        dc.onclose = function () { give(3, new Uint8Array(0)); };
+        dc.onmessage = function (ev) { give(1, new Uint8Array(ev.data)); };
+        let sent = false;
+        const offer = function () {
+            if (sent || !pc.localDescription) return;
+            sent = true;
+            give(0, new TextEncoder().encode(pc.localDescription.sdp));
+        };
+        pc.onicegatheringstatechange = function () { if (pc.iceGatheringState === "complete") offer(); };
+        pc.createOffer().then(function (o) { return pc.setLocalDescription(o); })
+          .then(function () { setTimeout(offer, 1500); });   // (gathering slow: send what there is)
+    } catch (e) { console.log("fast lane unavailable: " + e); }
+});
+EM_JS(void, tpp_rtc_answer, (const char *sdp), {
+    try { if (window.tppRtc) window.tppRtc.pc.setRemoteDescription({ type: "answer", sdp: UTF8ToString(sdp) }); }
+    catch (e) { console.log("fast lane answer: " + e); }
+});
+EM_JS(void, tpp_rtc_send, (const unsigned char *p, int n), {
+    try { const r = window.tppRtc; if (r && r.dc.readyState === "open") r.dc.send(HEAPU8.slice(p, p + n)); } catch (e) {}
+});
+EM_JS(void, tpp_rtc_stop, (), {
+    try { if (window.tppRtc) window.tppRtc.pc.close(); } catch (e) {}
+    window.tppRtc = null;
+});
+#endif
 
 RaceClient::RaceClient(QObject *parent)
     : QObject(parent)
@@ -17,6 +71,8 @@ RaceClient::RaceClient(QObject *parent)
     connectTimer.setSingleShot(true);
     connect(&connectTimer, &QTimer::timeout, this, &RaceClient::onConnectTimeout);
     pingClock.start();
+    connect(&fastSock, &QUdpSocket::readyRead, this, &RaceClient::onFastRead);
+    connect(&fastTimer, &QTimer::timeout, this, &RaceClient::onFastTimer);
     // Lag simulator for testing/demos: CAR_RACING_LAG_MS=150 delays every message
     // by half of that each way, like a slow internet connection.
     fakeLagMs = qEnvironmentVariableIntValue("CAR_RACING_LAG_MS");
@@ -27,6 +83,7 @@ RaceClient::~RaceClient()
     // cut the socket's signals before it is destroyed (it would report "disconnected")
     if (link) { link->disconnect(this); link->abort(); }
     udp.disconnect(this);
+    fastSock.disconnect(this);
 }
 
 void RaceClient::reset()
@@ -41,6 +98,15 @@ void RaceClient::reset()
     isHost = false;
     players.clear();
     pingMs = -1;
+#ifdef __EMSCRIPTEN__
+    if (rtcWeb) tpp_rtc_stop();
+    rtcWeb = false;
+#endif
+    fastTimer.stop();
+    fastOk = false;
+    fastToken = 0;
+    fastHost = QHostAddress();
+    lastSnapTick = -1;
     joined = false;
     lagIn.clear();
     lagOut.clear();
@@ -236,6 +302,40 @@ void RaceClient::dispatch(MsgType type, const QByteArray &payload)
             qint8 s; bool h;
             in >> s >> code >> h;
             slot = s; isHost = h; joined = true;
+#ifdef __EMSCRIPTEN__
+            if (!in.atEnd()) {                           // the fast lane: the page's WebRTC data channel
+                quint16 port; quint64 token;
+                in >> port >> token;
+                if (!qEnvironmentVariableIsSet("CAR_RACING_NET_NOFAST")) {
+                    fastToken = token;
+                    fastOk = false;
+                    rtcWeb = true;
+                    rtcClient = this;
+                    tpp_rtc_start(tppRtcBuf, int(sizeof tppRtcBuf));
+                }
+            }
+#else
+            if (!in.atEnd()) {                           // the fast lane: say hello on it until it answers
+                quint16 port; quint64 token;
+                in >> port >> token;
+                const int testPort = qEnvironmentVariableIntValue("CAR_RACING_NET_FASTPORT");   // (tests: through a lag proxy)
+                if (port && !qEnvironmentVariableIsSet("CAR_RACING_NET_NOFAST")) {
+                    fastPort = testPort > 0 ? quint16(testPort) : port;
+                    fastToken = token;
+                    fastOk = false;
+                    const QString host = connectHost.startsWith("ws", Qt::CaseInsensitive) ? QUrl(connectHost).host() : connectHost;
+                    QHostInfo::lookupHost(host, this, [this, token](const QHostInfo &info) {
+                        if (token != fastToken) return;
+                        for (const QHostAddress &a : info.addresses())
+                            if (a.protocol() == QAbstractSocket::IPv4Protocol) { fastHost = a; break; }
+                        if (fastHost.isNull()) return;
+                        if (fastSock.state() != QAbstractSocket::BoundState) fastSock.bind(QHostAddress::AnyIPv4, 0);
+                        onFastTimer();
+                        fastTimer.start(250);
+                    });
+                }
+            }
+#endif
             emit welcomed();
             break;
         }
@@ -269,16 +369,25 @@ void RaceClient::dispatch(MsgType type, const QByteArray &payload)
             quint32 world = 0;
             in >> world;
             slot = s;
+            lastSnapTick = -1;
             emit raceStarted(map, laps, s, names, world);
             if (autoStory) sendStory(false);
             break;
         }
-        case S_SNAPSHOT: {
-            quint32 lastSeq;
-            in >> lastSeq;
-            emit snapshotArrived(lastSeq, payload.mid(4));
+        case S_SNAPSHOT:
+            handleSnapshot(payload);
+            break;
+        case S_EXTRAS:
+            emit extrasArrived(payload);
+            break;
+#ifdef __EMSCRIPTEN__
+        case S_RTC_ANSWER: {
+            QString sdp;
+            in >> sdp;
+            if (rtcWeb) tpp_rtc_answer(sdp.toUtf8().constData());
             break;
         }
+#endif
         case S_PONG: {
             qint64 sent;
             in >> sent;
@@ -337,13 +446,15 @@ void RaceClient::sendStory(bool skipForAll)
     send(C_STORY, out);
 }
 
-void RaceClient::sendInput(quint32 seq, const sim::PlayerInput &in)
+void RaceClient::sendInput(quint32 seq, const QByteArray &bits, int want)
 {
     QByteArray out;
     QDataStream ds(&out, QIODevice::WriteOnly);
     prepare(ds);
-    ds << seq << packInput(in);
-    send(C_INPUT, out);
+    ds << seq << quint8(std::clamp(want, 1, 12)) << quint8(bits.size());
+    out += bits;
+    if (fastActive()) sendFast(F_INPUT, out);
+    else send(C_INPUT, out);
 }
 
 void RaceClient::requestStart() { send(C_START); }
@@ -384,3 +495,85 @@ void RaceClient::send(MsgType type, const QByteArray &payload)
         link->send(f);
     }
 }
+
+// ---------------------------------------------------------------------------
+//  The fast lane (net/protocol.h)
+// ---------------------------------------------------------------------------
+void RaceClient::handleSnapshot(const QByteArray &payload)
+{
+    if (payload.size() < 13) return;
+    const qint32 tick = qFromBigEndian<qint32>(payload.constData() + 9);   // (after seq, queued, state, mode, map, laps)
+    if (tick <= lastSnapTick) return;                // older than one already shown (the fast lane can reorder)
+    lastSnapTick = tick;
+    QDataStream in(payload);
+    prepare(in);
+    quint32 lastSeq; quint8 queued;
+    in >> lastSeq >> queued;
+    emit snapshotArrived(lastSeq, queued, payload.mid(5));
+}
+
+bool RaceClient::fastActive() const
+{
+    return fastOk && fastLastRx >= 0 && pingClock.elapsed() - fastLastRx < 3500;
+}
+
+void RaceClient::sendFast(quint8 type, const QByteArray &payload)
+{
+    QByteArray dg(9, 0);
+    dg[0] = char(type);
+    qToBigEndian<quint64>(fastToken, dg.data() + 1);
+    dg += payload;
+#ifdef __EMSCRIPTEN__
+    if (rtcWeb) { tpp_rtc_send(reinterpret_cast<const unsigned char *>(dg.constData()), int(dg.size())); return; }
+#endif
+    fastSock.writeDatagram(dg, fastHost, fastPort);
+}
+
+void RaceClient::onFastTimer()
+{
+    bool web = false;
+#ifdef __EMSCRIPTEN__
+    web = rtcWeb;
+#endif
+    if (!link || !link->isOpen() || !fastToken || (fastHost.isNull() && !web)) { fastTimer.stop(); return; }
+    if (fastOk && !fastActive()) fastOk = false;     // nothing back for a while: say hello again
+    sendFast(F_HELLO, QByteArray());
+    fastTimer.setInterval(fastOk ? 1000 : 250);
+}
+
+void RaceClient::onFastRead()
+{
+    while (fastSock.hasPendingDatagrams()) {
+        const QNetworkDatagram d = fastSock.receiveDatagram(65536);
+        const QByteArray data = d.data();
+        if (data.size() < 9 || qFromBigEndian<quint64>(data.constData() + 1) != fastToken) continue;
+        fastLastRx = pingClock.elapsed();
+        if (quint8(data[0]) == F_HELLO_OK) fastOk = true;
+        else if (quint8(data[0]) == F_SNAPSHOT && fastOk) handleSnapshot(data.mid(9));
+    }
+}
+
+#ifdef __EMSCRIPTEN__
+void RaceClient::rtcEvent(int kind, const unsigned char *data, int size)
+{
+    if (!rtcWeb) return;
+    if (kind == 0) {                                     // the offer: to the server by the WebSocket
+        QByteArray out;
+        QDataStream ds(&out, QIODevice::WriteOnly);
+        prepare(ds);
+        ds << QString::fromUtf8(reinterpret_cast<const char *>(data), size);
+        send(C_RTC_OFFER, out);
+    } else if (kind == 1) {                              // a datagram
+        QByteArray d(reinterpret_cast<const char *>(data), size);
+        if (d.size() < 9 || qFromBigEndian<quint64>(d.constData() + 1) != fastToken) return;
+        fastLastRx = pingClock.elapsed();
+        if (quint8(d[0]) == F_HELLO_OK) fastOk = true;
+        else if (quint8(d[0]) == F_SNAPSHOT && fastOk) handleSnapshot(d.mid(9));
+    } else if (kind == 2) {                              // open: say hello on it (the answer proves both ways)
+        onFastTimer();
+        fastTimer.start(250);
+    } else if (kind == 3) {
+        fastOk = false;
+    }
+}
+#endif

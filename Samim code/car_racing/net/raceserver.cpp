@@ -1,4 +1,18 @@
 #include "raceserver.h"
+#include <QtEndian>
+#ifdef HAVE_RTC
+#include <rtc/rtc.hpp>
+#include <memory>
+// A browser's WebRTC connection. libdatachannel calls back on its own threads: everything it
+// says is passed to the server's thread by the player's id (the player may be gone by then).
+struct RtcPeer {
+    std::shared_ptr<rtc::PeerConnection> pc;
+    std::shared_ptr<rtc::DataChannel> dc;
+    std::atomic<bool> open{false};
+};
+#else
+struct RtcPeer {};
+#endif
 
 #include <QTcpSocket>
 #include <QNetworkDatagram>
@@ -14,8 +28,10 @@
 using namespace net;
 
 RaceServer::RaceServer(QObject *parent)
-    : QObject(parent), tcp(this), ws(this), udp(this), timer(this)   // children: they move threads with it
+    : QObject(parent), tcp(this), ws(this), udp(this), fast(this), timer(this)   // children: they move threads with it
 {
+    connect(&fast, &QUdpSocket::readyRead, this, &RaceServer::onFast);
+    upClock.start();
     connect(&tcp, &QTcpServer::newConnection, this, &RaceServer::onNewConnection);
     connect(&ws, &QTcpServer::newConnection, this, &RaceServer::onNewConnection);
     connect(&udp, &QUdpSocket::readyRead, this, &RaceServer::onDiscovery);
@@ -53,6 +69,10 @@ bool RaceServer::start(quint16 port)
     // Several servers on one PC can all answer discovery requests for their own rooms
     if (!udp.bind(QHostAddress::AnyIPv4, DISCOVERY_PORT, QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint))
         emit log("Room discovery (UDP) unavailable - players can still join with CODE@address");
+    if (!fast.bind(QHostAddress::AnyIPv4, quint16(tcp.serverPort() + 2)) && !fast.bind(QHostAddress::AnyIPv4, 0))
+        emit log("Fast lane (UDP) unavailable - everything goes over the connection");
+    else
+        emit log(QString("Fast lane on UDP port %1").arg(fast.localPort()));
     clock.start();
     timer.setTimerType(Qt::PreciseTimer);
     timer.start(5);
@@ -130,6 +150,7 @@ void RaceServer::onDisconnected()
     link->deleteLater();
     if (!p) return;
     p->sock = nullptr;
+    closeRtc(p);
     removePlayer(p);
 }
 
@@ -142,10 +163,20 @@ void RaceServer::handle(Player *p, MsgType type, const QByteArray &payload)
     case C_JOIN:
         if (!room) join(p, in);
         break;
-    case C_INPUT: {
-        quint32 seq; quint8 bits;
-        in >> seq >> bits;
-        if (room && room->racing) p->inputs.emplace_back(seq, unpackInput(bits));
+    case C_INPUT: {                                      // the newest input and copies of the ones before it
+        quint32 seq; quint8 want, count;
+        in >> seq >> want >> count;
+        if (!room || !room->racing || count == 0 || count > 32) break;
+        p->want = std::clamp(int(want), 1, 12);
+        for (int k = 0; k < count; ++k) {
+            quint8 bits;
+            in >> bits;
+            if (in.status() != QDataStream::Ok) break;
+            const quint32 s = seq - quint32(count - 1 - k);
+            if (s > seq || s <= p->lastQueued) continue;  // (had it already)
+            p->inputs.emplace_back(s, unpackInput(bits));
+            p->lastQueued = s;
+        }
         break;
     }
     case C_START:
@@ -176,6 +207,12 @@ void RaceServer::handle(Player *p, MsgType type, const QByteArray &payload)
     case C_PING:
         send(p, S_PONG, payload);
         break;
+    case C_RTC_OFFER: {
+        QString sdp;
+        in >> sdp;
+        if (room && sdp.size() < 20000) rtcOffer(p, sdp);
+        break;
+    }
     case C_ADD_BOT:
         if (room && room->host == p && !room->racing) addCpu(room);
         break;
@@ -257,7 +294,9 @@ void RaceServer::join(Player *p, QDataStream &in)
     QByteArray out;
     QDataStream ds(&out, QIODevice::WriteOnly);
     prepare(ds);
-    ds << qint8(room->players.size() - 1) << room->code << bool(room->host == p);
+    p->fastToken = QRandomGenerator::global()->generate64() | 1;
+    ds << qint8(room->players.size() - 1) << room->code << bool(room->host == p)
+       << quint16(fast.state() == QAbstractSocket::BoundState ? fast.localPort() : 0) << quint64(p->fastToken);
     send(p, S_WELCOME, out);
     sendLobby(room);
     checkAccount(p);
@@ -397,15 +436,18 @@ void RaceServer::startRace(Room *room)
     room->sim.setLaps(room->laps);
     // the CPUs: new minds every race, their skill spread around the people in the room (what
     // the server has measured of them; someone new counts as an average driver)
-    float skill = 0.0f;
+    float skill = 0.0f, challenge = 0.0f;
     int people = 0;
     for (Player *p : room->players) {
         if (p->isCpu()) continue;
         const sim::PlayerProfile &prof = profiles[p->name];
-        skill += 0.6f * (1.0f - prof.sure) + prof.traits.skill * prof.sure;
+        skill += sim::NEW_PLAYER_SKILL * (1.0f - prof.sure) + prof.traits.skill * prof.sure;
+        challenge += prof.challenge;
         ++people;
     }
-    room->sim.setCpuSkill(sim::cpuPrecisionFor(people ? skill / float(people) : 0.6f));
+    challenge = people ? challenge / float(people) : 0.0f;   // (the room's people together)
+    room->sim.setCpuChallenge(challenge);
+    room->sim.setCpuSkill(sim::cpuCentreFor(people ? skill / float(people) : sim::NEW_PLAYER_SKILL, 1.0f, challenge));   // (skill: already blended)
     room->sim.setAiSeed(QRandomGenerator::global()->generate());
     room->sim.clearPlayerHints();                        // what the race director knows of each person
     for (int i = 0; i < room->players.size(); ++i) {
@@ -438,7 +480,11 @@ void RaceServer::startRace(Room *room)
         }
         p->inputs.clear();
         p->budget = 0.0f;
-        p->lastSeq = 0;
+        p->lastSeq = p->lastQueued = 0;
+        p->want = 2;
+        p->events.clear();
+        p->mem = sim::GameSim::SnapshotMemory();
+        p->skipped = 0;
     }
     room->racing = true;
     room->storyHold = true;                              // first the story scene (endStory)
@@ -446,8 +492,6 @@ void RaceServer::startRace(Room *room)
     room->storyWatched.clear();
     room->overTicks = 0;
     room->steps = 0;
-    room->pendingEvents.clear();
-    room->lastSentObstacles.clear();
     emit log(QString("Room %1: race started on %2 (%3 laps) with %4 players")
                  .arg(room->code, sim::MAPS[room->map].name).arg(room->laps).arg(n));
 
@@ -547,10 +591,15 @@ void RaceServer::onTick()
                 // yet (a slow frame on their side): the car waits this tick. Inputs piling up:
                 // two in one tick until it has caught up. The budget (a little over one input
                 // per tick, for clocks that run slightly differently) stops a game going faster.
-                p->budget = std::min(p->budget + 1.02f, 12.0f);
+                // After a stall on the way here (TCP resends a lost packet: often 200-500 ms) the
+                // waiting inputs arrive together. They must all be used: each one dropped pulls
+                // the player's car back about a metre on their screen. So the budget and the queue
+                // hold a whole second of them.
+                static const bool deepQueue = qEnvironmentVariableIsSet("CAR_RACING_NET_DEEPQUEUE");   // (test: keep the inputs the game asks for waiting)
+                p->budget = std::min(p->budget + 1.02f, 60.0f);
                 runs[i] = 0;
                 while (runs[i] < 2 && !p->inputs.empty() && p->budget >= 1.0f &&
-                       (runs[i] == 0 || p->inputs.size() > 2)) {
+                       (runs[i] == 0 || p->inputs.size() > (deepQueue ? size_t(p->want) + 2 : size_t(2)))) {   // (as before: your car on the server stays close to your screen)
                     (runs[i] == 0 ? inputs[i] : extra[i]) = p->inputs.front().second;
                     p->lastSeq = p->inputs.front().first;
                     p->inputs.pop_front();
@@ -558,7 +607,7 @@ void RaceServer::onTick()
                     ++runs[i];
                 }
                 if (runs[i] == 0 && room->sim.getState() == sim::GameSim::Racing) ++statStarved;
-                while (p->inputs.size() > 12) {                // 0.2 s behind: drop the oldest
+                while (p->inputs.size() > 60) {                // a whole second behind: drop the oldest
                     p->lastSeq = p->inputs.front().first;
                     p->inputs.pop_front();
                     ++statDropped;
@@ -566,28 +615,192 @@ void RaceServer::onTick()
             }
             room->sim.step(inputs, n, runs, extra);
             const auto &evs = room->sim.getEvents();
-            if (room->pendingEvents.size() < 300)
-                room->pendingEvents.insert(room->pendingEvents.end(), evs.begin(), evs.end());
+            for (Player *p : room->players)
+                if (p->sock && p->events.size() < 300) p->events.insert(p->events.end(), evs.begin(), evs.end());
 
             if (++room->steps % SNAPSHOT_EVERY == 0) {
-                QByteArray body;
-                QDataStream ds(&body, QIODevice::WriteOnly);
-                prepare(ds);
-                room->sim.writeSnapshot(ds, room->pendingEvents, &room->lastSentObstacles);
-                room->pendingEvents.clear();
+                static const bool rounded = qEnvironmentVariableIsSet("CAR_RACING_NET_ROUNDED");   // (tests: the old rounded own car)
                 for (Player *p : room->players) {
                     if (!p->sock) continue;
-                    QByteArray out;
-                    QDataStream hs(&out, QIODevice::WriteOnly);
-                    prepare(hs);
-                    hs << quint32(p->lastSeq);
-                    send(p, S_SNAPSHOT, out + body);
+                    // their connection has backed up (a stall on the way): hold the next snapshots
+                    // rather than pile up ones that would all arrive late together. Each player's
+                    // snapshot carries their own effects and obstacle changes since their last one.
+                    // The fast lane while their inputs come by it: the snapshot as one datagram,
+                    // what must not be lost (obstacle changes, effects) on the connection beside it.
+                    const bool viaFast = p->fastInputAt >= 0 && upClock.elapsed() - p->fastInputAt < 1000
+#ifdef HAVE_RTC
+                                         && (!p->rtc || p->rtc->open)
+#endif
+                                         ;
+                    if (!viaFast && p->sock->backlog() > SNAPSHOT_BACKLOG && p->skipped < 15) { ++p->skipped; ++statSkipped; continue; }
+                    p->skipped = 0;
+                    QByteArray out, extras;
+                    QDataStream ds(&out, QIODevice::WriteOnly), xs(&extras, QIODevice::WriteOnly);
+                    prepare(ds);
+                    prepare(xs);
+                    ds << quint32(p->lastSeq) << quint8(std::min<size_t>(p->inputs.size(), 255));
+                    room->sim.writeSnapshot(ds, p->events, &p->mem, viaFast ? &xs : nullptr, rounded ? -1 : int(room->players.indexOf(p)));
+                    p->events.clear();
+                    if (viaFast) {
+                        QByteArray dg(9, 0);
+                        dg[0] = char(F_SNAPSHOT);
+                        qToBigEndian<quint64>(p->fastToken, dg.data() + 1);
+                        sendFastTo(p, dg + out);
+                        if (extras.size() > 4) send(p, S_EXTRAS, extras);   // (4: nothing moved, no effects)
+                    } else {
+                        send(p, S_SNAPSHOT, out);
+                    }
                 }
             }
             // results stay on screen for a few seconds, then everyone is back in the lobby
             if (room->sim.getState() == sim::GameSim::Finished && ++room->overTicks > 60 * 7) endRace(room);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  The fast lane (net/protocol.h): datagrams carry the sender's token; the address they come
+//  from is where that player's snapshots go (a phone's address can change mid-race)
+// ---------------------------------------------------------------------------
+void RaceServer::onFast()
+{
+    while (fast.hasPendingDatagrams()) {
+        const QNetworkDatagram d = fast.receiveDatagram(2048);
+        const QByteArray data = d.data();
+        if (data.size() < 9) continue;
+        const quint64 token = qFromBigEndian<quint64>(data.constData() + 1);
+        Player *p = nullptr;
+        for (auto it = roomOf.constBegin(); it != roomOf.constEnd() && !p; ++it)
+            if (it.key()->fastToken == token && it.key()->sock) p = it.key();
+        if (!p || p->rtc) continue;
+        p->fastAddr = d.senderAddress();
+        p->fastPort = quint16(d.senderPort());
+        fastPacket(p, data);
+    }
+}
+
+// a fast-lane datagram from a player (by UDP, or a browser's data channel)
+void RaceServer::fastPacket(Player *p, const QByteArray &data)
+{
+    const quint8 type = quint8(data[0]);
+    if (type == F_HELLO) {
+        QByteArray ok(data.left(9));
+        ok[0] = char(F_HELLO_OK);
+        sendFastTo(p, ok);
+    } else if (type == F_INPUT) {
+        p->fastInputAt = upClock.elapsed();
+        handle(p, C_INPUT, data.mid(9));
+    }
+}
+
+void RaceServer::sendFastTo(Player *p, const QByteArray &dg)
+{
+#ifdef HAVE_RTC
+    if (p->rtc) {
+        if (p->rtc->open && p->rtc->dc) {
+            try { p->rtc->dc->send(reinterpret_cast<const std::byte *>(dg.constData()), size_t(dg.size())); } catch (...) {}
+        }
+        return;
+    }
+#endif
+    if (!p->fastAddr.isNull()) fast.writeDatagram(dg, p->fastAddr, p->fastPort);
+}
+
+// A browser's offer: answer it, with this machine's public address in place of a private one
+void RaceServer::rtcOffer(Player *p, const QString &sdp)
+{
+#ifdef HAVE_RTC
+    if (!rtcPort) return;
+    closeRtc(p);
+    p->rtc = new RtcPeer;
+    rtc::Configuration cfg;
+    cfg.portRangeBegin = cfg.portRangeEnd = rtcPort;
+    cfg.enableIceUdpMux = true;                          // (every browser on the one port)
+    try {
+        auto pc = std::make_shared<rtc::PeerConnection>(cfg);
+        p->rtc->pc = pc;
+        const quint64 id = p->id;
+        std::weak_ptr<rtc::PeerConnection> weak = pc;
+        const QString pub = publicIp;
+        pc->onGatheringStateChange([this, id, weak, pub](rtc::PeerConnection::GatheringState st) {
+            if (st != rtc::PeerConnection::GatheringState::Complete) return;
+            auto pcs = weak.lock();
+            if (!pcs) return;
+            const auto desc = pcs->localDescription();
+            if (!desc) return;
+            QStringList lines = QString::fromStdString(std::string(*desc)).split("\r\n");
+            for (QString &l : lines) {
+                if (!l.startsWith("a=candidate:") || pub.isEmpty()) continue;
+                QStringList f = l.split(' ');
+                if (f.size() > 5) {
+                    const QString ip = f[4];
+                    if (ip.startsWith("10.") || ip.startsWith("192.168.") || ip.startsWith("172.")) { f[4] = pub; l = f.join(' '); }
+                }
+            }
+            const QString answer = lines.join("\r\n");
+            QMetaObject::invokeMethod(this, [this, id, answer]() {
+                Player *q = playerById(id);
+                if (!q || !q->rtc) return;
+                QByteArray out;
+                QDataStream ds(&out, QIODevice::WriteOnly);
+                net::prepare(ds);
+                ds << answer;
+                send(q, S_RTC_ANSWER, out);
+            }, Qt::QueuedConnection);
+        });
+        pc->onDataChannel([this, id](std::shared_ptr<rtc::DataChannel> dc) {
+            QMetaObject::invokeMethod(this, [this, id, dc]() {
+                Player *q = playerById(id);
+                if (!q || !q->rtc) return;
+                q->rtc->dc = dc;
+                if (dc->isOpen()) q->rtc->open = true;
+            }, Qt::QueuedConnection);
+            dc->onOpen([this, id]() {
+                QMetaObject::invokeMethod(this, [this, id]() {
+                    Player *q = playerById(id);
+                    if (q && q->rtc) q->rtc->open = true;
+                }, Qt::QueuedConnection);
+            });
+            dc->onClosed([this, id]() {
+                QMetaObject::invokeMethod(this, [this, id]() {
+                    Player *q = playerById(id);
+                    if (q && q->rtc) q->rtc->open = false;
+                }, Qt::QueuedConnection);
+            });
+            dc->onMessage([this, id](rtc::message_variant m) {
+                if (!std::holds_alternative<rtc::binary>(m)) return;
+                const rtc::binary &b = std::get<rtc::binary>(m);
+                if (b.size() < 9 || b.size() > 4096) return;
+                QByteArray data(reinterpret_cast<const char *>(b.data()), int(b.size()));
+                QMetaObject::invokeMethod(this, [this, id, data]() {
+                    Player *q = playerById(id);
+                    if (!q || !q->rtc || qFromBigEndian<quint64>(data.constData() + 1) != q->fastToken) return;
+                    fastPacket(q, data);
+                }, Qt::QueuedConnection);
+            });
+        });
+        pc->setRemoteDescription(rtc::Description(sdp.toStdString(), "offer"));
+    } catch (const std::exception &e) {
+        emit log(QString("WebRTC offer failed: %1").arg(e.what()));
+        closeRtc(p);
+    }
+#else
+    Q_UNUSED(p); Q_UNUSED(sdp);
+#endif
+}
+
+void RaceServer::closeRtc(Player *p)
+{
+    if (!p->rtc) return;
+#ifdef HAVE_RTC
+    RtcPeer *r = p->rtc;
+    p->rtc = nullptr;
+    try { if (r->pc) r->pc->close(); } catch (...) {}
+    delete r;
+#else
+    delete p->rtc;
+    p->rtc = nullptr;
+#endif
 }
 
 // ---------------------------------------------------------------------------

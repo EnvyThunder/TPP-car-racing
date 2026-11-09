@@ -173,11 +173,11 @@ The same free AWS machine (t3.micro, eu-north-1) now serves everything on one ad
 **Updating:**
 
 1. the game: `tools/wasm/build_wasm.bat`, then
-   `tools/wasm/deploy_site.sh ubuntu@13.49.109.8 <key.pem>`. The new files replace the old ones in
+   `tools/wasm/deploy_site.sh ubuntu@13.127.16.77 <key.pem>`. The new files replace the old ones in
    one step, and the previous version stays in `/var/www/tpp-game.old`;
-2. the API and the Caddyfile: `car-racing-backend/deploy/deploy.sh ubuntu@13.49.109.8 <key.pem>
-   13-49-109-8.sslip.io`. It now checks the new Caddyfile on the server before using it;
-3. the race server: `server/deploy_race_server.sh ubuntu@13.49.109.8 <key.pem>`.
+2. the API and the Caddyfile: `car-racing-backend/deploy/deploy.sh ubuntu@13.127.16.77 <key.pem>
+   tppcarracing.duckdns.org`. It now checks the new Caddyfile on the server before using it;
+3. the race server: `server/deploy_race_server.sh ubuntu@13.127.16.77 <key.pem>`.
 
 SSH only works from your own address (security group `car-racing-sg`, rule "SSH: My IP"). Your
 connection changes address often, so set the rule to "My IP" again before a deploy.
@@ -210,3 +210,38 @@ server and API code.
   The test browser pane (hidden, resized behind the scenes) still showed the menus too big after a
   while. A normal Chrome tab was checked for 30 seconds and stayed right.
 
+## Moved to AWS Mumbai: https://tppcarracing.duckdns.org
+
+On 1 November 2026 everything moved from Stockholm (eu-north-1) to **Mumbai (ap-south-1)**, close to
+the players.
+
+- The server `car-racing-mumbai` (i-0158428abaa597c95) is the same as before: t3.micro, Ubuntu
+  26.04, 8 GB, a 1 GB swap file (without it the race server can't be compiled there).
+- Its fixed address is **13.127.16.77** (Elastic IP).
+- Its name is **tppcarracing.duckdns.org**: a free DuckDNS name on your Google account. If the
+  server ever changes address, only the IP on duckdns.org changes; the game's address stays the
+  same.
+- The firewall `launch-wizard-1` allows SSH from your IP only (set "My IP" again before a
+  deploy), and the website ports to everyone.
+- **The accounts database was copied unchanged**: the API was stopped on Stockholm, the file
+  copied, its checksum compared, and the leaderboards checked to match.
+- The desktop game now has `https://tppcarracing.duckdns.org` built in. The browser game uses the
+  page's own address, as before.
+- Connection time from India: about 85-100 ms, against about 195-380 ms to Stockholm.
+
+The Stockholm server stays for about a day as a fallback, then it is deleted and its address
+released (with the owner's OK).
+
+
+## A stuck page: what guards against it
+
+A report said the page sometimes stops at a story scene until it is reloaded. `car_racing.html?storytest&mute`
+plays every scene of every map twice and prints each step, the slowest frame and the memory on the console:
+it ran clean (slowest frame about 400 ms, the map being built; memory steady), so the report's cause is not
+known yet. What now stands in its way:
+
+- The clone trains in slices (`sim::CloneTrainer`, a few ms a frame). It took about 0.6 s natively in one go
+  for a full history, so this was a smoothness fix rather than the proven cause.
+- The page passes keys on to the game wherever the page's focus went.
+- An error, lost WebGL graphics or 8 s without a frame in a visible tab shows a red notice with the reason in
+  the console (`[game stopped]`), instead of a silent frozen picture.

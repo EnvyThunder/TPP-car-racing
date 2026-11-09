@@ -60,6 +60,13 @@ const char *moodShort(int m);
 const char *tacticShort(int t);
 // the CPU precision that drives at the pace the player model measures as this skill
 float cpuPrecisionFor(float measuredSkill);
+// From the very first race the CPUs race you hard: a player the game doesn't know yet is taken
+// for a quick one (NEW_PLAYER_SKILL: CPUs at about 93% of a clean lap's pace), and however
+// slow a profile reads, they never drive below CPU_FLOOR (about 85%). They only get faster.
+constexpr float NEW_PLAYER_SKILL = 0.93f;
+constexpr float CPU_FLOOR = 0.62f;
+// the CPUs' skill centre: from what the profile knows (sure 0..1) of the measured skill
+float cpuCentreFor(float measuredSkill, float sure, float challenge);
 
 // what the mind wants this tick (computeAIInput drives by it)
 struct AiView {
