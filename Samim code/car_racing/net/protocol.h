@@ -64,7 +64,7 @@ inline QList<QNetworkAddressEntry> lanEntries()
 }
 #endif
 
-constexpr quint16 PROTOCOL_VERSION = 26;   // 2: same track everywhere + fingerprint; 3: CPU racers; 4: wide road;
+constexpr quint16 PROTOCOL_VERSION = 27;   // 2: same track everywhere + fingerprint; 3: CPU racers; 4: wide road;
                                            // 5: rooms of 6, names changed in the lobby; 6: circuits with laps;
                                            // 7: hills and banking; 8: jumps (car height in snapshots);
                                            // 9: tunnels, bridges, the raised highway; 10: shortcuts;
@@ -89,6 +89,7 @@ constexpr quint16 PROTOCOL_VERSION = 26;   // 2: same track everywhere + fingerp
                                            //     snapshots, S_WELCOME ends with its port and token
                                            // 25: your own car exact in your snapshots (no rounding shake)
                                            // 26: two new maps (Desert Zigzag, Ghat Road)
+                                           // 27: L boost +22% speed, 10 / 15 / 25 health a second, burnt out at 5 s
 constexpr quint16 GAME_PORT        = 47800;   // TCP; a busy port makes the host try the next ones
 constexpr quint16 DISCOVERY_PORT   = 47801;   // UDP
 constexpr int     SNAPSHOT_EVERY   = 2;       // sim ticks per snapshot: 60 Hz sim -> 30 Hz snapshots

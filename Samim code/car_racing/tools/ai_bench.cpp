@@ -200,6 +200,45 @@ static void livesTest(int laps)
 
 // The elimination distance: how far an average driver (the reference driver and CPU levels
 // 2-4, crashes and all) goes per 70 health of damage. Whole races of 6 on every map.
+// The L boost: a full room of 6 CPUs, 2 races on every map - how often they boost, how long
+// they hold, how much health it costs them and how often an engine burns out
+static void boostTest()
+{
+    const int N = sim::MAX_RACERS;
+    long presses = 0, holdTicks = 0, over1 = 0, over3 = 0, burns = 0, wrecks = 0;
+    double races = 0.0;
+    std::printf("L boost: 6 CPUs (levels 2-4), 2 races on each of the %d maps\n", sim::NUM_MAPS);
+    for (int m = 0; m < sim::NUM_MAPS; ++m) {
+        for (int rot = 0; rot < 2; ++rot) {
+            sim::GameSim s(uint32_t(7000 + 31 * m + rot));
+            s.setMap(m);
+            s.startRace(sim::GameSim::ModeOnline, N);
+            static const int LV[6] = {2, 3, 4, 3, 2, 4};
+            for (int i = 0; i < N; ++i) s.getCars()[(i + rot) % N].aiLevel = LV[i];
+            std::vector<int> held(N, 0);
+            for (int t = 0; t < 60 * 600 && s.getState() != sim::GameSim::Finished; ++t) {
+                sim::PlayerInput in[sim::MAX_RACERS];
+                for (int i = 0; i < N; ++i) in[i] = s.computeAIInput(s.getCars()[i], i, true);
+                s.step(in, N);
+                for (int i = 0; i < N; ++i) {
+                    const sim::Car &c = s.getCars()[i];
+                    if (c.boosting) { if (held[i] == 0) ++presses; ++held[i]; ++holdTicks; }
+                    else if (held[i] > 0) { if (held[i] >= 90) ++over1; if (held[i] >= 180) ++over3; held[i] = 0; }
+                }
+                for (const sim::SimEvent &e : s.getEvents())
+                    if (e.type == sim::SimEvent::Damage && e.count == sim::SimEvent::ByBoost) ++burns;
+                s.clearEvents();
+            }
+            for (int i = 0; i < N; ++i) wrecks += s.getCars()[i].wrecks;
+            races += 1.0;
+        }
+    }
+    std::printf("per race (6 cars): %.1f boosts, average hold %.2f s, %.1f past 1.5 s, %.1f past 3 s\n",
+                presses / races, presses ? holdTicks / 60.0 / presses : 0.0, over1 / races, over3 / races);
+    std::printf("per race: %.2f engines burnt out (5 s), %.1f wrecks in all\n\n",
+                burns / races, wrecks / races);
+}
+
 static void damageRate()
 {
     const int N = sim::MAX_RACERS;
@@ -939,6 +978,7 @@ int main(int argc, char **argv)
     if (argc > 1 && std::strcmp(argv[1], "fair") == 0) { fairTest(argc > 2 ? std::atoi(argv[2]) : 4); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "profile") == 0) { profileTest(); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "damage") == 0) { damageRate(); return 0; }
+    if (argc > 1 && std::strcmp(argv[1], "boost") == 0) { boostTest(); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "lives") == 0) { livesTest(argc > 2 ? std::atoi(argv[2]) : 3); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "jumps") == 0) { jumpTest(); return 0; }
     if (argc > 1 && std::strcmp(argv[1], "crash") == 0) { crashTest(); return 0; }

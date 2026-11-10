@@ -5734,13 +5734,13 @@ void GLWidget::drawHUD(const sim::Car &me, const sim::Car &other, int playerNum,
             const int stage = sim::GameSim::boostStage(me);
             float lr = 0.35f, lg = 0.90f, lb = 1.0f;
             if (me.boosting) {
-                if (stage == 2) snprintf(lBuf, sizeof lBuf, "OVERHEAT! -%d HP/S", int(sim::GameSim::BOOST_RATE[2]));
+                if (stage == 2) snprintf(lBuf, sizeof lBuf, "OVERHEAT! -%d HP/S  %.1fS", int(sim::GameSim::BOOST_RATE[2]), me.boostHold / 60.0f);
                 else snprintf(lBuf, sizeof lBuf, "BOOST %.1fS -%g HP/S", me.boostHold / 60.0f, double(sim::GameSim::BOOST_RATE[stage]));
                 const bool on = (simEngine.getTick() / 6) % 2 == 0;
                 if (stage == 0)      { lr = 0.40f; lg = 1.0f; lb = 0.55f; }
                 else if (stage == 1) { lr = 1.0f; lg = 0.85f; lb = 0.25f; }
                 else                 { lr = 1.0f; lg = on ? 0.30f : 0.10f; lb = on ? 0.25f : 0.10f; }
-                const float f = std::min(1.0f, me.boostHold / float(sim::GameSim::BOOST_HIGH));   // a heat bar under the text
+                const float f = std::min(1.0f, me.boostHold / float(sim::GameSim::BOOST_BURN));   // a heat bar under the text: full = burnt out
                 glColor4f(lr, lg, lb, 0.35f);
                 rect(hx0, ly0, hx0 + hpW * f, ly0 + ps * 1.5f);
             } else if (me.boostHold > 0) {

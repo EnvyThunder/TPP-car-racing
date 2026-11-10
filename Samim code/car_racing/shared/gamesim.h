@@ -215,8 +215,8 @@ public:
     // ---- L boost, bounty -----------------------------------------------------------------
     // Holding L gives BOOST_GAIN more top speed for as long as it is held (not in split
     // screen). It costs health every tick, more the longer L has been held without a break:
-    // BOOST_RATE[0] a second for the first 3 s, BOOST_RATE[1] from 3 to 10 s, and from 10 s
-    // BOOST_RATE[2] - the engine burns out and the car is wrecked within seconds.
+    // BOOST_RATE[0] a second for the first 1.5 s, BOOST_RATE[1] from 1.5 to 3 s, BOOST_RATE[2]
+    // from 3 to 5 s, and at 5 s the engine burns out: the car is wrecked (the owner's numbers).
     // There is no elimination (the owner found it too harsh): a wrecked car is always back
     // in the race 2-3 s later. When a car is wrecked, the car that did it the most damage
     // since its last wreck gets BOUNTY health.
@@ -232,12 +232,12 @@ public:
     // x POS_DAMAGE_FRONT for the leader down to x POS_DAMAGE_BACK for the last car
     static constexpr float POS_DAMAGE_FRONT = 1.25f, POS_DAMAGE_BACK = 0.80f;
     float positionDamage(int idx) const;
-    static constexpr float BOOST_GAIN = 0.14f;
-    static constexpr float BOOST_RATE[3] = {1.5f, 4.0f, 25.0f};   // health a second
-    static constexpr int   BOOST_MID = 3 * 60, BOOST_HIGH = 10 * 60;
+    static constexpr float BOOST_GAIN = 0.22f;   // (the owner: 22%)
+    static constexpr float BOOST_RATE[3] = {10.0f, 15.0f, 25.0f};   // health a second
+    static constexpr int   BOOST_MID = 90, BOOST_HIGH = 180, BOOST_BURN = 300;   // 1.5 s, 3 s, 5 s (60 ticks a second)
     static constexpr float BOUNTY = 15.0f;
     bool boostAllowed() const { return mode != ModeSplitScreen; }
-    static int boostStage(const Car &c) { return c.boostHold >= BOOST_HIGH ? 2 : c.boostHold >= BOOST_MID ? 1 : 0; }
+    static int boostStage(const Car &c) { return c.boostHold >= BOOST_HIGH ? 2 : c.boostHold >= BOOST_MID ? 1 : 0; }   // (BOOST_BURN: burnt out)
     // ---- The CPU driver's mind (shared/aidriver.*) --------------------------------------
     // The AI seed makes every race's personalities, skills and choices different (the
     // track itself always comes from reset's seed); the skill centre is the profile skill the

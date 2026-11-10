@@ -131,7 +131,7 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
     AiView v;
     if (!cpu) {                                          // the neutral reference driver (tests, autodrive)
         const uint32_t hb = uint32_t(idx) * 37u + uint32_t(c.lap) * 11u + uint32_t(c.wrecks) * 101u;
-        v.boostHold = 60 + int(hb % 90u);
+        v.boostHold = 30 + int(hb % 60u);   // 0.5-1.5 s: the cheap part
         return v;
     }
     aiMeet(c, idx);
@@ -258,11 +258,12 @@ AiView GameSim::aiThink(Car &c, int idx, bool cpu)
     v.saveNitro = P.lateCharger && !lastThird && bold < 0.5f;
     const int presses = obsOf(idx) ? obsOf(idx)->boosts : 0;   // (each press has its own length)
     const float b = aiRand(aiSeed, idx, presses, 61);
-    v.boostHold = 60 + int(120.0f * P.boostLove * (0.5f + b));
-    if (c.aiPersona == PersonaShowOff) v.boostHold = std::max(v.boostHold, 180 + int(b * 120.0f));
-    if (c.aiPersona == PersonaWildCard && b < 0.15f) v.boostHold = 660 + int(b * 600.0f);   // sometimes far too long
-    if (mood == MoodDesperate) v.boostHold = std::max(v.boostHold, 300);
-    if (c.aiMistake == MistakeOverBoost) v.boostHold = 480;
+    // (GameSim::BOOST_RATE: 10 health a second, 15 after 1.5 s, 25 after 3 s, burnt out at 5 s)
+    v.boostHold = 30 + int(90.0f * P.boostLove * (0.5f + b));                     // 0.5 to about 2.7 s
+    if (c.aiPersona == PersonaShowOff) v.boostHold = std::max(v.boostHold, 120 + int(b * 90.0f));   // 2-3.5 s
+    if (c.aiPersona == PersonaWildCard && b < 0.15f) v.boostHold = 310 + int(b * 200.0f);   // sometimes far too long: burns out
+    if (mood == MoodDesperate) v.boostHold = std::max(v.boostHold, 200);             // 3.3 s
+    if (c.aiMistake == MistakeOverBoost) v.boostHold = 320;                          // a mistake: burns out
     v.boostEvery = mood == MoodDesperate ? 300 : std::max(300, int((1500.0f - 1000.0f * P.boostLove) * (1.0f - 0.6f * bold)));
     if (P.lateCharger && !lastThird && bold < 0.5f) v.boostEvery = 1000000;
     v.boostAnyRoad = P.boostLove > 0.8f || c.aiPersona == PersonaWildCard || mood == MoodDesperate;

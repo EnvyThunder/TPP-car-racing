@@ -155,7 +155,7 @@ void GameSim::directorStep()
             c.dirEffort = 0.05f;
             c.dirMistake = 0.7f;
             c.dirRamp = 25;
-            c.dirBoostHold = 200;
+            c.dirBoostHold = 150;
             c.dirBoostEvery = 300;
         } else if (gap < -80.0f && (tilt > 0.30f || gap < -200.0f)) {
             c.dirMode = DirEase;                         // far ahead of a struggling person: ease off a little
@@ -191,7 +191,7 @@ void GameSim::directorStep()
             c.dirMode = DirSurprise;
             c.dirEffort = 0.10f;
             c.dirMistake = 0.7f;
-            c.dirBoostHold = 240;
+            c.dirBoostHold = 180;
             c.dirBoostEvery = 120;
             c.dirRamp = 30;
         }
@@ -220,7 +220,7 @@ void GameSim::directorStep()
             if (ph.boostBin >= 0 && gap < 0.0f && gap > -60.0f) {
                 const float f = sprint() ? std::clamp(c.progress / total, 0.0f, 0.999f) : wrapS(c.s) / lapLen;
                 const int bin = int(f * PM_BOOST_BINS);
-                if (bin == (ph.boostBin + PM_BOOST_BINS - 1) % PM_BOOST_BINS) { c.dirBoostEvery = 1; c.dirBoostHold = std::max(c.dirBoostHold, 120); }
+                if (bin == (ph.boostBin + PM_BOOST_BINS - 1) % PM_BOOST_BINS) { c.dirBoostEvery = 1; c.dirBoostHold = std::max(c.dirBoostHold, 90); }
             }
             if (c.dirCut >= 0 || c.dirCover != 0 || c.dirRamp >= 50 || c.dirBoostEvery == 1)
                 if (c.dirMode == DirNone) c.dirMode = DirCounter;

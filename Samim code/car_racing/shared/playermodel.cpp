@@ -53,7 +53,7 @@ RaceTraits raceTraits(const RaceObs &o)
     float boostRisk = 0.0f;
     if (o.boosts > 0) {
         const float avgHold = float(o.boostTicks) / float(o.boosts) / 60.0f;
-        boostRisk = clamp01(avgHold / 5.0f + 0.4f * float(o.boostOver3) / float(o.boosts) + 0.8f * float(o.boostOver10) / float(o.boosts));
+        boostRisk = clamp01(avgHold / 2.5f + 0.4f * float(o.boostOver3) / float(o.boosts) + 0.8f * float(o.boostOver10) / float(o.boosts));   // (over3 / over10: past 1.5 s / 3 s now)
         boostRisk = clamp01(boostRisk + 0.15f * clamp01(float(o.boosts) / perKm / 0.6f));
     }
     if (o.rampsOffered > 0) {

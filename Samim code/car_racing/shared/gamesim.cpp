@@ -1505,7 +1505,7 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
     float topSpeed = MAX_SPEED * c.speedScale * hill * (dirt ? 0.93f : 1.0f);
 
     // L boost: more top speed and pull while L is held, paid for with health every tick -
-    // gently at first, faster after 3 s, and after 10 s the engine burns out
+    // 10 a second, 15 after 1.5 s, 25 after 3 s, and at 5 s the engine burns out
     const bool wasBoosting = c.boosting;
     c.boosting = in.boost && boostAllowed() && state == Racing && !c.finished && !c.out;
     if (c.boosting) {
@@ -1518,6 +1518,7 @@ void GameSim::updateCar(Car &c, const PlayerInput &in, int carIndex)
             events.push_back(ev);
         }
         c.health -= BOOST_RATE[boostStage(c)] / 60.0f;
+        if (c.boostHold >= BOOST_BURN) c.health = 0.0f;  // (held 5 s: the engine burns out)
         c.calm = 0;                                      // (no mending while boosting)
         if (c.health <= 0.0f) {
             for (int k = 0; k < 2; ++k) {                // the engine blows
@@ -2304,7 +2305,7 @@ PlayerInput GameSim::computeAIDrive(Car &c, int carIndex, bool asRival)
             const bool rampSoon = (takeRamp >= 0 && takeDist < 250.0f) || (c.path == 0 && nearRamp(c.s, 250.0f, 10.0f));
             in.nitro = bo[OutNitro] > 0.3f && c.nitroCharges > 0 && c.nitroTimer == 0 && !v.saveNitro && hzDist > 150.0f && !rampSoon;
             if (boostAllowed() && bo[OutBoost] > 0.3f && c.health > 60.0f && hzDist > 100.0f && !rampSoon)
-                in.boost = c.boosting ? c.boostHold < 170 : (c.boostHold == 0 && c.nitroTimer == 0 && c.health > 80.0f);
+                in.boost = c.boosting ? c.boostHold < BOOST_MID + 30 : (c.boostHold == 0 && c.nitroTimer == 0 && c.health > 80.0f);
             c.aiBrainRamp += (bo[OutRamps] - c.aiBrainRamp) * 0.01f;
             // the safety net
             const float headErr = std::fabs(wrapAngle(c.heading - headingAhead(c, 0.0f)));
@@ -2395,7 +2396,7 @@ PlayerInput GameSim::computeAIDrive(Car &c, int carIndex, bool asRival)
     const bool straightOn = c.air == 0 && std::fabs(err) < 0.12f
                          && std::fabs(wrapAngle(headingAhead(c, 80.0f) - headingAhead(c, 0.0f))) < 0.10f;
     // (how long and how often: its personality and mood; a show-off or a wild card keeps
-    // holding into the corners, and a wild card sometimes past 10 s - its engine burns out)
+    // holding into the corners, and a wild card sometimes past 5 s - its engine burns out)
     if (boostAllowed() && (v.boostAnyRoad ? c.boosting || straightOn : straightOn && c.health > 40.0f)) {
         const uint32_t h = (uint32_t(tick) * 2654435761u) ^ (uint32_t(carIndex + 5) * 2246822519u) ^ (asRival ? aiSeed : 0u);
         if (c.boosting) {
